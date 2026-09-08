@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        shell: bash
+        run: cmake -S . -B build -DWK_BUILD_VIEWER=OFF -DWK_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+      - name: CLI smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x build/wkenc || test -x build/Release/wkenc.exe
+          test -x build/wkdec || test -x build/Release/wkdec.exe
+          test -x build/wkmetric || test -x build/Release/wkmetric.exe
+
+  sanitizers:
+    name: Linux sanitizers
+    runs-on: ubuntu-latest
+    env:
+      CXXFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+      CFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+      LDFLAGS: -fsanitize=address,undefined
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-sanitize
+          -DWK_BUILD_VIEWER=OFF
+          -DWK_BUILD_TESTS=ON
+          -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build-sanitize --parallel
+
+      - name: Test
+        run: ctest --test-dir build-sanitize --output-on-failure
