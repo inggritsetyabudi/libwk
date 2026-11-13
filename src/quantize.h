@@ -22,6 +22,21 @@
 
 namespace wk {
 
+// The JPEG base tables above run to 121 (luma) / 112 (chroma) at the
+// highest frequencies. Those large steps resonate with the near-integer
+// DCT coefficients of photo blocks: the rounding error is not monotonic
+// in the step size, so a finer step can score WORSE. Measured 2026-11-13
+// on real photos, the encoder's PSNR fell as quality rose (mira q75
+// 55.15 dB -> q80 44.77 dB -> q90 48.10 dB; a single 8x8 block's luma SSE
+// went 5.4 -> 834.8 -> 517.7 because q75's steps divide its coefficients
+// almost exactly while q80's do not). Capping the base at 40 keeps the
+// high-frequency steps small enough that the error stays monotonic in
+// quality (verified q50..q100 on mira/ember/horizon); the absolute q75
+// PSNR drops because the old value was a resonance spike, not real
+// quality. Encoder-side only: tables are stored per tile in the file, so
+// old .wk files still decode bit-identically.
+constexpr float kMaxBaseQuantValue = 40.0f;
+
 constexpr std::array<uint16_t, 64> BASE_QUANT_LUMA = {{
     16, 11, 10, 16, 24, 40, 51, 61,
     12, 12, 14, 19, 26, 58, 60, 55,
@@ -71,6 +86,10 @@ public:
         for (int i = 0; i < 64; i++) {
             const int natural_index = ZIGZAG_ORDER[i];
             float base_value = static_cast<float>(base[natural_index]);
+            // Cap the base table (see kMaxBaseQuantValue): without it the
+            // large high-frequency steps resonate with photo DCT
+            // coefficients and PSNR becomes non-monotonic in quality.
+            base_value = std::min(base_value, kMaxBaseQuantValue);
             if (is_chroma_) {
                 base_value *= chroma_step_scale(i);
             }

@@ -7,6 +7,8 @@
 
 **v0.2 changes:** lossy layout `0x374D4843` (V7) with per-block quant scales and the PLANAR prediction mode (mode 13); quantization-aware rate-distortion mode selection; the V7 seed boost (scale `0.75`) for smooth-ramp tiles below quality 75. The container format (`0x0001`) is unchanged, and V1–V6 files decode identically.
 
+**v0.2.1 changes:** the JPEG base quant table is capped at 40 (see §8.2), fixing PSNR non-monotonicity in quality (the q90 < q75 anomaly). Encoder-side only; the container format is unchanged and all older files decode identically.
+
 ---
 
 ## 1. File Structure
@@ -400,6 +402,7 @@ inverses of each other.
 - Quality < 50: scale = 5000 / quality
 - Quality ≥ 50: scale = 200 - 2 × quality
 - Bit depth scaling: Q10 = Q8 × 4, Q12 = Q8 × 16
+- Base-table cap: the JPEG base value is capped at 40 before quality scaling (both luma and chroma). Without the cap, the large high-frequency base values (up to 121) resonate with the near-integer DCT coefficients of photo blocks, so the rounding error is not monotonic in the step size and PSNR falls as quality rises (measured 2026-11-13: mira q75 55.15 dB -> q80 44.77 dB; a single 8x8 block's luma SSE went 5.4 -> 834.8 because q75's steps divide its coefficients almost exactly while q80's do not). The cap keeps PSNR and file size monotonic in quality (verified q50..q100 on mira/ember/horizon). Encoder-side only: the capped tables are what get written into the file, so old files decode unchanged.
 - Deadzone: |coefficient| < 0.5 × step → 0
 - Adaptive quantization (layout `0x374D4843` only): a block's effective step is `table_step * scale`, where `scale` comes from that block's entry in the tile's per-block quant-scale stream (default `1.0`). The scaled step applies to the deadzone test, the quantize rounding, and the dequantize multiplication alike, so encoder and decoder reconstruct the same values. The encoder's first scale policy is the seed boost: on a tile that is unambiguously a smooth chroma ramp (see section 8.2, mode selection) at quality below 75, the seed blocks -- the first row and first column, which have no above/left reference -- use scale `0.75` (index 2). The seed's block means otherwise sit on a 2-level grid (luma DC step 16 at q50) and every interior block copies the row above, extruding the seed's staircase down the tile; `0.75` puts the seed's means on a finer grid. Scale `0.5` was measured and rejected (worst step got worse, 4 -> 5) and scale `1.0` leaves the q50 ramp banded (80 distinct, worst step 4); `0.75` reaches 93 distinct (the colorspace floor) with worst step 3 at essentially the same file size. The mode decision uses the same scale as the quantize, so the two agree.
 - Mode selection (rate-distortion) is quantization-aware: for each candidate prediction mode, the residual is transformed, quantized (with the plane's table and the block's scale), clamped to the stream's symbol range, dequantized, and added back to the prediction. The cost is the SSD of that reconstructed block plus lambda times a bit estimate of the quantized coefficients. Measuring the cost before quantization (on the raw prediction and the unquantized residual) picks modes whose residuals look cheap but quantize badly -- it regressed photos by 5-7 dB and made quality non-monotonic in the quality setting.

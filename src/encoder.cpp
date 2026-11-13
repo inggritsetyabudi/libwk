@@ -522,11 +522,12 @@ static Result<TileEncodeResult> encode_lossy_tile(
     // Seed boost, retried under the quantization-aware RDO: on a
     // smooth-ramp tile at low quality, the seed blocks (first row or
     // first column, which have no above/left reference) get quant
-    // scale 0.5. The seed is the bottleneck -- the first row's block
+    // scale 0.75. The seed is the bottleneck -- the first row's block
     // means sit on a 2-level grid (DC step 16) and every interior
     // block copies the row above, extruding the seed's staircase down
-    // the tile. Halving the seed's step puts its means on a 1-level
-    // grid. This failed under the OLD RDO (which could not value the
+    // the tile. Scaling the seed's step by 0.75 puts its means on a
+    // finer grid. (An earlier 0.5 scale was measured and rejected.)
+    // This failed under the OLD RDO (which could not value the
     // finer step); the new RDO measures the quantized cost, so it is
     // retried here. The per-block scale is threaded into the RDO
     // calls so the mode decision and the quantize agree.
@@ -1921,7 +1922,7 @@ void wk_free(void* ptr) {
 }
 
 const char* wk_version(void) {
-    return "0.2.0";
+    return "0.2.1";
 }
 
 }
