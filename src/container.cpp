@@ -83,6 +83,15 @@ namespace wk
             return std::unexpected(mfall.error());
         hdr.max_fall = *mfall;
 
+        // FHDR is exactly 19 bytes (SPEC section 2): trailing bytes must
+        // not be silently ignored, or a longer payload could smuggle data
+        // past the header parser.
+        if (r.remaining() != 0)
+        {
+            return std::unexpected(Error{ErrorCode::InvalidHeader,
+                                         "FHDR payload must be exactly 19 bytes"});
+        }
+
         if (hdr.width == 0 || hdr.height == 0)
         {
             return std::unexpected(Error{ErrorCode::InvalidHeader, "zero dimension"});
@@ -165,6 +174,13 @@ namespace wk
         {
             return std::unexpected(Error{ErrorCode::AnimationError,
                                          "ANIM frame_count exceeds payload size"});
+        }
+        // The payload must hold exactly frame_count entries: trailing
+        // bytes after the last frame must not be silently ignored.
+        if (needed < data.size())
+        {
+            return std::unexpected(Error{ErrorCode::AnimationError,
+                                         "ANIM payload has trailing bytes"});
         }
 
         anim.frames.resize(anim.frame_count);
@@ -302,6 +318,10 @@ namespace wk
         bool got_fhdr = false;
         bool got_fend = false;
         bool saw_tiles = false;
+        bool got_meta = false;
+        bool got_iccp = false;
+        bool got_prov = false;
+        bool got_anim = false;
 
         while (!r.at_end())
         {
@@ -338,11 +358,24 @@ namespace wk
                 {
                     return std::unexpected(Error{ErrorCode::InvalidChunkType, "META must precede TILE chunks"});
                 }
-                auto meta = meta::MetaBlock::parse(chunk->payload);
-                if (meta)
+                // META, ICCP, PROV, and ANIM are singleton chunks (SPEC
+                // section 1.3): a second copy must be rejected, not
+                // silently overwrite the first.
+                if (got_meta)
                 {
-                    file.metadata = std::move(*meta);
+                    return std::unexpected(Error{ErrorCode::InvalidChunkType, "duplicate META chunk"});
                 }
+                // A META chunk that fails to parse must be rejected, not
+                // silently dropped: dropping it would discard metadata
+                // the file claims to carry.
+                auto meta = meta::MetaBlock::parse(chunk->payload);
+                if (!meta)
+                {
+                    return std::unexpected(Error{ErrorCode::MetaParseError,
+                                                 "META chunk failed to parse: " + meta.error().message});
+                }
+                file.metadata = std::move(*meta);
+                got_meta = true;
                 continue;
             }
             if (chunk->is_type(CHUNK_ICCP))
@@ -351,7 +384,12 @@ namespace wk
                 {
                     return std::unexpected(Error{ErrorCode::InvalidChunkType, "ICCP must precede TILE chunks"});
                 }
+                if (got_iccp)
+                {
+                    return std::unexpected(Error{ErrorCode::InvalidChunkType, "duplicate ICCP chunk"});
+                }
                 file.icc_profile = std::move(chunk->payload);
+                got_iccp = true;
                 continue;
             }
             if (chunk->is_type(CHUNK_PROV))
@@ -360,7 +398,12 @@ namespace wk
                 {
                     return std::unexpected(Error{ErrorCode::InvalidChunkType, "PROV must precede TILE chunks"});
                 }
+                if (got_prov)
+                {
+                    return std::unexpected(Error{ErrorCode::InvalidChunkType, "duplicate PROV chunk"});
+                }
                 file.c2pa_manifest = std::move(chunk->payload);
+                got_prov = true;
                 continue;
             }
             if (chunk->is_type(CHUNK_ANIM))
@@ -369,10 +412,15 @@ namespace wk
                 {
                     return std::unexpected(Error{ErrorCode::InvalidChunkType, "ANIM must precede TILE chunks"});
                 }
+                if (got_anim)
+                {
+                    return std::unexpected(Error{ErrorCode::InvalidChunkType, "duplicate ANIM chunk"});
+                }
                 auto anim = parse_anim(chunk->payload);
                 if (!anim)
                     return std::unexpected(anim.error());
                 file.animation = std::move(*anim);
+                got_anim = true;
                 continue;
             }
             if (chunk->is_type(CHUNK_TILE))

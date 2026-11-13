@@ -341,3 +341,156 @@ TEST(ContainerTest, ParseFhdrRejectsJustOverPixelCap) {
     ASSERT_FALSE(parsed.has_value());
     EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
 }
+
+// Regression tests for the PR4 strict-container review (2026-11-13):
+// parse_fhdr read exactly the 20 header bytes and ignored anything after
+// them, parse_anim accepted trailing bytes past the last frame entry,
+// a META chunk that failed to parse was silently dropped, and duplicate
+// META/ICCP/PROV/ANIM chunks silently overwrote the first copy.
+TEST(ContainerTest, ParseFhdrRejectsTrailingBytes) {
+    // A 24-byte FHDR payload: the 19 valid bytes plus 5 trailing bytes.
+    // (The FHDR field table sums to 19 bytes -- 4+4+1+1+1+1+2+1+2+2 --
+    // even though the old spec heading said 20; the heading was wrong,
+    // the code was right, and the heading is corrected with this fix.)
+    auto bytes = serialize_fhdr(make_test_header());
+    ASSERT_EQ(bytes.size(), 19u);
+    for (int i = 0; i < 5; ++i) {
+        bytes.push_back(0);
+    }
+
+    auto parsed = parse_fhdr(bytes);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+}
+
+TEST(ContainerTest, ParseAnimRejectsTrailingBytes) {
+    AnimHeader anim;
+    anim.frame_count = 1;
+    anim.loop_count = 0;
+    anim.background_rgba = 0;
+    AnimFrame frame;
+    frame.delay_ms = 100;
+    anim.frames.push_back(frame);
+
+    auto bytes = serialize_anim(anim);
+    ASSERT_EQ(bytes.size(), 26u);  // 10 header + 1 frame * 16
+    bytes.push_back(0);            // one trailing byte
+
+    auto parsed = parse_anim(bytes);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsMalformedMeta) {
+    // An empty META payload cannot even hold the 3-byte envelope, so
+    // MetaBlock::parse fails -- and that failure must surface instead of
+    // the chunk being silently dropped.
+    ByteWriter writer;
+    writer.write_bytes({WK_MAGIC, 5});
+    writer.write_u16(WK_VERSION);
+    append_chunk(writer, CHUNK_FHDR, 0, serialize_fhdr(make_test_header()));
+    append_chunk(writer, CHUNK_WKMETA, CHUNK_FLAG_OPTIONAL | CHUNK_FLAG_META_ONLY, {});
+    append_chunk(writer, CHUNK_FEND, 0, {});
+
+    auto parsed = parse_container(writer.finish());
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::MetaParseError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsDuplicateMeta) {
+    meta::MetaBlock meta;
+    ASSERT_TRUE(meta.set(meta::Namespace::Geo, meta::geo::LAT, 1.234).has_value());
+    const auto meta_bytes = meta.serialize();
+
+    ByteWriter writer;
+    writer.write_bytes({WK_MAGIC, 5});
+    writer.write_u16(WK_VERSION);
+    append_chunk(writer, CHUNK_FHDR, 0, serialize_fhdr(make_test_header()));
+    append_chunk(writer, CHUNK_WKMETA, CHUNK_FLAG_OPTIONAL | CHUNK_FLAG_META_ONLY, meta_bytes);
+    append_chunk(writer, CHUNK_WKMETA, CHUNK_FLAG_OPTIONAL | CHUNK_FLAG_META_ONLY, meta_bytes);
+    append_chunk(writer, CHUNK_FEND, 0, {});
+
+    auto parsed = parse_container(writer.finish());
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidChunkType);
+}
+
+TEST(ContainerTest, ParseContainerRejectsDuplicateIccp) {
+    const std::vector<uint8_t> icc = {0x01, 0x02, 0x03};
+
+    ByteWriter writer;
+    writer.write_bytes({WK_MAGIC, 5});
+    writer.write_u16(WK_VERSION);
+    append_chunk(writer, CHUNK_FHDR, 0, serialize_fhdr(make_test_header()));
+    append_chunk(writer, CHUNK_ICCP, CHUNK_FLAG_OPTIONAL, icc);
+    append_chunk(writer, CHUNK_ICCP, CHUNK_FLAG_OPTIONAL, icc);
+    append_chunk(writer, CHUNK_FEND, 0, {});
+
+    auto parsed = parse_container(writer.finish());
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidChunkType);
+}
+
+TEST(ContainerTest, ParseContainerRejectsDuplicateProv) {
+    const std::vector<uint8_t> prov = {0x0A, 0x0B};
+
+    ByteWriter writer;
+    writer.write_bytes({WK_MAGIC, 5});
+    writer.write_u16(WK_VERSION);
+    append_chunk(writer, CHUNK_FHDR, 0, serialize_fhdr(make_test_header()));
+    append_chunk(writer, CHUNK_PROV, CHUNK_FLAG_OPTIONAL, prov);
+    append_chunk(writer, CHUNK_PROV, CHUNK_FLAG_OPTIONAL, prov);
+    append_chunk(writer, CHUNK_FEND, 0, {});
+
+    auto parsed = parse_container(writer.finish());
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidChunkType);
+}
+
+TEST(ContainerTest, ParseContainerRejectsDuplicateAnim) {
+    AnimHeader anim;
+    anim.frame_count = 0;
+    anim.loop_count = 0;
+    anim.background_rgba = 0;
+    const auto anim_bytes = serialize_anim(anim);
+
+    ByteWriter writer;
+    writer.write_bytes({WK_MAGIC, 5});
+    writer.write_u16(WK_VERSION);
+    append_chunk(writer, CHUNK_FHDR, 0, serialize_fhdr(make_test_header()));
+    append_chunk(writer, CHUNK_ANIM, 0, anim_bytes);
+    append_chunk(writer, CHUNK_ANIM, 0, anim_bytes);
+    append_chunk(writer, CHUNK_FEND, 0, {});
+
+    auto parsed = parse_container(writer.finish());
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidChunkType);
+}
+
+TEST(ContainerTest, ParseContainerAcceptsSingletonsOnce) {
+    // Control: one of each singleton chunk is still accepted.
+    meta::MetaBlock meta;
+    ASSERT_TRUE(meta.set(meta::Namespace::Geo, meta::geo::LAT, 1.234).has_value());
+
+    AnimHeader anim;
+    anim.frame_count = 0;
+    anim.loop_count = 0;
+    anim.background_rgba = 0;
+
+    ByteWriter writer;
+    writer.write_bytes({WK_MAGIC, 5});
+    writer.write_u16(WK_VERSION);
+    append_chunk(writer, CHUNK_FHDR, 0, serialize_fhdr(make_test_header()));
+    append_chunk(writer, CHUNK_WKMETA, CHUNK_FLAG_OPTIONAL | CHUNK_FLAG_META_ONLY, meta.serialize());
+    append_chunk(writer, CHUNK_ICCP, CHUNK_FLAG_OPTIONAL, std::vector<uint8_t>{0x01, 0x02, 0x03});
+    append_chunk(writer, CHUNK_PROV, CHUNK_FLAG_OPTIONAL, std::vector<uint8_t>{0x0A, 0x0B});
+    append_chunk(writer, CHUNK_ANIM, 0, serialize_anim(anim));
+    append_chunk(writer, CHUNK_FEND, 0, {});
+
+    auto parsed = parse_container(writer.finish());
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    EXPECT_TRUE(parsed->metadata.has_value());
+    EXPECT_EQ(parsed->icc_profile.size(), 3u);
+    EXPECT_EQ(parsed->c2pa_manifest.size(), 2u);
+    EXPECT_TRUE(parsed->animation.has_value());
+}
