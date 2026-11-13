@@ -26,27 +26,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "tool_common.h"
 
 namespace {
-
-wk::Result<std::vector<uint8_t>> read_file_bytes(std::string_view path) {
-    std::ifstream file(std::string(path), std::ios::binary | std::ios::ate);
-    if (!file) {
-        return std::unexpected(wk::Error{wk::ErrorCode::IoError, "failed to open file"});
-    }
-
-    const std::streamsize size = file.tellg();
-    if (size < 0) {
-        return std::unexpected(wk::Error{wk::ErrorCode::IoError, "failed to determine file size"});
-    }
-    file.seekg(0, std::ios::beg);
-
-    std::vector<uint8_t> bytes(static_cast<size_t>(size));
-    if (!file.read(reinterpret_cast<char*>(bytes.data()), size)) {
-        return std::unexpected(wk::Error{wk::ErrorCode::IoError, "failed to read file"});
-    }
-    return bytes;
-}
 
 std::string default_output_path(std::string_view input_path) {
     std::filesystem::path path{std::string(input_path)};
@@ -96,7 +78,7 @@ void merge_metadata(wk::meta::MetaBlock& destination, const wk::meta::MetaBlock&
 
 wk::Result<std::vector<uint8_t>> apply_exif_metadata(std::span<const uint8_t> encoded,
                                                      std::string_view exif_source_path) {
-    auto donor_bytes = read_file_bytes(exif_source_path);
+    auto donor_bytes = wk::tool::read_file_bytes(exif_source_path);
     if (!donor_bytes) {
         return std::unexpected(donor_bytes.error());
     }
@@ -140,7 +122,6 @@ void print_usage() {
         << "  --lossless              Encode losslessly\n"
         << "  --tile-size N           Explicit tile size in pixels (64..1024, power of two)\n"
         << "  --threads N             Thread count (0 = auto)\n"
-        << "  --target-ssimulacra2 N  Target SSIMULACRA2 score\n"
         << "  --yuv444                Use 4:4:4 chroma (default)\n"
         << "  --yuv420                Use 4:2:0 chroma\n"
         << "  --import-exif FILE      Import EXIF from JPEG/TIFF donor file\n"
@@ -199,17 +180,6 @@ int main(int argc, char* argv[]) {
                 config.threads = static_cast<uint32_t>(std::stoul(argv[++i]));
             } catch (...) {
                 std::cerr << "Error: invalid thread count\n";
-                return 1;
-            }
-        } else if (arg == "--target-ssimulacra2") {
-            if (i + 1 >= argc) {
-                std::cerr << "Error: --target-ssimulacra2 requires a value\n";
-                return 1;
-            }
-            try {
-                config.target_ssimulacra2 = std::stof(argv[++i]);
-            } catch (...) {
-                std::cerr << "Error: invalid SSIMULACRA2 target\n";
                 return 1;
             }
         } else if (arg == "--yuv444") {

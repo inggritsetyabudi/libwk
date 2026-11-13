@@ -70,7 +70,7 @@ extern "C"
         uint8_t cicp_matrix;
         uint8_t tile_size_log2;
         uint8_t threads;
-        float target_ssimulacra2;
+        float target_ssimulacra2;  // Reserved: accepted but currently ignored.
         uint8_t chroma_subsampling;
         uint8_t full_range;
     } wk_encoder_config_t;

@@ -31,6 +31,20 @@ namespace wk {
     return 1024 << shift;
 }
 
+// The coefficient stream's symbol range is bit-depth aware (see
+// coeff_symbol_offset above): a quantized coefficient outside that range
+// reaches the decoder clamped, while the encoder's in-loop reconstruction
+// would use the unclamped value -- so prediction for every following
+// block would drift from what the decoder computes. Clamp here, once,
+// so the stored coefficients, the reconstruction, and the stream all
+// agree on the same values.
+inline void clamp_quantized_to_stream_range(DctBlockI16& quantized, uint8_t bit_depth) {
+    const int16_t limit = static_cast<int16_t>(coeff_symbol_offset(bit_depth));
+    for (int i = 0; i < 64; ++i) {
+        quantized[i] = std::clamp<int16_t>(quantized[i], static_cast<int16_t>(-limit), limit);
+    }
+}
+
 struct LossyCoeffStreamConfig {
     bool use_plane_max_coeff_span = false;
     bool adaptive_coefficient_tables = true;

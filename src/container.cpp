@@ -116,6 +116,20 @@ namespace wk
             return std::unexpected(Error{ErrorCode::InvalidBitDepth,
                                          "bit_depth must be 8, 10, or 12"});
         }
+        // The converter only implements these CICP values (colorspace.h):
+        // anything else used to silently fall back to BT.709 / sRGB,
+        // so a file claiming an unsupported matrix or transfer decoded
+        // with the wrong colors. Reject it here instead.
+        if (hdr.cicp_matrix != 1 && hdr.cicp_matrix != 5 && hdr.cicp_matrix != 6 && hdr.cicp_matrix != 9)
+        {
+            return std::unexpected(Error{ErrorCode::InvalidHeader,
+                                         "unknown CICP matrix coefficient"});
+        }
+        if (hdr.cicp_transfer != 1 && hdr.cicp_transfer != 13 && hdr.cicp_transfer != 16 && hdr.cicp_transfer != 18)
+        {
+            return std::unexpected(Error{ErrorCode::InvalidHeader,
+                                         "unknown CICP transfer characteristic"});
+        }
         if (hdr.tile_size_log2 < 6 || hdr.tile_size_log2 > 10)
         {
             return std::unexpected(Error{ErrorCode::InvalidHeader,
@@ -465,6 +479,26 @@ namespace wk
         if (!got_fend)
         {
             return std::unexpected(Error{ErrorCode::InvalidChunkType, "missing FEND chunk"});
+        }
+
+        // The FHDR flags must agree with the chunks actually present:
+        // a flag claiming metadata, animation, or a C2PA manifest that
+        // is not in the file (or a chunk the flags do not claim) means
+        // the file is malformed, not merely unusual.
+        if (file.header.has_wkmeta() != got_meta)
+        {
+            return std::unexpected(Error{ErrorCode::InvalidHeader,
+                                         "FHDR HAS_WKMETA flag does not match META chunk presence"});
+        }
+        if (file.header.is_animated() != got_anim)
+        {
+            return std::unexpected(Error{ErrorCode::InvalidHeader,
+                                         "FHDR ANIMATED flag does not match ANIM chunk presence"});
+        }
+        if (((file.header.flags & FHDR_FLAG_HAS_C2PA) != 0) != got_prov)
+        {
+            return std::unexpected(Error{ErrorCode::InvalidHeader,
+                                         "FHDR HAS_C2PA flag does not match PROV chunk presence"});
         }
 
         return file;

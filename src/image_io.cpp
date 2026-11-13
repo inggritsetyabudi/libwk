@@ -188,6 +188,12 @@ Result<void> save_ppm(std::string_view path, const Image& image) {
     } else {
         file.write(reinterpret_cast<const char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
     }
+    // ofstream buffers silently: a full disk or broken pipe only shows
+    // up when the stream is flushed, so check before reporting success.
+    file.flush();
+    if (!file) {
+        return std::unexpected(Error{ErrorCode::IoError, "failed to write output file"});
+    }
     return {};
 }
 

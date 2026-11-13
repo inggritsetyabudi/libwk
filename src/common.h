@@ -417,7 +417,11 @@ namespace wk
         }
         [[nodiscard]] uint32_t tile_count() const
         {
-            return tiles_x() * tiles_y();
+            // The product is formed in 64-bit: the parse_fhdr caps
+            // (65535 px per side, 2^28 pixels) bound it far below
+            // 2^32, but the multiply itself must not be the thing
+            // that overflows first if those caps ever change.
+            return static_cast<uint32_t>(static_cast<uint64_t>(tiles_x()) * tiles_y());
         }
         [[nodiscard]] uint16_t max_sample_value() const
         {

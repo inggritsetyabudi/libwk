@@ -24,27 +24,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "tool_common.h"
 
 namespace {
-
-wk::Result<std::vector<uint8_t>> read_file_bytes(std::string_view path) {
-    std::ifstream file(std::string(path), std::ios::binary | std::ios::ate);
-    if (!file) {
-        return std::unexpected(wk::Error{wk::ErrorCode::IoError, "failed to open file"});
-    }
-
-    const std::streamsize size = file.tellg();
-    if (size < 0) {
-        return std::unexpected(wk::Error{wk::ErrorCode::IoError, "failed to determine file size"});
-    }
-    file.seekg(0, std::ios::beg);
-
-    std::vector<uint8_t> bytes(static_cast<size_t>(size));
-    if (!file.read(reinterpret_cast<char*>(bytes.data()), size)) {
-        return std::unexpected(wk::Error{wk::ErrorCode::IoError, "failed to read file"});
-    }
-    return bytes;
-}
 
 wk::Result<void> write_text_file(std::string_view path, std::string_view text) {
     std::ofstream file(std::string(path), std::ios::binary);
@@ -141,7 +123,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    auto input_bytes = read_file_bytes(input_path);
+    auto input_bytes = wk::tool::read_file_bytes(input_path);
     if (!input_bytes) {
         std::cerr << "Error: " << input_bytes.error().message << '\n';
         return 1;

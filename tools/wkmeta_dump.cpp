@@ -38,7 +38,10 @@ int main(int argc, char* argv[]) {
     size_t file_size = static_cast<size_t>(in.tellg());
     in.seekg(0);
     std::vector<uint8_t> data(file_size);
-    in.read(reinterpret_cast<char*>(data.data()), file_size);
+    if (!in.read(reinterpret_cast<char*>(data.data()), file_size)) {
+        std::fprintf(stderr, "Error: failed to read %s\n", input_path);
+        return 1;
+    }
     in.close();
 
     auto file = wk::parse_container(data);
@@ -52,7 +55,10 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    std::printf("%s", file->metadata->to_json().c_str());
+    if (std::printf("%s", file->metadata->to_json().c_str()) < 0) {
+        std::fprintf(stderr, "Error: failed to write output\n");
+        return 1;
+    }
 
     return 0;
 }

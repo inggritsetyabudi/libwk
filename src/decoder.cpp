@@ -20,6 +20,7 @@
 #include "lossy_coeff_stream.h"
 #include "mode_stream.h"
 #include "predict.h"
+#include "quantize.h"
 #include "colorspace.h"
 #include "lossless.h"
 #include <wk/wk.hpp>
@@ -205,25 +206,29 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     if (!layout_tag) {
         return std::unexpected(Error{ErrorCode::TruncatedInput, "missing lossy tile layout tag"});
     }
+    // V7 behaves exactly like V6 for every syntax feature; it only adds
+    // the per-block quant-scale streams after the syntax-flags byte.
+    const bool is_v7 = *layout_tag == kLossyTileLayoutTagV7;
+    const bool is_v6_family = *layout_tag == kLossyTileLayoutTagV6 || is_v7;
     const bool packed_mode_streams = *layout_tag == kLossyTileLayoutTagV2 ||
                                      *layout_tag == kLossyTileLayoutTagV3 ||
                                      *layout_tag == kLossyTileLayoutTagV4 ||
                                      *layout_tag == kLossyTileLayoutTagV5 ||
-                                     *layout_tag == kLossyTileLayoutTagV6;
+                                     is_v6_family;
     const bool raw_mode_streams = *layout_tag == kLossyTileLayoutTagV1;
     const bool packed_coefficient_spans = *layout_tag == kLossyTileLayoutTagV3 ||
                                           *layout_tag == kLossyTileLayoutTagV4 ||
                                           *layout_tag == kLossyTileLayoutTagV5 ||
-                                          *layout_tag == kLossyTileLayoutTagV6;
+                                          is_v6_family;
     const bool adaptive_coefficient_tables = *layout_tag == kLossyTileLayoutTagV4 ||
                                              *layout_tag == kLossyTileLayoutTagV5 ||
-                                             *layout_tag == kLossyTileLayoutTagV6;
+                                             is_v6_family;
     if (!packed_mode_streams && !raw_mode_streams) {
         return std::unexpected(Error{ErrorCode::DecodeFailed, "unsupported lossy tile layout"});
     }
 
     uint8_t syntax_flags = 0;
-    if (*layout_tag == kLossyTileLayoutTagV6) {
+    if (is_v6_family) {
         auto flags = reader.read_u8();
         if (!flags) {
             return std::unexpected(Error{ErrorCode::TruncatedInput, "missing lossy tile syntax flags"});
@@ -240,22 +245,82 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
             return std::unexpected(Error{ErrorCode::DecodeFailed, "lossy tile syntax flags are invalid"});
         }
     }
-    const bool adaptive_span_streams = *layout_tag == kLossyTileLayoutTagV6 &&
+
+    // V7 per-block quant scales (SPEC 3.2): sparse lists, one per plane,
+    // read immediately after the syntax-flags byte. Strictly validated:
+    // count within the plane's block count, indices in range and
+    // strictly increasing, scale index within the factor table.
+    auto read_quant_scale_stream = [&](size_t block_count, std::string_view label)
+        -> Result<std::vector<float>> {
+        std::vector<float> scales(block_count, 1.0f);
+        auto count = reader.read_u16();
+        if (!count) {
+            return std::unexpected(count.error());
+        }
+        if (*count > block_count) {
+            return std::unexpected(Error{ErrorCode::DecodeFailed,
+                std::string("quant scale count exceeds ") + std::string(label) + " block count"});
+        }
+        size_t prev_index = 0;
+        bool first = true;
+        for (uint16_t i = 0; i < *count; ++i) {
+            auto index = reader.read_u16();
+            if (!index) {
+                return std::unexpected(index.error());
+            }
+            auto scale = reader.read_u8();
+            if (!scale) {
+                return std::unexpected(scale.error());
+            }
+            if (*index >= block_count) {
+                return std::unexpected(Error{ErrorCode::DecodeFailed,
+                    std::string("quant scale block index out of range in ") + std::string(label)});
+            }
+            if (!first && *index <= prev_index) {
+                return std::unexpected(Error{ErrorCode::DecodeFailed,
+                    std::string("quant scale block indices not strictly increasing in ") + std::string(label)});
+            }
+            if (*scale >= QuantTable::kQuantScaleFactors.size()) {
+                return std::unexpected(Error{ErrorCode::DecodeFailed,
+                    std::string("quant scale index out of range in ") + std::string(label)});
+            }
+            scales[*index] = QuantTable::kQuantScaleFactors[*scale];
+            prev_index = *index;
+            first = false;
+        }
+        return scales;
+    };
+
+    std::vector<float> y_scales;
+    std::vector<float> c_scales;
+    if (is_v7) {
+        auto y = read_quant_scale_stream(static_cast<size_t>(blocks_x) * blocks_y, "luma");
+        if (!y) {
+            return std::unexpected(y.error());
+        }
+        y_scales = std::move(*y);
+        auto c = read_quant_scale_stream(static_cast<size_t>(chroma_blocks_x) * chroma_blocks_y, "chroma");
+        if (!c) {
+            return std::unexpected(c.error());
+        }
+        c_scales = std::move(*c);
+    }
+    const bool adaptive_span_streams = is_v6_family &&
         (syntax_flags & kLossyTileSyntaxFlagAdaptiveSpanStreams) != 0;
-    const bool split_magnitude_signs = *layout_tag == kLossyTileLayoutTagV6 &&
+    const bool split_magnitude_signs = is_v6_family &&
         (syntax_flags & kLossyTileSyntaxFlagSplitMagnitudeSigns) != 0;
-    const bool shared_chroma_coeff_tables = *layout_tag == kLossyTileLayoutTagV6 &&
+    const bool shared_chroma_coeff_tables = is_v6_family &&
         (syntax_flags & kLossyTileSyntaxFlagSharedChromaCoeffTables) != 0;
-    const bool coefficient_table_bank = *layout_tag == kLossyTileLayoutTagV6 &&
+    const bool coefficient_table_bank = is_v6_family &&
         (syntax_flags & kLossyTileSyntaxFlagCoefficientTableBank) != 0;
-    const bool elide_single_symbol_streams = *layout_tag == kLossyTileLayoutTagV6 &&
+    const bool elide_single_symbol_streams = is_v6_family &&
         (syntax_flags & kLossyTileSyntaxFlagElideSingleSymbolStreams) != 0;
-    const bool coefficient_significance_maps = *layout_tag == kLossyTileLayoutTagV6 &&
+    const bool coefficient_significance_maps = is_v6_family &&
         (syntax_flags & kLossyTileSyntaxFlagCoefficientSignificanceMaps) != 0;
-    const bool adaptive_coefficient_signs = *layout_tag == kLossyTileLayoutTagV6 &&
+    const bool adaptive_coefficient_signs = is_v6_family &&
         (syntax_flags & kLossyTileSyntaxFlagAdaptiveCoefficientSigns) != 0;
     const bool explicit_plane_max_coeff_spans = *layout_tag == kLossyTileLayoutTagV5 ||
-        (*layout_tag == kLossyTileLayoutTagV6 &&
+        (is_v6_family &&
          (syntax_flags & kLossyTileSyntaxFlagPlaneCoeffExtents) != 0);
 
     auto geometry = infer_tile_geometry(tile_x, tile_y, tile_size, image_width, image_height,
@@ -294,6 +359,22 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
                                             : read_raw_modes(num_c_blocks, "chroma");
     if (!chroma_modes) {
         return std::unexpected(chroma_modes.error());
+    }
+
+    // PLANAR (mode 13) is only valid in layout V7 (SPEC 6).
+    if (!is_v7) {
+        auto uses_planar = [](const std::vector<PredMode>& modes) {
+            for (PredMode mode : modes) {
+                if (mode == PredMode::PLANAR) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (uses_planar(*y_modes) || uses_planar(*chroma_modes)) {
+            return std::unexpected(Error{ErrorCode::DecodeFailed,
+                                         "planar prediction mode requires layout V7"});
+        }
     }
 
     std::vector<uint8_t> y_spans(num_y_blocks, 64);
@@ -391,9 +472,10 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     for (uint32_t by = 0; by < blocks_y; ++by) {
         for (uint32_t bx = 0; bx < blocks_x; ++bx) {
             const size_t block_index = static_cast<size_t>(by) * blocks_x + bx;
+            const float block_scale = is_v7 ? y_scales[block_index] : 1.0f;
             DctBlock recon_dct{};
             for (int i = 0; i < 64; ++i) {
-                recon_dct[ZIGZAG_ORDER[i]] = static_cast<float>((*y_coeffs)[block_index][i]) * y_steps[i];
+                recon_dct[ZIGZAG_ORDER[i]] = static_cast<float>((*y_coeffs)[block_index][i]) * y_steps[i] * block_scale;
             }
             dct_2d_inverse(recon_dct);
 
@@ -450,9 +532,10 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
         for (uint32_t by = 0; by < chroma_blocks_y; ++by) {
             for (uint32_t bx = 0; bx < chroma_blocks_x; ++bx) {
                 const size_t block_index = static_cast<size_t>(by) * chroma_blocks_x + bx;
+                const float block_scale = is_v7 ? c_scales[block_index] : 1.0f;
                 DctBlock recon_dct{};
                 for (int i = 0; i < 64; ++i) {
-                    recon_dct[ZIGZAG_ORDER[i]] = static_cast<float>(coeffs[block_index][i]) * c_steps[i];
+                    recon_dct[ZIGZAG_ORDER[i]] = static_cast<float>(coeffs[block_index][i]) * c_steps[i] * block_scale;
                 }
                 dct_2d_inverse(recon_dct);
 
@@ -528,6 +611,14 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
                                            : read_raw_modes(num_y_blocks, "alpha");
         if (!a_modes) {
             return std::unexpected(a_modes.error());
+        }
+        if (!is_v7) {
+            for (PredMode mode : *a_modes) {
+                if (mode == PredMode::PLANAR) {
+                    return std::unexpected(Error{ErrorCode::DecodeFailed,
+                                                 "planar prediction mode requires layout V7"});
+                }
+            }
         }
 
         std::vector<uint8_t> alpha_spans(num_y_blocks, 64);

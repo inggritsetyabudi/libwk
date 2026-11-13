@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 #include "../src/predict.h"
+#include "../src/quantize.h"
 #include <cstring>
 
 using namespace wk;
@@ -117,7 +118,9 @@ TEST_F(PredictTest, ModeSelectionPicksBest) {
         }
     }
 
-    auto result = select_best_mode(original, above, left, above_left, 1.0f, 255);
+    QuantTable quant;
+    quant.build(75.0f, false, 8);
+    auto result = select_best_mode(original, above, left, above_left, 1.0f, 255, quant, 8);
     EXPECT_EQ(result.mode, PredMode::V);
 }
 
@@ -130,10 +133,11 @@ TEST_F(PredictTest, ModeSelectionHorizontal) {
         }
     }
 
-    auto result = select_best_mode(original, above, left, above_left, 1.0f, 255);
+    QuantTable quant;
+    quant.build(75.0f, false, 8);
+    auto result = select_best_mode(original, above, left, above_left, 1.0f, 255, quant, 8);
     EXPECT_EQ(result.mode, PredMode::H);
 }
-
 TEST_F(PredictTest, DeterministicModeNoNeighborsUsesDc128) {
     EXPECT_EQ(select_deterministic_mode(nullptr, nullptr, above_left, 255), PredMode::DC_128);
 }
@@ -163,5 +167,29 @@ TEST_F(PredictTest, AllModesProduceValid) {
             EXPECT_GE(pred[i], 0) << "Mode " << m << " at " << i;
             EXPECT_LE(pred[i], 255) << "Mode " << m << " at " << i;
         }
+    }
+}
+
+// Planar (HEVC-style): a weighted average of the horizontal and
+// vertical linear interpolations between the references, so a smooth
+// 2D ramp is predicted as a ramp instead of a flat copy. The weights
+// sum to 16, so (sum + 8) >> 4 is the rounded average. Fixture:
+// above = 100,105,...,135; left = 80,90,...,150.
+TEST_F(PredictTest, PlanarMode) {
+    predict_8x8(PredMode::PLANAR, above, left, above_left, pred, 255);
+
+    EXPECT_EQ(pred[0], 97);    // (0,0): 7*80 + 135 + 7*100 + 150, /16
+    EXPECT_EQ(pred[7], 136);   // (0,7): 8*135 + 7*135 + 150, /16
+    EXPECT_EQ(pred[56], 149);  // (7,0): 7*150 + 135 + 8*150, /16
+    EXPECT_EQ(pred[63], 143);  // (7,7): 8*135 + 8*150, /16
+    EXPECT_EQ(pred[27], 128);  // (3,3): 4*110 + 4*135 + 4*115 + 4*150, /16
+    EXPECT_EQ(pred[3], 113);   // (0,3)
+    EXPECT_EQ(pred[24], 119);  // (3,0)
+}
+
+TEST_F(PredictTest, PlanarModeWithoutReferences) {
+    predict_8x8(PredMode::PLANAR, nullptr, nullptr, 128, pred, 255);
+    for (int i = 0; i < 64; i++) {
+        EXPECT_EQ(pred[i], 128) << "at " << i;
     }
 }

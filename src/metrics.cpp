@@ -42,18 +42,6 @@ uint8_t channel_count(const Image& image) {
     return image.has_alpha() ? 4u : 3u;
 }
 
-double sample_at(const Image& image, size_t pixel_index, uint8_t channel_index) {
-    const auto pixels = image.pixels();
-    const size_t channels = channel_count(image);
-    if (image.bit_depth() == BitDepth::Bits8) {
-        const size_t offset = pixel_index * channels + channel_index;
-        return static_cast<double>(pixels[offset]);
-    }
-
-    const size_t offset = (pixel_index * channels + channel_index) * 2;
-    return static_cast<double>(read_le16(pixels.data() + offset));
-}
-
 double psnr_from_mse(double mse, double max_value) {
     if (mse <= 1e-12) {
         return 100.0;
@@ -346,6 +334,27 @@ ArtifactMetrics compute_artifact_metrics(const Image& reference,
     return artifacts;
 }
 
+}
+
+double sample_at(const Image& image, size_t pixel_index, uint8_t channel_index) {
+    const auto pixels = image.pixels();
+    const size_t channels = channel_count(image);
+    const size_t bytes_per_sample = image.bit_depth() == BitDepth::Bits8 ? 1u : 2u;
+    // Out-of-range reads used to walk off the end of the pixel buffer
+    // whenever a caller indexed past the image (e.g. comparing images
+    // of different sizes). compare_images() rejects mismatched sizes
+    // first, so this only fires on a caller bug -- return 0 rather
+    // than reading out of bounds.
+    if (pixel_index >= pixels.size() / (channels * bytes_per_sample) || channel_index >= channels) {
+        return 0.0;
+    }
+    if (image.bit_depth() == BitDepth::Bits8) {
+        const size_t offset = pixel_index * channels + channel_index;
+        return static_cast<double>(pixels[offset]);
+    }
+
+    const size_t offset = (pixel_index * channels + channel_index) * 2;
+    return static_cast<double>(read_le16(pixels.data() + offset));
 }
 
 Result<ImageMetrics> compare_images(const Image& reference, const Image& candidate, bool include_alpha) {

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(wk VERSION 0.1.0 LANGUAGES CXX)
+project(wk VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,7 +36,7 @@ else()
     endfunction()
 endif()
 
-file(GLOB_RECURSE WK_SOURCES src/*.cpp)
+file(GLOB_RECURSE WK_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 list(FILTER WK_SOURCES EXCLUDE REGEX "tools/")
 
 add_library(wk STATIC ${WK_SOURCES})
@@ -72,7 +72,9 @@ if(WK_BUILD_VIEWER)
     FetchContent_Declare(
         minifb
         GIT_REPOSITORY https://github.com/emoon/minifb.git
-        GIT_TAG v0.10.1
+        # v0.10.1, pinned to its commit so the build does not move
+        # when the tag does.
+        GIT_TAG 51f8004058a99fe024328b7f0848a6e353bfac86
     )
     if(WIN32)
         set(MINIFB_USE_OPENGL_API OFF CACHE BOOL "" FORCE)
@@ -97,7 +99,9 @@ if(WK_BUILD_TESTS)
     FetchContent_Declare(
         googletest
         GIT_REPOSITORY https://github.com/google/googletest.git
-        GIT_TAG v1.14.0
+        # v1.14.0, pinned to its commit so the build does not move
+        # when the tag does.
+        GIT_TAG f8d7d77c06936315286eb55f8de22cd23c188571
     )
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
@@ -134,3 +138,11 @@ if(WK_BUILD_TESTS)
     wk_add_test(exif_gps_test tests/exif_gps_test.cpp)
     wk_add_test(wkmeta_strict_test tests/wkmeta_strict_test.cpp)
 endif()
+
+# Install the library, the command-line tools, and the public headers.
+install(TARGETS wk ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
+install(TARGETS wkenc wkdec wkmetric wkmeta-dump wkmeta-edit RUNTIME DESTINATION bin)
+if(WK_BUILD_VIEWER)
+    install(TARGETS wkview RUNTIME DESTINATION bin)
+endif()
+install(DIRECTORY include/ DESTINATION include)

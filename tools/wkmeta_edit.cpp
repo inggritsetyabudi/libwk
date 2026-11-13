@@ -27,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "tool_common.h"
 
 namespace {
 
@@ -376,25 +377,6 @@ std::expected<wk::meta::Value, std::string> parse_value_str(const std::string& n
     return value_str;
 }
 
-wk::Result<std::vector<uint8_t>> read_file_bytes(std::string_view path) {
-    std::ifstream file(std::string(path), std::ios::binary | std::ios::ate);
-    if (!file) {
-        return std::unexpected(wk::Error{wk::ErrorCode::IoError, "failed to open file"});
-    }
-
-    const std::streamsize size = file.tellg();
-    if (size < 0) {
-        return std::unexpected(wk::Error{wk::ErrorCode::IoError, "failed to determine file size"});
-    }
-    file.seekg(0, std::ios::beg);
-
-    std::vector<uint8_t> bytes(static_cast<size_t>(size));
-    if (!file.read(reinterpret_cast<char*>(bytes.data()), size)) {
-        return std::unexpected(wk::Error{wk::ErrorCode::IoError, "failed to read file"});
-    }
-    return bytes;
-}
-
 void merge_metadata(wk::meta::MetaBlock& destination, const wk::meta::MetaBlock& source) {
     for (const auto& entry : source.entries) {
         if (entry.is_opaque) {
@@ -491,7 +473,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    auto input_bytes = read_file_bytes(input_path);
+    auto input_bytes = wk::tool::read_file_bytes(input_path);
     if (!input_bytes) {
         std::cerr << "Error: " << input_bytes.error().message << '\n';
         return 1;
@@ -559,7 +541,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (!exif_source_path.empty()) {
-        auto donor_bytes = read_file_bytes(exif_source_path);
+        auto donor_bytes = wk::tool::read_file_bytes(exif_source_path);
         if (!donor_bytes) {
             std::cerr << "Error: " << donor_bytes.error().message << '\n';
             return 1;

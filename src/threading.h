@@ -43,7 +43,6 @@ public:
     }
 
     [[nodiscard]] uint32_t num_threads() const { return 1; }
-    void wait_all() {}
     static uint32_t default_thread_count() { return 1; }
 };
 
@@ -95,7 +94,6 @@ public:
         return static_cast<uint32_t>(workers_.size());
     }
 
-    void wait_all();
     static uint32_t default_thread_count();
 
 private:
@@ -103,9 +101,7 @@ private:
     std::queue<std::function<void()>>  tasks_;
     std::mutex                         mutex_;
     std::condition_variable            cv_;
-    std::condition_variable            done_cv_;
     std::atomic<bool>                  stop_{false};
-    std::atomic<int>                   active_tasks_{0};
 };
 
 }
