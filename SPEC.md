@@ -148,8 +148,16 @@ FILE HEADER (magic + version)
      - `1`: all decoded non-zero magnitudes are positive, so no sign payload bytes are stored
      - `2`: all decoded non-zero magnitudes are negative, so no sign payload bytes are stored
 7. **rANS-coded coefficients**:
-   - Legacy signed coding stores symbols in the range `[-1024, 1024]` mapped to `[0, 2048]`.
-   - If layout tag `0x364D4843` sets syntax flag bit `2`, each coefficient context stores magnitude symbols in the range `[0, 1024]`, then stores packed sign bits for the non-zero magnitudes in block decode order.
+   - The coefficient symbol range is bit-depth aware: the magnitude
+     limit is `1024 << (bit_depth - 8)`, i.e. `+-1024` at 8-bit, `+-4096`
+     at 10-bit, `+-16384` at 12-bit. The limit is derived from the FHDR
+     bit depth, which both sides already know, so it is not stored in
+     the stream. The 8-bit range is the historical one, so 8-bit files
+     are unchanged.
+   - Legacy signed coding stores symbols in the range `[-limit, limit]`
+     mapped to `[0, 2*limit]` (at 8-bit: `[-1024, 1024]` mapped to
+     `[0, 2048]`).
+   - If layout tag `0x364D4843` sets syntax flag bit `2`, each coefficient context stores magnitude symbols in the range `[0, limit]` (at 8-bit: `[0, 1024]`), then stores packed sign bits for the non-zero magnitudes in block decode order.
    - The packed sign stream has no explicit byte length; its size is derived from the decoded non-zero magnitude count as `ceil(nonzero_count / 8)`.
    - If syntax flag bit `3` is set, each chroma coefficient context serializes `shared_table + cb_stream + cr_stream` instead of two independent table+stream pairs.
    - If syntax flag bit `5` is set and the coefficient table is single-symbol:
@@ -175,7 +183,7 @@ FILE HEADER (magic + version)
 | 4      | 2    | loop_count      | uint16 (0=infinite) |
 | 6      | 4    | background_rgba | uint32 |
 
-Followed by `frame_count` frame entries (14 bytes each):
+Followed by `frame_count` frame entries (16 bytes each):
 
 | Offset | Size | Field      | Type   |
 |--------|------|------------|--------|

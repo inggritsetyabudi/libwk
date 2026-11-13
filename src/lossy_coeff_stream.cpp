@@ -27,28 +27,26 @@ namespace wk {
 
 namespace {
 
-constexpr int kSignedOffset = 1024;
-constexpr int kSignedNumSymbols = 2049;
-constexpr int kMagnitudeNumSymbols = 1025;
 constexpr size_t kTableClusterCandidateLimit = 8;
 constexpr size_t kTableClusterMaxPasses = 2;
 
 struct SymbolCoding {
-    int num_symbols = kSignedNumSymbols;
+    int offset = 1024;
+    int num_symbols = 2049;
     bool split_magnitude_signs = false;
 
     [[nodiscard]] int encode(int value) const {
         if (split_magnitude_signs) {
-            return std::clamp(std::abs(value), 0, kMagnitudeNumSymbols - 1);
+            return std::clamp(std::abs(value), 0, offset);
         }
-        return std::clamp(value + kSignedOffset, 0, kSignedNumSymbols - 1);
+        return std::clamp(value + offset, 0, num_symbols - 1);
     }
 
     [[nodiscard]] int16_t decode(int symbol) const {
         if (split_magnitude_signs) {
             return static_cast<int16_t>(symbol);
         }
-        return static_cast<int16_t>(symbol - kSignedOffset);
+        return static_cast<int16_t>(symbol - offset);
     }
 };
 
@@ -82,7 +80,9 @@ struct CoeffContextAnalysis {
 [[nodiscard]] SymbolCoding make_symbol_coding(const LossyCoeffStreamConfig& config) {
     SymbolCoding coding;
     coding.split_magnitude_signs = config.split_magnitude_signs;
-    coding.num_symbols = config.split_magnitude_signs ? kMagnitudeNumSymbols : kSignedNumSymbols;
+    coding.offset = coeff_symbol_offset(config.bit_depth);
+    coding.num_symbols = config.split_magnitude_signs ? coding.offset + 1
+                                                       : 2 * coding.offset + 1;
     return coding;
 }
 
@@ -204,7 +204,7 @@ struct CoeffContextAnalysis {
 
 [[nodiscard]] LossyCoeffTable make_single_symbol_table(const SymbolCoding& coding) {
     std::vector<uint32_t> counts(static_cast<size_t>(coding.num_symbols), 0);
-    counts[static_cast<size_t>(coding.split_magnitude_signs ? 0 : kSignedOffset)] = 1;
+    counts[static_cast<size_t>(coding.split_magnitude_signs ? 0 : coding.offset)] = 1;
     LossyCoeffTable table;
     table.build_from_counts(counts.data(), coding.num_symbols);
     return table;

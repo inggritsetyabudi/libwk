@@ -30,6 +30,9 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <exception>
+#include <new>
+#include <optional>
 
 namespace wk {
 
@@ -365,6 +368,20 @@ static float adaptive_luma_quality_for_tile(float base_quality,
     return std::clamp(base_quality + delta, 1.0f, 100.0f);
 }
 
+// The coefficient stream's symbol range is bit-depth aware (see
+// coeff_symbol_offset in lossy_coeff_stream.h): a quantized coefficient
+// outside that range reaches the decoder clamped, while the encoder's
+// in-loop reconstruction would use the unclamped value -- so prediction
+// for every following block would drift from what the decoder computes.
+// Clamp here, once, so the stored coefficients, the reconstruction, and
+// the stream all agree on the same values.
+inline void clamp_quantized_to_stream_range(DctBlockI16& quantized, uint8_t bit_depth) {
+    const int16_t limit = static_cast<int16_t>(coeff_symbol_offset(bit_depth));
+    for (int i = 0; i < 64; ++i) {
+        quantized[i] = std::clamp<int16_t>(quantized[i], static_cast<int16_t>(-limit), limit);
+    }
+}
+
 static std::vector<uint8_t> expand_rgb8_to_rgba8(const Image& image) {
     std::vector<uint8_t> expanded(static_cast<size_t>(image.width()) * image.height() * 4, 255);
     const auto pixels = image.pixels();
@@ -537,6 +554,7 @@ static Result<TileEncodeResult> encode_lossy_tile(
             auto& bd = y_blocks[by * blocks_x + bx];
             bd.mode = rd.mode;
             quant_y.quantize(dct_coeffs, bd.quantized);
+            clamp_quantized_to_stream_range(bd.quantized, bit_depth);
 
             DctBlock recon_dct;
             quant_y.dequantize(bd.quantized, recon_dct);
@@ -634,6 +652,7 @@ static Result<TileEncodeResult> encode_lossy_tile(
         }
         dct_2d_forward(dct_coeffs);
         quant_c.quantize(dct_coeffs, block_data.quantized);
+        clamp_quantized_to_stream_range(block_data.quantized, bit_depth);
 
         DctBlock recon_dct;
         quant_c.dequantize(block_data.quantized, recon_dct);
@@ -805,6 +824,7 @@ static Result<TileEncodeResult> encode_lossy_tile(
                 auto& bd = a_blocks[by * blocks_x + bx];
                 bd.mode = rd.mode;
                 quant_a.quantize(dct_coeffs, bd.quantized);
+                clamp_quantized_to_stream_range(bd.quantized, bit_depth);
 
                 DctBlock recon_dct;
                 quant_a.dequantize(bd.quantized, recon_dct);
@@ -908,10 +928,12 @@ static Result<TileEncodeResult> encode_lossy_tile(
     const LossyCoeffStreamConfig legacy_coeff_config{
         .use_plane_max_coeff_span = use_plane_max_coeff_spans,
         .split_magnitude_signs = false,
+        .bit_depth = bit_depth,
     };
     const LossyCoeffStreamConfig split_coeff_config{
         .use_plane_max_coeff_span = use_plane_max_coeff_spans,
         .split_magnitude_signs = true,
+        .bit_depth = bit_depth,
     };
 
     auto y_legacy_coeff_payload = encode_lossy_plane_payload(y_quantized_blocks, y_spans, y_max_coeff_span, legacy_coeff_config);
@@ -1384,7 +1406,7 @@ static Result<TileEncodeResult> encode_lossy_tile(
     return result;
 }
 
-Result<std::vector<uint8_t>> encode(const Image& image, const EncoderConfig& config) {
+Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig& config) {
     uint32_t width = image.width();
     uint32_t height = image.height();
 
@@ -1475,7 +1497,17 @@ Result<std::vector<uint8_t>> encode(const Image& image, const EncoderConfig& con
             }
         }
 
-        if (config.subsampling == Subsampling::YUV420) {
+        // YUV420 is undecodable when the first tile is 8x8 or smaller:
+        // the decoder infers subsampling from the first tile's chroma
+        // block counts, and at <=8px the 4:4:4 and 4:2:0 counts coincide,
+        // so it defaults to 4:4:4 and decodes the chroma wrong. FHDR
+        // carries no subsampling field, so for tiny images fall back to
+        // 4:4:4 instead of writing a file no decoder can read correctly.
+        // Normal-size images are unaffected.
+        const bool use_yuv420 =
+            config.subsampling == Subsampling::YUV420 && (width > 8 || height > 8);
+
+        if (use_yuv420) {
             const uint32_t chroma_w = (width + 1) / 2;
             const uint32_t chroma_h = (height + 1) / 2;
             cb_plane.resize(chroma_w * chroma_h);
@@ -1503,8 +1535,8 @@ Result<std::vector<uint8_t>> encode(const Image& image, const EncoderConfig& con
                         width, height, tx, ty, tile_size,
                         config.quality, fhdr.bit_depth,
                         source_has_alpha,
-                        config.subsampling == Subsampling::YUV420 ?
-                            ChromaSubsampling::YUV420 : ChromaSubsampling::YUV444,
+                        use_yuv420 ? ChromaSubsampling::YUV420
+                                   : ChromaSubsampling::YUV444,
                         config.target_ssimulacra2);
                 });
                 futures.push_back(std::move(future));
@@ -1548,6 +1580,20 @@ Result<std::vector<uint8_t>> encode(const Image& image, const EncoderConfig& con
     }
 
     return write_container(file);
+}
+
+// Public API boundary: see the decode/get_info wrappers in decoder.cpp.
+// Allocation failure must surface as a Result error, never escape.
+Result<std::vector<uint8_t>> encode(const Image& image, const EncoderConfig& config) {
+    try {
+        return encode_impl(image, config);
+    } catch (const std::bad_alloc&) {
+        return std::unexpected(Error{ErrorCode::OutOfMemory, "out of memory while encoding"});
+    } catch (const std::exception& e) {
+        return std::unexpected(Error{ErrorCode::EncodeFailed, std::string("exception while encoding: ") + e.what()});
+    } catch (...) {
+        return std::unexpected(Error{ErrorCode::EncodeFailed, "unknown exception while encoding"});
+    }
 }
 
 
@@ -1614,14 +1660,22 @@ wk_error_t wk_encode(
     else if (config->bit_depth == 12) bd = wk::BitDepth::Bits12;
 
     bool has_alpha = (bpp == 4 || bpp == 8);
-    wk::Image image(width, height, bd, has_alpha);
-
-
+    // The Image constructor allocates width*height*bpp bytes from
+    // caller-supplied dimensions; guard it so a huge claim returns
+    // WK_ERROR_OOM instead of letting bad_alloc escape extern "C"
+    // (which would terminate the caller).
+    std::optional<wk::Image> image;
     size_t row_bytes = static_cast<size_t>(width) * bpp;
     size_t src_stride = pixel_stride > 0 ? pixel_stride : row_bytes;
-
-    for (uint32_t y = 0; y < height; y++) {
-        std::memcpy(image.row(y), pixels + y * src_stride, row_bytes);
+    try {
+        image.emplace(width, height, bd, has_alpha);
+        for (uint32_t y = 0; y < height; y++) {
+            std::memcpy(image->row(y), pixels + y * src_stride, row_bytes);
+        }
+    } catch (const std::bad_alloc&) {
+        return WK_ERROR_OOM;
+    } catch (...) {
+        return WK_ERROR_ENCODE_FAIL;
     }
 
     wk::EncoderConfig enc_config;
@@ -1636,7 +1690,7 @@ wk_error_t wk_encode(
     enc_config.threads = config->threads;
     enc_config.target_ssimulacra2 = config->target_ssimulacra2;
 
-    auto result = wk::encode(image, enc_config);
+    auto result = wk::encode(*image, enc_config);
     if (!result) {
         return WK_ERROR_ENCODE_FAIL;
     }

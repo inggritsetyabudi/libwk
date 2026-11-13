@@ -87,6 +87,21 @@ namespace wk
         {
             return std::unexpected(Error{ErrorCode::InvalidHeader, "zero dimension"});
         }
+        // Bounds for allocations driven by the header: decode() builds the
+        // output Image (and per-plane buffers) from width/height before
+        // any tile is checked, so an unbounded header turns a few header
+        // bytes into a multi-GB allocation. 2^28 pixels still covers any
+        // realistic still image (16384x16384); anything larger is
+        // rejected here, at the single choke point both get_info() and
+        // decode() go through.
+        constexpr uint32_t kMaxDimension = 65535;
+        constexpr uint64_t kMaxPixels = 268435456ull;  // 2^28
+        if (hdr.width > kMaxDimension || hdr.height > kMaxDimension ||
+            static_cast<uint64_t>(hdr.width) * hdr.height > kMaxPixels)
+        {
+            return std::unexpected(Error{ErrorCode::InvalidHeader,
+                                         "image dimensions exceed supported maximum"});
+        }
         if (hdr.bit_depth != 8 && hdr.bit_depth != 10 && hdr.bit_depth != 12)
         {
             return std::unexpected(Error{ErrorCode::InvalidBitDepth,
@@ -139,6 +154,18 @@ namespace wk
         if (!bg)
             return std::unexpected(bg.error());
         anim.background_rgba = *bg;
+
+        // Each frame entry is 16 bytes (2+1+1+2+2+2+2+4). The frame count
+        // comes from the file, so prove the payload can hold that many
+        // entries before resizing: resizing first lets a 10-byte chunk
+        // claiming 0xFFFFFFFF frames abort the decoder with bad_alloc.
+        constexpr uint64_t kAnimFrameBytes = 16;
+        const uint64_t needed = 10ull + static_cast<uint64_t>(anim.frame_count) * kAnimFrameBytes;
+        if (needed > data.size())
+        {
+            return std::unexpected(Error{ErrorCode::AnimationError,
+                                         "ANIM frame_count exceeds payload size"});
+        }
 
         anim.frames.resize(anim.frame_count);
         for (uint32_t i = 0; i < anim.frame_count; i++)

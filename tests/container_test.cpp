@@ -258,3 +258,86 @@ TEST(ContainerTest, TileCount) {
     EXPECT_EQ(hdr.tiles_y(), 3u);
     EXPECT_EQ(hdr.tile_count(), 12u);
 }
+
+// Regression tests for the Critical allocation-safety review (2026-11-13):
+// parse_anim used to resize(frame_count) from the file before checking the
+// payload size, so a 10-byte ANIM chunk claiming 0xFFFFFFFF frames aborted
+// the decoder with std::bad_alloc. parse_fhdr accepted any non-zero
+// dimension, so a 27-byte header could trigger a multi-GB Image allocation
+// in decode() before any tile was checked.
+TEST(ContainerTest, ParseAnimRejectsFrameCountLargerThanPayload) {
+    ByteWriter writer;
+    writer.write_u32(0xFFFFFFFFu);
+    writer.write_u16(0);
+    writer.write_u32(0);
+
+    auto parsed = parse_anim(writer.finish());
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseAnimRejectsTruncatedFrameEntries) {
+    // Claims 2 frames (needs 10 + 2*16 bytes) but carries only 1 frame.
+    ByteWriter writer;
+    writer.write_u32(2);
+    writer.write_u16(0);
+    writer.write_u32(0);
+    for (int i = 0; i < 16; ++i) {
+        writer.write_u8(0);
+    }
+
+    auto parsed = parse_anim(writer.finish());
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseFhdrRejectsOversizedDimensions) {
+    FrameHeader hdr;
+    hdr.width = 40000;
+    hdr.height = 40000;
+    hdr.bit_depth = 8;
+    hdr.tile_size_log2 = 9;
+
+    auto parsed = parse_fhdr(serialize_fhdr(hdr));
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+}
+
+TEST(ContainerTest, ParseFhdrRejectsDimensionAboveMax) {
+    FrameHeader hdr;
+    hdr.width = 65536;
+    hdr.height = 64;
+    hdr.bit_depth = 8;
+    hdr.tile_size_log2 = 6;
+
+    auto parsed = parse_fhdr(serialize_fhdr(hdr));
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+}
+
+TEST(ContainerTest, ParseFhdrAcceptsMaxSupportedDimensions) {
+    // 16384 x 16384 = 2^28 pixels, exactly at the supported cap.
+    FrameHeader hdr;
+    hdr.width = 16384;
+    hdr.height = 16384;
+    hdr.bit_depth = 8;
+    hdr.tile_size_log2 = 10;
+
+    auto parsed = parse_fhdr(serialize_fhdr(hdr));
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    EXPECT_EQ(parsed->width, 16384u);
+    EXPECT_EQ(parsed->height, 16384u);
+}
+
+TEST(ContainerTest, ParseFhdrRejectsJustOverPixelCap) {
+    // 16385 x 16384 = 268,451,840 pixels, one row over the 2^28 cap.
+    FrameHeader hdr;
+    hdr.width = 16385;
+    hdr.height = 16384;
+    hdr.bit_depth = 8;
+    hdr.tile_size_log2 = 10;
+
+    auto parsed = parse_fhdr(serialize_fhdr(hdr));
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+}
