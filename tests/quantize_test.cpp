@@ -23,7 +23,12 @@ TEST(QuantizeTest, UsesNaturalMatrixInZigzagOrder) {
 
     const auto& steps = quant.steps();
     for (int i = 0; i < 64; ++i) {
-        EXPECT_EQ(steps[i], BASE_QUANT_LUMA[ZIGZAG_ORDER[i]])
+        // The base table is capped at kMaxBaseQuantValue (q90-anomaly fix,
+        // 2026-11-13): steps are min(base, cap), zigzag order unchanged.
+        const uint16_t expected = std::min<uint16_t>(
+            BASE_QUANT_LUMA[ZIGZAG_ORDER[i]],
+            static_cast<uint16_t>(kMaxBaseQuantValue));
+        EXPECT_EQ(steps[i], expected)
             << "Unexpected quant step at zigzag index " << i;
     }
 }
@@ -34,7 +39,12 @@ TEST(QuantizeTest, BitDepthScalingPreservesZigzagMapping) {
 
     const auto& steps = quant.steps();
     for (int i = 0; i < 64; ++i) {
-        EXPECT_EQ(steps[i], BASE_QUANT_LUMA[ZIGZAG_ORDER[i]] * 4)
+        // Capped base (see above) times the 10-bit multiplier 4.
+        const uint16_t expected = static_cast<uint16_t>(
+            std::min<uint16_t>(BASE_QUANT_LUMA[ZIGZAG_ORDER[i]],
+                               static_cast<uint16_t>(kMaxBaseQuantValue)) *
+            4);
+        EXPECT_EQ(steps[i], expected)
             << "Unexpected 10-bit quant step at zigzag index " << i;
     }
 }
@@ -53,9 +63,10 @@ TEST(QuantizeTest, ChromaLowFrequencyRefinementIsOptIn) {
         EXPECT_EQ(quant.steps()[i], expected_low[i])
             << "Unexpected refined chroma quant step at zigzag index " << i;
     }
-    // zigzag 8+ unchanged: 21 * 0.74 = 15, 46 * 0.86 = 39
+    // zigzag 8+ unchanged: 21 * 0.74 = 15, and 46 is capped to 40 first
+    // (kMaxBaseQuantValue), so 40 * 0.86 = 34.
     EXPECT_EQ(quant.steps()[8], 15);
-    EXPECT_EQ(quant.steps()[24], 39);
+    EXPECT_EQ(quant.steps()[24], 34);
 
     // q>=90: the refinement never applies, even when requested.
     quant.build(90.0f, true, 8, true);
