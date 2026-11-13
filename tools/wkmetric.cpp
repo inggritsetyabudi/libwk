@@ -25,27 +25,9 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+#include "tool_common.h"
 
 namespace {
-
-wk::Result<std::vector<uint8_t>> read_file_bytes(std::string_view path) {
-    std::ifstream file(std::string(path), std::ios::binary | std::ios::ate);
-    if (!file) {
-        return std::unexpected(wk::Error{wk::ErrorCode::IoError, "failed to open file"});
-    }
-
-    const std::streamsize size = file.tellg();
-    if (size < 0) {
-        return std::unexpected(wk::Error{wk::ErrorCode::IoError, "failed to determine file size"});
-    }
-    file.seekg(0, std::ios::beg);
-
-    std::vector<uint8_t> bytes(static_cast<size_t>(size));
-    if (!file.read(reinterpret_cast<char*>(bytes.data()), size)) {
-        return std::unexpected(wk::Error{wk::ErrorCode::IoError, "failed to read file"});
-    }
-    return bytes;
-}
 
 std::string lowercase_extension(std::string_view path) {
     std::filesystem::path fs_path{std::string(path)};
@@ -58,7 +40,7 @@ std::string lowercase_extension(std::string_view path) {
 
 wk::Result<wk::Image> load_visual_input(std::string_view path) {
     if (lowercase_extension(path) == ".wk") {
-        auto encoded = read_file_bytes(path);
+        auto encoded = wk::tool::read_file_bytes(path);
         if (!encoded) {
             return std::unexpected(encoded.error());
         }

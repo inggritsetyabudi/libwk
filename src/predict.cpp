@@ -281,6 +281,30 @@ namespace wk
             }
             break;
         }
+        case PredMode::PLANAR:
+        {
+            // HEVC-style planar: a weighted average of the horizontal
+            // and vertical linear interpolations between the references.
+            // A smooth 2D ramp is predicted as a ramp, not a flat copy,
+            // so the slope survives even when the residual quantizes to
+            // zero. The four weights sum to 16, so (sum + 8) >> 4 is the
+            // rounded average; every term is in [0, max_val], so the
+            // result is in range without clamping. Requires layout V7.
+            const int top_right = above[7];
+            const int bottom_left = left[7];
+            for (int r = 0; r < 8; r++)
+            {
+                for (int c = 0; c < 8; c++)
+                {
+                    const int value = (7 - c) * static_cast<int>(left[r]) +
+                                      (c + 1) * top_right +
+                                      (7 - r) * static_cast<int>(above[c]) +
+                                      (r + 1) * bottom_left + 8;
+                    pred[r * 8 + c] = static_cast<int16_t>(value >> 4);
+                }
+            }
+            break;
+        }
         default:
             std::fill(pred, pred + 64, mid);
             break;
@@ -391,14 +415,29 @@ namespace wk
         return bits;
     }
 
+    // Quantization-aware rate-distortion: for each mode, the residual is
+    // transformed, quantized (with the plane's table and the block's
+    // scale), clamped to the stream range, dequantized, and added back
+    // to the prediction -- exactly as the encoder's in-loop
+    // reconstruction does it. The cost is the SSD of the RECONSTRUCTED
+    // block (what the decoder will actually produce) plus lambda times
+    // the bit estimate of the QUANTIZED coefficients (what the stream
+    // will actually carry). The old version measured the SSD of the
+    // prediction and the bits of the unquantized residual, so it picked
+    // modes whose residuals looked cheap before quantization but were
+    // expensive (or lossy) after it -- the cause of planar regressing
+    // photos and of the quality non-monotonicity.
     RdResult select_best_mode(const int16_t *original, const int16_t *above,
                               const int16_t *left, int16_t above_left,
-                              float lambda, int16_t max_val)
+                              float lambda, int16_t max_val,
+                              const QuantTable &quant, uint8_t bit_depth,
+                              float quant_scale)
     {
         RdResult best{PredMode::DC, std::numeric_limits<float>::max()};
 
         int16_t pred[64];
         int16_t residual[64];
+        int16_t reconstructed[64];
 
         for (int m = 0; m < static_cast<int>(PredMode::NUM_MODES); m++)
         {
@@ -411,8 +450,27 @@ namespace wk
                 residual[i] = original[i] - pred[i];
             }
 
-            float ssd = compute_ssd_8x8(original, pred);
-            float bits = estimate_bits_8x8(residual);
+            DctBlock dct_coeffs;
+            for (int i = 0; i < 64; ++i)
+            {
+                dct_coeffs[i] = static_cast<float>(residual[i]);
+            }
+            dct_2d_forward(dct_coeffs);
+            DctBlockI16 quantized;
+            quant.quantize_scaled(dct_coeffs, quantized, quant_scale);
+            clamp_quantized_to_stream_range(quantized, bit_depth);
+            DctBlock recon_dct;
+            quant.dequantize_scaled(quantized, recon_dct, quant_scale);
+            dct_2d_inverse(recon_dct);
+
+            for (int i = 0; i < 64; ++i)
+            {
+                const int value = static_cast<int>(std::lround(recon_dct[i])) + pred[i];
+                reconstructed[i] = static_cast<int16_t>(std::clamp(value, 0, static_cast<int>(max_val)));
+            }
+
+            float ssd = compute_ssd_8x8(original, reconstructed);
+            float bits = estimate_bits_8x8(quantized.data());
             float cost = ssd + lambda * bits;
 
             if (cost < best.cost)

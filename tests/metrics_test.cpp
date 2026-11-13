@@ -50,6 +50,23 @@ Image make_color_edge_image() {
 
 }
 
+TEST(MetricsTest, SampleAtReadsInRangeSamples) {
+    Image image = make_rgb_image(2, 2, 10, 20, 30);
+    EXPECT_DOUBLE_EQ(metrics::sample_at(image, 0, 0), 10.0);
+    EXPECT_DOUBLE_EQ(metrics::sample_at(image, 0, 1), 20.0);
+    EXPECT_DOUBLE_EQ(metrics::sample_at(image, 3, 2), 30.0);
+}
+
+TEST(MetricsTest, SampleAtReturnsZeroOutOfRange) {
+    Image image = make_rgb_image(2, 2, 10, 20, 30);
+    // Past the last pixel (2x2 has pixels 0..3).
+    EXPECT_DOUBLE_EQ(metrics::sample_at(image, 4, 0), 0.0);
+    EXPECT_DOUBLE_EQ(metrics::sample_at(image, 100, 0), 0.0);
+    // No alpha channel on this image.
+    EXPECT_DOUBLE_EQ(metrics::sample_at(image, 0, 3), 0.0);
+    EXPECT_DOUBLE_EQ(metrics::sample_at(image, 0, 9), 0.0);
+}
+
 TEST(MetricsTest, IdenticalImageIsPerfect) {
     Image reference = make_rgb_image(16, 16, 90, 120, 200);
     auto metrics = wk::metrics::compare_images(reference, reference);

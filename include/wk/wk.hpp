@@ -135,7 +135,6 @@ namespace wk
         [[nodiscard]] BitDepth bit_depth() const { return info_.bit_depth; }
         [[nodiscard]] bool has_alpha() const { return info_.has_alpha; }
         [[nodiscard]] const ImageInfo &info() const { return info_; }
-        [[nodiscard]] ImageInfo &info() { return info_; }
 
         [[nodiscard]] std::span<uint8_t> pixels() { return pixels_; }
         [[nodiscard]] std::span<const uint8_t> pixels() const { return pixels_; }
@@ -161,6 +160,9 @@ namespace wk
         CICP cicp = {};
         uint8_t tile_size_log2 = 0;
         uint32_t threads = 0;
+        // Reserved: accepted but currently ignored -- no
+        // SSIMULACRA2-targeted mode exists yet (the wkenc flag was
+        // removed rather than advertise a no-op).
         float target_ssimulacra2 = 0.0f;
     };
 
@@ -177,6 +179,6 @@ namespace wk
 
     [[nodiscard]] Result<Image> decode(std::span<const uint8_t> data, const DecoderConfig &config = {});
 
-    constexpr std::string_view version() { return "0.1.0"; }
+    constexpr std::string_view version() { return "0.2.0"; }
 
 }

@@ -58,6 +58,34 @@ FrameHeader make_test_header() {
     return hdr;
 }
 
+// A raw container with just a header and the requested singleton
+// chunks (no tiles): enough for parse_container's flag checks.
+std::vector<uint8_t> build_raw_container(const FrameHeader& hdr, bool include_meta,
+                                         bool include_prov, bool include_anim) {
+    ByteWriter w;
+    w.write_bytes({WK_MAGIC, 5});
+    w.write_u16(WK_VERSION);
+    append_chunk(w, CHUNK_FHDR, 0, serialize_fhdr(hdr));
+    if (include_meta) {
+        // A real (non-empty) META payload: an empty one does not parse.
+        meta::MetaBlock meta;
+        (void)meta.set(meta::Namespace::Geo, meta::geo::LAT, 1.234);
+        append_chunk(w, CHUNK_WKMETA, CHUNK_FLAG_OPTIONAL | CHUNK_FLAG_META_ONLY, meta.serialize());
+    }
+    if (include_prov) {
+        append_chunk(w, CHUNK_PROV, CHUNK_FLAG_OPTIONAL, std::vector<uint8_t>{1});
+    }
+    if (include_anim) {
+        ByteWriter anim;
+        anim.write_u32(0);  // frame_count 0
+        anim.write_u16(0);  // loop_count
+        anim.write_u32(0);  // background_rgba
+        append_chunk(w, CHUNK_ANIM, 0, anim.finish());
+    }
+    append_chunk(w, CHUNK_FEND, 0, {});
+    return w.finish();
+}
+
 }
 
 TEST(ContainerTest, FhdrRoundTrip) {
@@ -480,7 +508,11 @@ TEST(ContainerTest, ParseContainerAcceptsSingletonsOnce) {
     ByteWriter writer;
     writer.write_bytes({WK_MAGIC, 5});
     writer.write_u16(WK_VERSION);
-    append_chunk(writer, CHUNK_FHDR, 0, serialize_fhdr(make_test_header()));
+    // The flags must match the chunks present (see the cross-checks in
+    // parse_container): this file carries META, PROV, and ANIM.
+    FrameHeader hdr = make_test_header();
+    hdr.flags |= FHDR_FLAG_HAS_WKMETA | FHDR_FLAG_ANIMATED | FHDR_FLAG_HAS_C2PA;
+    append_chunk(writer, CHUNK_FHDR, 0, serialize_fhdr(hdr));
     append_chunk(writer, CHUNK_WKMETA, CHUNK_FLAG_OPTIONAL | CHUNK_FLAG_META_ONLY, meta.serialize());
     append_chunk(writer, CHUNK_ICCP, CHUNK_FLAG_OPTIONAL, std::vector<uint8_t>{0x01, 0x02, 0x03});
     append_chunk(writer, CHUNK_PROV, CHUNK_FLAG_OPTIONAL, std::vector<uint8_t>{0x0A, 0x0B});
@@ -493,4 +525,84 @@ TEST(ContainerTest, ParseContainerAcceptsSingletonsOnce) {
     EXPECT_EQ(parsed->icc_profile.size(), 3u);
     EXPECT_EQ(parsed->c2pa_manifest.size(), 2u);
     EXPECT_TRUE(parsed->animation.has_value());
+}
+
+TEST(ContainerTest, ParseFhdrRejectsUnknownCicpMatrix) {
+    FrameHeader hdr = make_test_header();
+    hdr.cicp_matrix = 2;  // No conversion matrix is defined for this value.
+    auto parsed = parse_fhdr(serialize_fhdr(hdr));
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+}
+
+TEST(ContainerTest, ParseFhdrRejectsUnknownCicpTransfer) {
+    FrameHeader hdr = make_test_header();
+    hdr.cicp_transfer = 2;  // No transfer function is defined for this value.
+    auto parsed = parse_fhdr(serialize_fhdr(hdr));
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+}
+
+TEST(ContainerTest, ParseFhdrAcceptsKnownCicpValues) {
+    // Control: every matrix/transfer the converter implements is accepted.
+    FrameHeader hdr = make_test_header();
+    hdr.cicp_matrix = 9;
+    hdr.cicp_transfer = 16;
+    auto parsed = parse_fhdr(serialize_fhdr(hdr));
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    EXPECT_EQ(parsed->cicp_matrix, 9);
+    EXPECT_EQ(parsed->cicp_transfer, 16);
+}
+
+TEST(ContainerTest, ParseContainerRejectsMetaFlagWithoutChunk) {
+    FrameHeader hdr = make_test_header();
+    hdr.flags |= FHDR_FLAG_HAS_WKMETA;
+    auto parsed = parse_container(build_raw_container(hdr, false, false, false));
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+}
+
+TEST(ContainerTest, ParseContainerRejectsMetaChunkWithoutFlag) {
+    auto parsed = parse_container(build_raw_container(make_test_header(), true, false, false));
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimFlagWithoutChunk) {
+    FrameHeader hdr = make_test_header();
+    hdr.flags |= FHDR_FLAG_ANIMATED;
+    auto parsed = parse_container(build_raw_container(hdr, false, false, false));
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimChunkWithoutFlag) {
+    auto parsed = parse_container(build_raw_container(make_test_header(), false, false, true));
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+}
+
+TEST(ContainerTest, ParseContainerRejectsC2paFlagWithoutChunk) {
+    FrameHeader hdr = make_test_header();
+    hdr.flags |= FHDR_FLAG_HAS_C2PA;
+    auto parsed = parse_container(build_raw_container(hdr, false, false, false));
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+}
+
+TEST(ContainerTest, ParseContainerRejectsProvChunkWithoutFlag) {
+    auto parsed = parse_container(build_raw_container(make_test_header(), false, true, false));
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+}
+
+TEST(ContainerTest, ParseContainerAcceptsConsistentFlags) {
+    // Control: flags that match the chunks present still parse.
+    FrameHeader hdr = make_test_header();
+    hdr.flags |= FHDR_FLAG_HAS_WKMETA | FHDR_FLAG_ANIMATED | FHDR_FLAG_HAS_C2PA;
+    auto parsed = parse_container(build_raw_container(hdr, true, true, true));
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    EXPECT_TRUE(parsed->metadata.has_value());
+    EXPECT_TRUE(parsed->animation.has_value());
+    EXPECT_FALSE(parsed->c2pa_manifest.empty());
 }

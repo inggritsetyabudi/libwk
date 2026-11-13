@@ -60,6 +60,10 @@ struct ImageMetrics {
     ImageStatistics candidate_stats{};
 };
 
+// One sample from a pixel, as a double. An out-of-range pixel or
+// channel index returns 0.0 instead of reading past the buffer.
+[[nodiscard]] double sample_at(const Image& image, size_t pixel_index, uint8_t channel_index);
+
 Result<ImageMetrics> compare_images(const Image& reference, const Image& candidate, bool include_alpha = true);
 
 }

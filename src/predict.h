@@ -16,6 +16,9 @@
 
 
 #include "common.h"
+#include "dct.h"
+#include "lossy_coeff_stream.h"
+#include "quantize.h"
 #include <array>
 #include <cstdint>
 
@@ -37,7 +40,8 @@ enum class PredMode : uint8_t {
     D153     = 10,
     D207     = 11,
     D63      = 12,
-    NUM_MODES = 13,
+    PLANAR   = 13,
+    NUM_MODES = 14,
 };
 
 
@@ -71,7 +75,9 @@ struct RdResult {
 
 RdResult select_best_mode(const int16_t* original, const int16_t* above,
                            const int16_t* left, int16_t above_left,
-                           float lambda, int16_t max_val);
+                           float lambda, int16_t max_val,
+                           const QuantTable& quant, uint8_t bit_depth,
+                           float quant_scale = 1.0f);
 
 PredMode select_deterministic_mode(const int16_t* above, const int16_t* left,
                                    int16_t above_left, int16_t max_val);

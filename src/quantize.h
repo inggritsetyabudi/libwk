@@ -48,9 +48,11 @@ class QuantTable {
 public:
     QuantTable() = default;
 
-    void build(float quality, bool is_chroma, uint8_t bit_depth) {
+    void build(float quality, bool is_chroma, uint8_t bit_depth,
+              bool refine_low_frequencies = false) {
         quality_ = std::clamp(quality, 1.0f, 100.0f);
         is_chroma_ = is_chroma;
+        refine_low_frequencies_ = refine_low_frequencies;
         const auto& base = is_chroma ? BASE_QUANT_CHROMA : BASE_QUANT_LUMA;
 
         const float q = quality_;
@@ -100,6 +102,37 @@ public:
         }
     }
 
+    // Adaptive quantization (layout V7): per-block step multipliers.
+    // Every factor is exactly representable in binary floating point,
+    // so encoder and decoder agree bit-for-bit. The scaled step applies
+    // to the deadzone test, the quantize rounding, and the dequantize
+    // multiplication alike; scale 1.0 reproduces quantize/dequantize.
+    static constexpr std::array<float, 8> kQuantScaleFactors = {
+        0.5f, 0.625f, 0.75f, 0.875f, 1.0f, 1.25f, 1.5f, 2.0f};
+    static constexpr uint8_t kQuantScaleIdentity = 4;
+
+    void quantize_scaled(const DctBlock& input, DctBlockI16& output, float scale) const {
+        for (int i = 0; i < 64; i++) {
+            const int zi = ZIGZAG_ORDER[i];
+            const float v = input[zi];
+            const float step = static_cast<float>(table_[i]) * scale;
+            if (std::abs(v) < step * deadzone_scale(i)) {
+                output[i] = 0;
+            } else {
+                const float q = v * (inv_table_[i] / scale);
+                output[i] = static_cast<int16_t>(
+                    (v > 0) ? std::floor(q + 0.5f) : std::ceil(q - 0.5f));
+            }
+        }
+    }
+
+    void dequantize_scaled(const DctBlockI16& input, DctBlock& output, float scale) const {
+        for (int i = 0; i < 64; i++) {
+            const int zi = ZIGZAG_ORDER[i];
+            output[zi] = static_cast<float>(input[i]) * table_[i] * scale;
+        }
+    }
+
     [[nodiscard]] uint16_t step(int i) const { return table_[i]; }
     [[nodiscard]] const std::array<uint16_t, 64>& steps() const { return table_; }
 
@@ -109,29 +142,39 @@ private:
             return 1.0f;
         }
 
+        float scale;
         if (quality_ >= 90.0f) {
-            if (zigzag_index == 0) return 0.58f;
-            if (zigzag_index < 8) return 0.56f;
-            if (zigzag_index < 24) return 0.58f;
-            return 0.72f;
-        }
-        if (quality_ >= 85.0f) {
-            if (zigzag_index == 0) return 0.64f;
-            if (zigzag_index < 8) return 0.62f;
-            if (zigzag_index < 24) return 0.63f;
-            return 0.78f;
-        }
-        if (quality_ >= 75.0f) {
-            if (zigzag_index == 0) return 0.72f;
-            if (zigzag_index < 8) return 0.68f;
-            if (zigzag_index < 24) return 0.64f;
-            return 0.76f;
+            if (zigzag_index == 0) scale = 0.58f;
+            else if (zigzag_index < 8) scale = 0.56f;
+            else if (zigzag_index < 24) scale = 0.58f;
+            else scale = 0.72f;
+        } else if (quality_ >= 85.0f) {
+            if (zigzag_index == 0) scale = 0.64f;
+            else if (zigzag_index < 8) scale = 0.62f;
+            else if (zigzag_index < 24) scale = 0.63f;
+            else scale = 0.78f;
+        } else if (quality_ >= 75.0f) {
+            if (zigzag_index == 0) scale = 0.72f;
+            else if (zigzag_index < 8) scale = 0.68f;
+            else if (zigzag_index < 24) scale = 0.64f;
+            else scale = 0.76f;
+        } else {
+            if (zigzag_index == 0) scale = 0.82f;
+            else if (zigzag_index < 8) scale = 0.78f;
+            else if (zigzag_index < 24) scale = 0.74f;
+            else scale = 0.86f;
         }
 
-        if (zigzag_index == 0) return 0.82f;
-        if (zigzag_index < 8) return 0.78f;
-        if (zigzag_index < 24) return 0.74f;
-        return 0.86f;
+        // Gentle color ramps live in the low-frequency chroma coefficients
+        // (DC + first ACs); below q90 their steps were coarse enough to
+        // flatten a smooth ramp into visible bands, so refine them 2x --
+        // but only when the encoder asked for it (smooth-ramp tiles), never
+        // as a blanket change: it costs bytes and can flip RDO modes on
+        // textured content.
+        if (refine_low_frequencies_ && quality_ < 90.0f && zigzag_index < 8) {
+            scale *= 0.5f;
+        }
+        return scale;
     }
 
     [[nodiscard]] float deadzone_scale(int zigzag_index) const {
@@ -159,6 +202,7 @@ private:
     std::array<float, 64>    inv_table_{};
     float                    quality_ = 75.0f;
     bool                     is_chroma_ = false;
+    bool                     refine_low_frequencies_ = false;
 };
 
 inline int quality_to_qp(float quality) {

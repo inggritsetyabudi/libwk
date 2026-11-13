@@ -48,26 +48,6 @@ void apply_subtract_green(uint8_t* rgba, uint32_t width, uint32_t height);
 void undo_subtract_green(uint8_t* rgba, uint32_t width, uint32_t height);
 
 
-void apply_subtract_green_16(uint16_t* rgba, uint32_t width, uint32_t height);
-void undo_subtract_green_16(uint16_t* rgba, uint32_t width, uint32_t height);
-
-
-struct ColorDecorrelation {
-    int8_t green_to_red  = 0;
-    int8_t green_to_blue = 0;
-    int8_t red_to_blue   = 0;
-};
-
-
-ColorDecorrelation estimate_color_decorrelation(
-    const uint8_t* rgba, uint32_t width, uint32_t height);
-
-void apply_color_decorrelation(uint8_t* rgba, uint32_t width, uint32_t height,
-                                const ColorDecorrelation& params);
-void undo_color_decorrelation(uint8_t* rgba, uint32_t width, uint32_t height,
-                               const ColorDecorrelation& params);
-
-
 
 struct Palette {
     uint32_t colors[256];

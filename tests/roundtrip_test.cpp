@@ -50,6 +50,33 @@ Image make_rgb_gradient(uint32_t width, uint32_t height) {
     return image;
 }
 
+Image make_solid_image(uint32_t width, uint32_t height, uint8_t value) {
+    Image image(width, height, BitDepth::Bits8, false);
+    for (uint32_t y = 0; y < height; ++y) {
+        uint8_t* row = image.row(y);
+        for (uint32_t x = 0; x < width; ++x) {
+            row[x * 3 + 0] = value;
+            row[x * 3 + 1] = value;
+            row[x * 3 + 2] = value;
+        }
+    }
+    return image;
+}
+
+Image make_checkerboard(uint32_t width, uint32_t height, uint32_t square) {
+    Image image(width, height, BitDepth::Bits8, false);
+    for (uint32_t y = 0; y < height; ++y) {
+        uint8_t* row = image.row(y);
+        for (uint32_t x = 0; x < width; ++x) {
+            const uint8_t value = ((x / square) + (y / square)) % 2 == 0 ? 255 : 0;
+            row[x * 3 + 0] = value;
+            row[x * 3 + 1] = value;
+            row[x * 3 + 2] = value;
+        }
+    }
+    return image;
+}
+
 Image make_dark_color_scene(uint32_t width, uint32_t height) {
     Image image(width, height, BitDepth::Bits8, false);
     auto clamp_byte = [](float value) -> uint8_t {
@@ -154,7 +181,7 @@ Result<LossyTileSyntaxInfo> parse_lossy_tile_syntax(std::span<const uint8_t> pay
     LossyTileSyntaxInfo info;
     info.layout_tag = read_le32(payload.data() + kLossySyntaxBaseOffset);
     info.stream_offset = kLossySyntaxBaseOffset + kLayoutTagBytes;
-    if (info.layout_tag == kLossyTileLayoutTagV6) {
+    if (info.layout_tag == kLossyTileLayoutTagV6 || info.layout_tag == kLossyTileLayoutTagV7) {
         if (payload.size() <= info.stream_offset) {
             return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload is missing syntax flags"});
         }
@@ -175,6 +202,22 @@ Result<LossyTileSyntaxInfo> parse_lossy_tile_syntax(std::span<const uint8_t> pay
             (info.syntax_flags & kLossyTileSyntaxFlagCoefficientSignificanceMaps) != 0;
         info.adaptive_coefficient_signs =
             (info.syntax_flags & kLossyTileSyntaxFlagAdaptiveCoefficientSigns) != 0;
+        if (info.layout_tag == kLossyTileLayoutTagV7) {
+            // V7 carries two sparse quant-scale streams (luma, then
+            // chroma) after the flags byte: count u16, then count
+            // entries of (block_index u16, scale_index u8). Skip both
+            // so stream_offset lands on the mode streams.
+            for (int stream = 0; stream < 2; ++stream) {
+                if (payload.size() - info.stream_offset < sizeof(uint16_t)) {
+                    return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload is missing a V7 scale stream"});
+                }
+                const uint16_t count = read_le16(payload.data() + info.stream_offset);
+                info.stream_offset += sizeof(uint16_t) + static_cast<size_t>(count) * 3;
+                if (info.stream_offset > payload.size()) {
+                    return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload has a truncated V7 scale stream"});
+                }
+            }
+        }
     } else if (info.layout_tag == kLossyTileLayoutTagV5) {
         info.plane_extents = true;
     }
@@ -353,6 +396,128 @@ TEST(RoundtripTest, DefaultLossyTilePolicyUses1024ButLosslessStays512) {
     auto lossless_file = parse_container(*encoded_lossless);
     ASSERT_TRUE(lossless_file.has_value()) << lossless_file.error().message;
     EXPECT_EQ(lossless_file->header.tile_size_log2, 9u);
+}
+
+TEST(RoundtripTest, SmoothChromaRampKeepsFineStepsAtQ75) {
+    // A smooth color ramp (green -> gray -> green). Without the
+    // content-adaptive chroma refinement the decoded ramp collapses into
+    // visible bands (84 distinct R levels, steps up to 5 at q75).
+    Image image(256, 256, BitDepth::Bits8, false);
+    for (uint32_t y = 0; y < 256; ++y) {
+        uint8_t* row = image.row(y);
+        for (uint32_t x = 0; x < 256; ++x) {
+            uint8_t r = static_cast<uint8_t>(x);
+            uint8_t g = static_cast<uint8_t>(255 - x);
+            uint8_t b = 128;
+            if (x >= 128) {
+                r = static_cast<uint8_t>(255 - r);
+                g = static_cast<uint8_t>(255 - g);
+                b = static_cast<uint8_t>(255 - b);
+            }
+            row[x * 3 + 0] = r;
+            row[x * 3 + 1] = g;
+            row[x * 3 + 2] = b;
+        }
+    }
+
+    EncoderConfig config;
+    config.quality = 75.0f;
+    config.subsampling = Subsampling::YUV444;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+
+    const uint8_t* drow = decoded->row(128);
+    bool seen[256] = {};
+    int distinct = 0;
+    int max_step = 0;
+    int prev = -1;
+    for (uint32_t x = 0; x < 128; ++x) {
+        const int v = drow[x * 3 + 0];
+        if (!seen[v]) {
+            seen[v] = true;
+            ++distinct;
+        }
+        if (prev >= 0) {
+            max_step = std::max(max_step, std::abs(v - prev));
+        }
+        prev = v;
+    }
+    EXPECT_GE(distinct, 90) << "smooth ramp lost too many levels (banding)";
+    EXPECT_LE(max_step, 2) << "smooth ramp has visible steps";
+}
+
+// The q50 version of the ramp above. At q50 the seed row (first row
+// and column, which have no above/left reference) is the bottleneck:
+// its block means sit on a 2-level grid (luma DC step 16) and every
+// interior block copies the row above, extruding the seed's staircase
+// down the tile. The V7 seed boost gives the seed blocks quant scale
+// 0.75, which puts their means on a finer grid. Measured: distinct
+// 80 -> 93 (the colorspace floor), worst step 4 -> 3, only one step
+// larger than 2, at essentially the same file size. The thresholds
+// below are the measured result, not a loosened bar -- the pre-boost
+// q50 (80 distinct, worst step 4) FAILS both of them.
+TEST(RoundtripTest, SeedBoostFixesRampAtQ50) {
+    Image image(256, 256, BitDepth::Bits8, false);
+    for (uint32_t y = 0; y < 256; ++y) {
+        uint8_t* row = image.row(y);
+        for (uint32_t x = 0; x < 256; ++x) {
+            uint8_t r = static_cast<uint8_t>(x);
+            uint8_t g = static_cast<uint8_t>(255 - x);
+            uint8_t b = 128;
+            if (x >= 128) {
+                r = static_cast<uint8_t>(255 - r);
+                g = static_cast<uint8_t>(255 - g);
+                b = static_cast<uint8_t>(255 - b);
+            }
+            row[x * 3 + 0] = r;
+            row[x * 3 + 1] = g;
+            row[x * 3 + 2] = b;
+        }
+    }
+
+    EncoderConfig config;
+    config.quality = 50.0f;
+    config.subsampling = Subsampling::YUV444;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+
+    // The seed boost is a V7 feature: the file must be V7, and the
+    // scale stream must actually carry the seed entries (not empty).
+    auto parsed = parse_container(*encoded);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ASSERT_EQ(parsed->tile_chunks.size(), 1u);
+    const auto& payload = parsed->tile_chunks[0].payload;
+    ASSERT_GE(payload.size(), 277u);
+    const uint32_t tag = static_cast<uint32_t>(payload[273]) |
+                         (static_cast<uint32_t>(payload[274]) << 8) |
+                         (static_cast<uint32_t>(payload[275]) << 16) |
+                         (static_cast<uint32_t>(payload[276]) << 24);
+    EXPECT_EQ(tag, kLossyTileLayoutTagV7) << "seed boost must emit V7";
+
+    const uint8_t* drow = decoded->row(128);
+    bool seen[256] = {};
+    int distinct = 0;
+    int max_step = 0;
+    int prev = -1;
+    for (uint32_t x = 0; x < 128; ++x) {
+        const int v = drow[x * 3 + 0];
+        if (!seen[v]) {
+            seen[v] = true;
+            ++distinct;
+        }
+        if (prev >= 0) {
+            max_step = std::max(max_step, std::abs(v - prev));
+        }
+        prev = v;
+    }
+    EXPECT_GE(distinct, 90) << "q50 ramp lost too many levels (banding)";
+    EXPECT_LE(max_step, 3) << "q50 ramp has visible steps";
 }
 
 TEST(RoundtripTest, HigherLossyQualityImprovesDarkChromaStability) {
@@ -548,7 +713,12 @@ TEST(RoundtripTest, PackedCoefficientSpanCorruptionRejected) {
 }
 
 TEST(RoundtripTest, CoefficientSignCorruptionRejected) {
-    Image image = make_rgb_gradient(24, 24);
+    // A 64x64 sample (64 luma blocks) so that some coefficient's
+    // RawPacked sign stream has a nonzero count that is not a multiple
+    // of 8 -- the padding bit the corruption flips. A 24x24 sample
+    // (9 blocks) stopped yielding one after the quantization-aware
+    // RDO changed the coefficient distribution.
+    Image image = make_rgb_gradient(64, 64);
 
     EncoderConfig config;
     config.quality = 85.0f;
@@ -566,8 +736,8 @@ TEST(RoundtripTest, CoefficientSignCorruptionRejected) {
     ASSERT_TRUE(syntax.has_value()) << syntax.error().message;
     ASSERT_TRUE(syntax->split_magnitude_signs);
 
-    const size_t y_blocks = 9;
-    const size_t chroma_blocks = 9;
+    const size_t y_blocks = 64;
+    const size_t chroma_blocks = 64;
     ByteReader reader(std::span<const uint8_t>(payload.data() + syntax->stream_offset,
                                                payload.size() - syntax->stream_offset));
 
@@ -1524,3 +1694,142 @@ TEST(RoundtripTest, DecodeAcceptsRewrittenContainer) {
 
 
 
+
+// Layout V7 is emitted only when a block actually uses it: a
+// non-identity quant scale, or the PLANAR prediction mode (13). Content
+// where planar cannot win (a solid block: DC ties planar and wins by
+// mode order; a checkerboard: V predicts it exactly) stays on V6, and
+// a smooth gradient that does use planar is V7 with a planar mode in
+// its mode stream. This replaced the old "textured scene stays V6"
+// guard: with the quantization-aware RDO, planar legitimately wins on
+// smooth regions of textured scenes and even on noise (averaging the
+// noisy references lowers the residual variance), so no natural scene
+// is guaranteed V6.
+TEST(RoundtripTest, V7OnlyWhenPlanarOrScaleUsed) {
+    EncoderConfig config;
+    config.quality = 75.0f;
+    config.subsampling = Subsampling::YUV444;
+
+    auto layout_tag_of = [](const Image& image, const EncoderConfig& cfg) {
+        auto encoded = encode(image, cfg);
+        EXPECT_TRUE(encoded.has_value()) << encoded.error().message;
+        if (!encoded.has_value()) {
+            return 0u;
+        }
+        auto parsed = parse_container(*encoded);
+        EXPECT_TRUE(parsed.has_value()) << parsed.error().message;
+        if (!parsed.has_value() || parsed->tile_chunks.empty()) {
+            return 0u;
+        }
+        const auto& payload = parsed->tile_chunks[0].payload;
+        EXPECT_GE(payload.size(), 277u);
+        if (payload.size() < 277u) {
+            return 0u;
+        }
+        return static_cast<uint32_t>(payload[273]) |
+               (static_cast<uint32_t>(payload[274]) << 8) |
+               (static_cast<uint32_t>(payload[275]) << 16) |
+               (static_cast<uint32_t>(payload[276]) << 24);
+    };
+
+    EXPECT_EQ(layout_tag_of(make_solid_image(64, 64, 128), config),
+              kLossyTileLayoutTagV6)
+        << "solid image must stay on V6";
+    EXPECT_EQ(layout_tag_of(make_checkerboard(64, 64, 8), config),
+              kLossyTileLayoutTagV6)
+        << "checkerboard must stay on V6";
+
+    // A smooth gradient uses planar and must be V7 -- and the V7 tag
+    // must be truthful: a planar mode is actually in the mode stream.
+    Image gradient = make_rgb_gradient(64, 64);
+    auto encoded = encode(gradient, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto parsed = parse_container(*encoded);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ASSERT_EQ(parsed->tile_chunks.size(), 1u);
+    const auto& payload = parsed->tile_chunks[0].payload;
+    ASSERT_GE(payload.size(), 277u);
+    const uint32_t tag = static_cast<uint32_t>(payload[273]) |
+                         (static_cast<uint32_t>(payload[274]) << 8) |
+                         (static_cast<uint32_t>(payload[275]) << 16) |
+                         (static_cast<uint32_t>(payload[276]) << 24);
+    ASSERT_EQ(tag, kLossyTileLayoutTagV7) << "gradient must use V7";
+    auto syntax = parse_lossy_tile_syntax(payload);
+    ASSERT_TRUE(syntax.has_value()) << syntax.error().message;
+    ByteReader reader(std::span<const uint8_t>(payload.data() + syntax->stream_offset,
+                                               payload.size() - syntax->stream_offset));
+    auto y_modes = read_packed_prediction_modes(reader, 64, "luma");
+    ASSERT_TRUE(y_modes.has_value()) << y_modes.error().message;
+    auto chroma_modes = read_packed_prediction_modes(reader, 64, "chroma");
+    ASSERT_TRUE(chroma_modes.has_value()) << chroma_modes.error().message;
+    const bool any_planar =
+        std::any_of(y_modes->begin(), y_modes->end(),
+                    [](PredMode m) { return m == PredMode::PLANAR; }) ||
+        std::any_of(chroma_modes->begin(), chroma_modes->end(),
+                    [](PredMode m) { return m == PredMode::PLANAR; });
+    EXPECT_TRUE(any_planar)
+        << "V7 tag must mean a planar mode is actually used";
+}
+
+// Layout V7 decoder path, exercised by byte surgery: take a V6 file,
+// insert sparse quant-scale streams after the syntax-flags byte and
+// retag it V7. The scale streams sit at tile-payload offset 278
+// (9-byte tile header + 256 quant-table bytes + 8 block-dim bytes
+// + 4 layout-tag bytes + 1 flags byte). The fixture is a checkerboard:
+// it stays V6 (V predicts it exactly, so planar never wins) while
+// still carrying real coefficients.
+TEST(RoundtripTest, V7EmptyScaleListsDecodeIdenticalToV6) {
+    Image image = make_checkerboard(64, 64, 8);
+
+    EncoderConfig config;
+    config.quality = 75.0f;
+    config.subsampling = Subsampling::YUV444;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto parsed = parse_container(*encoded);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ASSERT_EQ(parsed->tile_chunks.size(), 1u);
+    auto payload = parsed->tile_chunks[0].payload;
+    ASSERT_GE(payload.size(), 278u);
+    const uint32_t tag = static_cast<uint32_t>(payload[273]) |
+                         (static_cast<uint32_t>(payload[274]) << 8) |
+                         (static_cast<uint32_t>(payload[275]) << 16) |
+                         (static_cast<uint32_t>(payload[276]) << 24);
+    ASSERT_EQ(tag, kLossyTileLayoutTagV6) << "test fixture must start on V6";
+
+    // Two empty scale lists: count 0 for luma, count 0 for chroma.
+    const std::vector<uint8_t> scales = {0, 0, 0, 0};
+    payload.insert(payload.begin() + 278, scales.begin(), scales.end());
+    const uint32_t v7 = kLossyTileLayoutTagV7;
+    payload[273] = static_cast<uint8_t>(v7 & 0xFF);
+    payload[274] = static_cast<uint8_t>((v7 >> 8) & 0xFF);
+    payload[275] = static_cast<uint8_t>((v7 >> 16) & 0xFF);
+    payload[276] = static_cast<uint8_t>((v7 >> 24) & 0xFF);
+    uint32_t compressed_size = static_cast<uint32_t>(payload[5]) |
+                               (static_cast<uint32_t>(payload[6]) << 8) |
+                               (static_cast<uint32_t>(payload[7]) << 16) |
+                               (static_cast<uint32_t>(payload[8]) << 24);
+    compressed_size += static_cast<uint32_t>(scales.size());
+    payload[5] = static_cast<uint8_t>(compressed_size & 0xFF);
+    payload[6] = static_cast<uint8_t>((compressed_size >> 8) & 0xFF);
+    payload[7] = static_cast<uint8_t>((compressed_size >> 16) & 0xFF);
+    payload[8] = static_cast<uint8_t>((compressed_size >> 24) & 0xFF);
+    parsed->tile_chunks[0].payload = payload;
+
+    auto patched = write_container(*parsed);
+    ASSERT_TRUE(patched.has_value()) << patched.error().message;
+
+    auto decoded_v6 = decode(*encoded);
+    ASSERT_TRUE(decoded_v6.has_value()) << decoded_v6.error().message;
+    auto decoded_v7 = decode(*patched);
+    ASSERT_TRUE(decoded_v7.has_value()) << decoded_v7.error().message;
+
+    // Empty scale lists mean every block uses scale 1.0, so the V7
+    // decode must be pixel-identical to the V6 decode.
+    EXPECT_EQ(decoded_v7->pixels().size(), decoded_v6->pixels().size());
+    EXPECT_TRUE(std::equal(decoded_v7->pixels().begin(), decoded_v7->pixels().end(),
+                           decoded_v6->pixels().begin()))
+        << "V7 with identity scales must decode exactly like V6";
+}

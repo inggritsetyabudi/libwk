@@ -55,13 +55,9 @@ ThreadPool::ThreadPool(uint32_t num_threads) {
 
                     task = std::move(tasks_.front());
                     tasks_.pop();
-                    active_tasks_++;
                 }
 
                 task();
-
-                active_tasks_--;
-                done_cv_.notify_all();
             }
             });
         } catch (const std::system_error&) {
@@ -94,13 +90,6 @@ ThreadPool::~ThreadPool() {
         w.request_stop();
         if (w.joinable()) w.join();
     }
-}
-
-void ThreadPool::wait_all() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    done_cv_.wait(lock, [this] {
-        return tasks_.empty() && active_tasks_ == 0;
-    });
 }
 
 uint32_t ThreadPool::default_thread_count() {

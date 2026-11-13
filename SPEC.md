@@ -1,9 +1,11 @@
-# WK Image Format — Bitstream Specification v0.1
+# WK Image Format — Bitstream Specification v0.2
 
 **MIME type:** `image/x-wk`  
 **File extension:** `.wk`  
 **Byte order:** Little-endian throughout  
 **Format version:** 0x0001
+
+**v0.2 changes:** lossy layout `0x374D4843` (V7) with per-block quant scales and the PLANAR prediction mode (mode 13); quantization-aware rate-distortion mode selection; the V7 seed boost (scale `0.75`) for smooth-ramp tiles below quality 75. The container format (`0x0001`) is unchanged, and V1–V6 files decode identically.
 
 ---
 
@@ -99,6 +101,7 @@ FILE HEADER (magic + version)
    - Layout tag `0x344D4843` keeps the packed prediction modes and coefficient spans, and switches coefficient-table metadata to adaptive serialization.
    - Layout tag `0x354D4843` keeps packed modes, coefficient spans, adaptive coefficient tables, and additionally stores per-plane maximum coefficient extents so fully empty high-frequency contexts can be omitted.
    - Layout tag `0x364D4843` stores one `uint8` syntax-flags field after the layout tag. Bit `0` enables adaptive coefficient-span stream encodings, bit `1` enables per-plane maximum coefficient extents, bit `2` enables split magnitude/sign coefficient coding, bit `3` enables shared chroma coefficient tables, bit `4` enables coefficient-table bank signaling, bit `5` enables single-symbol coefficient-stream elision, bit `6` enables coefficient significance maps, and bit `7` enables adaptive coefficient sign modes.
+   - Layout tag `0x374D4843` (V7, adaptive quantization) is identical to `0x364D4843` in every respect, except that two per-block quant-scale streams follow immediately after the syntax-flags byte, before the prediction mode streams: one for luma blocks, one for chroma blocks. Each stream is a sparse list: `count: uint16`, then `count` entries of `(block_index: uint16, scale_index: uint8)`. A block not listed uses scale `1.0`. `block_index` counts blocks in raster order within that plane's grid (`blocks_x * blocks_y` for luma, `chroma_blocks_x * chroma_blocks_y` for chroma). `scale_index` selects a step multiplier from this table (all values exactly representable in binary floating point, so encoder and decoder agree bit-for-bit): `0: 0.5, 1: 0.625, 2: 0.75, 3: 0.875, 4: 1.0, 5: 1.25, 6: 1.5, 7: 2.0`. The effective quant step for a block is `table_step * scale` (floating point), applied at quantize time (deadzone included) and at dequantize time, for all 64 coefficients of that block. The alpha plane has no scale stream; it always uses the tile table. The encoder writes V7 only when at least one luma or chroma block has a scale other than `1.0` or uses the PLANAR prediction mode (13); otherwise it writes V6, so plain tiles pay no overhead and no behavior change. The decoder MUST reject a V7 tile when `count` exceeds the plane's block count, when any `block_index` is out of range or not strictly increasing, or when any `scale_index` exceeds `7`. A V7 tile is rejected by decoders that do not know layout `0x374D4843` (clean failure, never silent garbage); V1–V6 files decode unchanged.
    - Layout tag `0x314D4843` is the legacy layout and stores one `uint8` prediction mode per block.
    - One stream is stored for luma blocks and one stream is stored for chroma blocks.
 5. **Coefficient span streams**:
@@ -262,6 +265,7 @@ Frequencies are normalized to sum to M = 2^12 = 4096 using the FSE "spread" algo
 | 10   | D153    | ~153° horizontal-down |
 | 11   | D207    | ~207° horizontal-up |
 | 12   | D63     | ~63° vertical-left |
+| 13   | PLANAR  | HEVC-style planar: `pred[r][c] = ((7-c)*left[r] + (c+1)*above[7] + (7-r)*above[c] + (r+1)*left[7] + 8) >> 4` (integer arithmetic, exact). A smooth 2D ramp is predicted as a ramp, so the slope survives even when the residual quantizes to zero. Only valid in layout `0x374D4843` (V7); a decoder MUST reject mode 13 in any other layout. The encoder selects it through the quantization-aware RDO (section 8.2), which measures each mode's cost after quantization; under the old unquantized RDO it was disabled because it regressed photos.
 
 ---
 
@@ -381,8 +385,14 @@ read.
 
 ### 8.1 Transform
 
-8×8 block DCT using AAN fast algorithm (5 multiplications, 29 additions per 1D pass).
-2D separable: rows then columns (forward), columns then rows (inverse).
+8×8 block DCT-II computed directly from a precomputed 8×8 cosine
+table (`cos(pi * (2n+1) * k / 16)`, orthonormal scaling
+α(0) = 1/√8, α(k) = 1/2), applied as a dense 8-point dot product
+per coefficient. 2D separable: rows then columns (forward), columns
+then rows (inverse). This is intentionally the straightforward
+direct form, not the AAN fast algorithm: the transform is not the
+bottleneck, and the direct form keeps forward and inverse exact
+inverses of each other.
 
 ### 8.2 Quantization
 
@@ -391,6 +401,8 @@ read.
 - Quality ≥ 50: scale = 200 - 2 × quality
 - Bit depth scaling: Q10 = Q8 × 4, Q12 = Q8 × 16
 - Deadzone: |coefficient| < 0.5 × step → 0
+- Adaptive quantization (layout `0x374D4843` only): a block's effective step is `table_step * scale`, where `scale` comes from that block's entry in the tile's per-block quant-scale stream (default `1.0`). The scaled step applies to the deadzone test, the quantize rounding, and the dequantize multiplication alike, so encoder and decoder reconstruct the same values. The encoder's first scale policy is the seed boost: on a tile that is unambiguously a smooth chroma ramp (see section 8.2, mode selection) at quality below 75, the seed blocks -- the first row and first column, which have no above/left reference -- use scale `0.75` (index 2). The seed's block means otherwise sit on a 2-level grid (luma DC step 16 at q50) and every interior block copies the row above, extruding the seed's staircase down the tile; `0.75` puts the seed's means on a finer grid. Scale `0.5` was measured and rejected (worst step got worse, 4 -> 5) and scale `1.0` leaves the q50 ramp banded (80 distinct, worst step 4); `0.75` reaches 93 distinct (the colorspace floor) with worst step 3 at essentially the same file size. The mode decision uses the same scale as the quantize, so the two agree.
+- Mode selection (rate-distortion) is quantization-aware: for each candidate prediction mode, the residual is transformed, quantized (with the plane's table and the block's scale), clamped to the stream's symbol range, dequantized, and added back to the prediction. The cost is the SSD of that reconstructed block plus lambda times a bit estimate of the quantized coefficients. Measuring the cost before quantization (on the raw prediction and the unquantized residual) picks modes whose residuals look cheap but quantize badly -- it regressed photos by 5-7 dB and made quality non-monotonic in the quality setting.
 
 ### 8.3 Zigzag Scan
 
@@ -440,3 +452,10 @@ A conforming decoder MUST:
     frame grid exactly once: the chunk count must equal `tile_count()`
     and every `(tile_x, tile_y)` must appear exactly once; a lossless
     frame must have exactly one TILE chunk
+12. Reject an FHDR whose `cicp_matrix` is not one of 1, 5, 6, 9 or
+    whose `cicp_transfer` is not one of 1, 13, 16, 18 (the only values
+    the converter implements; anything else must not silently fall
+    back to BT.709 / sRGB), and reject a file whose FHDR flags
+    disagree with the chunks present: `HAS_WKMETA` must match the
+    presence of a META chunk, `ANIMATED` the presence of an ANIM
+    chunk, and `HAS_C2PA` the presence of a PROV chunk
