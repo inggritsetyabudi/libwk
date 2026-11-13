@@ -18,6 +18,7 @@
 #include <array>
 #include <optional>
 #include <wk/wk.hpp>
+#include <wk/wk.h>
 #include "../src/common.h"
 #include "../src/coeff_presence_stream.h"
 #include "../src/coeff_sign_stream.h"
@@ -941,6 +942,488 @@ TEST(RoundtripTest, ZeroDimensionError) {
     Image image(0, 0, BitDepth::Bits8, false);
     auto result = encode(image);
     EXPECT_FALSE(result.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the Critical allocation-safety review (2026-11-13).
+// The decoder used to trust three counts straight from the file:
+//   * lossless palette count (u16) -> stack array of 256 entries
+//   * LZ token count (u32) -> vector allocated before any token is read
+//   * LZ backref distance / produced length -> unchecked indices
+// and parse_anim() resized its frame vector from a u32 before checking the
+// payload size, while parse_fhdr() accepted any non-zero dimension, so a
+// tiny header could trigger a multi-GB Image allocation in decode().
+// These tests feed the decoder streams no valid encoder would produce and
+// require a clean Result error, never a crash, abort, or silent success.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::vector<uint8_t> build_lossless_palette_file(
+    uint16_t palette_count, const std::vector<uint32_t>& colors,
+    uint32_t token_count, const std::vector<uint8_t>& token_bytes) {
+    ByteWriter payload;
+    payload.write_u8(1);  // use_palette
+    payload.write_u8(0);  // pred_mode NONE
+    payload.write_u16(palette_count);
+    for (uint32_t color : colors) {
+        payload.write_u32(color);
+    }
+    payload.write_u32(token_count);
+    payload.write_bytes(token_bytes);
+    std::vector<uint8_t> payload_bytes = payload.finish();
+
+    TileHeader tile;
+    tile.tile_x = 0;
+    tile.tile_y = 0;
+    tile.layer_flags = TILE_HAS_BASE;
+    tile.compressed_size = static_cast<uint32_t>(payload_bytes.size());
+
+    Chunk chunk;
+    std::memcpy(chunk.type, CHUNK_TILE, 4);
+    chunk.payload = serialize_tile_header(tile);
+    chunk.payload.insert(chunk.payload.end(), payload_bytes.begin(),
+                         payload_bytes.end());
+
+    WkFile file;
+    file.header.width = 8;
+    file.header.height = 8;
+    file.header.bit_depth = 8;
+    file.header.cicp_primaries = 1;
+    file.header.cicp_transfer = 1;
+    file.header.cicp_matrix = 1;
+    file.header.flags =
+        FHDR_FLAG_LOSSLESS | FHDR_FLAG_TILED | FHDR_FLAG_FULL_RANGE;
+    file.header.tile_size_log2 = 6;
+    file.tile_chunks.push_back(std::move(chunk));
+
+    auto written = write_container(file);
+    if (!written.has_value()) {
+        return {};
+    }
+    return *written;
+}
+
+std::vector<uint8_t> literal_tokens(size_t count, uint8_t value) {
+    std::vector<uint8_t> bytes;
+    for (size_t i = 0; i < count; ++i) {
+        bytes.push_back(0);  // LITERAL
+        bytes.push_back(value);
+    }
+    return bytes;
+}
+
+std::vector<uint8_t> backref_token(uint16_t distance, uint16_t length) {
+    ByteWriter writer;
+    writer.write_u8(1);  // BACKREFERENCE
+    writer.write_u16(distance);
+    writer.write_u16(length);
+    return writer.finish();
+}
+
+}  // namespace
+
+TEST(RoundtripTest, LosslessPaletteSmallImageDecodes) {
+    // Positive control: a valid 2-color palette stream must still decode.
+    std::vector<uint8_t> tokens;
+    for (int k = 0; k < 64; ++k) {
+        tokens.push_back(0);  // LITERAL
+        tokens.push_back(static_cast<uint8_t>(k % 2));
+    }
+    auto bytes = build_lossless_palette_file(
+        2, {0xFF000000u, 0xFFFFFFFFu}, 64, tokens);
+    ASSERT_FALSE(bytes.empty());
+
+    auto decoded = decode(bytes);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    EXPECT_EQ(decoded->width(), 8u);
+    EXPECT_EQ(decoded->height(), 8u);
+    const auto pixels = decoded->pixels();
+    EXPECT_EQ(pixels[0], 0u);
+    EXPECT_EQ(pixels[1], 0u);
+    EXPECT_EQ(pixels[2], 0u);
+    EXPECT_EQ(pixels[3], 255u);
+    EXPECT_EQ(pixels[4], 255u);
+    EXPECT_EQ(pixels[5], 255u);
+}
+
+TEST(RoundtripTest, LosslessPaletteCountAbove256Rejected) {
+    std::vector<uint32_t> colors(300, 0xFF000000u);
+    auto bytes = build_lossless_palette_file(300, colors, 0, {});
+    ASSERT_FALSE(bytes.empty());
+
+    auto decoded = decode(bytes);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code, ErrorCode::LosslessError);
+}
+
+TEST(RoundtripTest, LosslessPaletteCountZeroRejected) {
+    auto bytes = build_lossless_palette_file(0, {}, 0, {});
+    ASSERT_FALSE(bytes.empty());
+
+    auto decoded = decode(bytes);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code, ErrorCode::LosslessError);
+}
+
+TEST(RoundtripTest, LosslessPaletteIndexOutOfRangeRejected) {
+    // Palette has 1 entry, but every index claims entry 5: undo_palette
+    // used to read past the initialized entries.
+    auto bytes = build_lossless_palette_file(1, {0xFF000000u}, 64,
+                                             literal_tokens(64, 5));
+    ASSERT_FALSE(bytes.empty());
+
+    auto decoded = decode(bytes);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code, ErrorCode::LosslessError);
+}
+
+TEST(RoundtripTest, LosslessLzBackrefDistanceBeyondPositionRejected) {
+    // One literal (pos=1), then a backref with distance 5 > pos.
+    std::vector<uint8_t> tokens = literal_tokens(1, 0);
+    auto backref = backref_token(5, 10);
+    tokens.insert(tokens.end(), backref.begin(), backref.end());
+    auto bytes = build_lossless_palette_file(1, {0xFF000000u}, 2, tokens);
+    ASSERT_FALSE(bytes.empty());
+
+    auto decoded = decode(bytes);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code, ErrorCode::LosslessError);
+}
+
+TEST(RoundtripTest, LosslessLzBackrefZeroDistanceRejected) {
+    std::vector<uint8_t> tokens = literal_tokens(1, 0);
+    auto backref = backref_token(0, 3);
+    tokens.insert(tokens.end(), backref.begin(), backref.end());
+    auto bytes = build_lossless_palette_file(1, {0xFF000000u}, 2, tokens);
+    ASSERT_FALSE(bytes.empty());
+
+    auto decoded = decode(bytes);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code, ErrorCode::LosslessError);
+}
+
+TEST(RoundtripTest, LosslessLzLiteralOverflowRejected) {
+    // 65 literals for a 64-pixel image: the 65th would write past indices.
+    auto bytes = build_lossless_palette_file(1, {0xFF000000u}, 65,
+                                             literal_tokens(65, 0));
+    ASSERT_FALSE(bytes.empty());
+
+    auto decoded = decode(bytes);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code, ErrorCode::LosslessError);
+}
+
+TEST(RoundtripTest, LosslessLzTokenCountAboveRemainingPayloadRejected) {
+    auto bytes = build_lossless_palette_file(1, {0xFF000000u}, 0xFFFFFFFFu, {});
+    ASSERT_FALSE(bytes.empty());
+
+    auto decoded = decode(bytes);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code, ErrorCode::LosslessError);
+}
+
+TEST(RoundtripTest, LosslessLzUnknownTokenTypeRejected) {
+    // Type byte 7 is neither LITERAL (0) nor BACKREFERENCE (1).
+    // The 4 trailing bytes are the dist/len fields a backref-shaped
+    // token carries, so the token reads fully and the rejection must
+    // come from the type check, not from truncation.
+    auto bytes = build_lossless_palette_file(1, {0xFF000000u}, 1, {7, 0, 0, 0, 0});
+    ASSERT_FALSE(bytes.empty());
+
+    auto decoded = decode(bytes);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code, ErrorCode::LosslessError);
+}
+
+TEST(RoundtripTest, HugeAnimationFrameCountDecodeRejected) {
+    WkFile file;
+    file.header.width = 8;
+    file.header.height = 8;
+    file.header.bit_depth = 8;
+    file.header.cicp_primaries = 1;
+    file.header.cicp_transfer = 1;
+    file.header.cicp_matrix = 1;
+    file.header.flags = FHDR_FLAG_TILED | FHDR_FLAG_FULL_RANGE;
+    file.header.tile_size_log2 = 6;
+    file.animation = AnimHeader{};
+    file.animation->frame_count = 0xFFFFFFFFu;
+    file.animation->loop_count = 0;
+    file.animation->background_rgba = 0;
+    // frames intentionally empty: 10-byte ANIM payload, huge claim.
+
+    auto written = write_container(file);
+    ASSERT_TRUE(written.has_value());
+
+    auto decoded = decode(*written);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code, ErrorCode::AnimationError);
+}
+
+TEST(RoundtripTest, CApiDecodeRejectsHugeAnimationWithoutAbort) {
+    WkFile file;
+    file.header.width = 8;
+    file.header.height = 8;
+    file.header.bit_depth = 8;
+    file.header.cicp_primaries = 1;
+    file.header.cicp_transfer = 1;
+    file.header.cicp_matrix = 1;
+    file.header.flags = FHDR_FLAG_TILED | FHDR_FLAG_FULL_RANGE;
+    file.header.tile_size_log2 = 6;
+    file.animation = AnimHeader{};
+    file.animation->frame_count = 0xFFFFFFFFu;
+
+    auto written = write_container(file);
+    ASSERT_TRUE(written.has_value());
+
+    uint8_t* pixels = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint8_t bpp = 0;
+    const wk_error_t rc = wk_decode(written->data(), written->size(), &pixels,
+                                    &width, &height, &bpp);
+    EXPECT_NE(rc, WK_OK);
+    EXPECT_EQ(pixels, nullptr);
+}
+
+TEST(RoundtripTest, HugeDimensionsDecodeRejected) {
+    WkFile file;
+    file.header.width = 40000;
+    file.header.height = 40000;
+    file.header.bit_depth = 8;
+    file.header.cicp_primaries = 1;
+    file.header.cicp_transfer = 1;
+    file.header.cicp_matrix = 1;
+    file.header.flags = FHDR_FLAG_TILED | FHDR_FLAG_FULL_RANGE;
+    file.header.tile_size_log2 = 9;
+
+    auto written = write_container(file);
+    ASSERT_TRUE(written.has_value());
+
+    auto decoded = decode(*written);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code, ErrorCode::InvalidHeader);
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the lossy review findings (2026-11-13, PR3).
+//   * The coefficient stream's symbol range is bit-depth aware (see
+//     SPEC.md): 8-bit keeps the historical +-1024, 10-bit uses +-4096,
+//     12-bit uses +-16384. The in-loop clamp from PR3 now clamps to the
+//     same range, so encoder and decoder agree at every bit depth and
+//     solid white at quality 100 decodes exactly (12-bit was 2306,
+//     10-bit was 642 when the range was +-1024 for all depths).
+//   * YUV420 on an image whose first tile is <=8px is undecodable: the
+//     decoder infers subsampling from the first tile's chroma block counts
+//     and 4:4:4 / 4:2:0 coincide there, so it defaults to 4:4:4.
+//   * Quality knob: verified on real photos (ember/mira/horizon) that size
+//     and PSNR/SSIM move monotonically with quality; lock that in so a
+//     future change cannot silently disconnect the knob from the output.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+double mean_abs_error(const Image& a, const Image& b) {
+    const auto pa = a.pixels();
+    const auto pb = b.pixels();
+    double sum = 0.0;
+    for (size_t i = 0; i < pa.size(); ++i) {
+        sum += std::abs(static_cast<int>(pa[i]) - static_cast<int>(pb[i]));
+    }
+    return sum / static_cast<double>(pa.size());
+}
+
+}  // namespace
+
+TEST(RoundtripTest, Lossy12BitQ100SolidWhiteDecodesExactly) {
+    // With a bit-depth-aware symbol range (12-bit: +-16384) the first
+    // block's DC coefficient fits the stream, so solid white decodes
+    // exactly instead of dark (it was 2306 when the range was +-1024).
+    Image image(8, 8, BitDepth::Bits12, false);
+    auto pixels = image.pixels();
+    for (size_t i = 0; i + 1 < pixels.size(); i += 2) {
+        pixels[i] = 0xFF;
+        pixels[i + 1] = 0x0F;  // 4095 little-endian
+    }
+
+    EncoderConfig config;
+    config.quality = 100;
+    config.bit_depth = BitDepth::Bits12;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+
+    const auto out = decoded->pixels();
+    const int value = static_cast<int>(out[0]) | (static_cast<int>(out[1]) << 8);
+    EXPECT_EQ(value, 4095) << "12-bit white decoded as " << value;
+}
+
+TEST(RoundtripTest, Lossy10BitQ100SolidWhiteDecodesExactly) {
+    // Same at 10-bit (+-4096 range): was 642 with the +-1024 range.
+    Image image(8, 8, BitDepth::Bits10, false);
+    auto pixels = image.pixels();
+    for (size_t i = 0; i + 1 < pixels.size(); i += 2) {
+        pixels[i] = 0xFF;
+        pixels[i + 1] = 0x03;  // 1023 little-endian
+    }
+
+    EncoderConfig config;
+    config.quality = 100;
+    config.bit_depth = BitDepth::Bits10;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+
+    const auto out = decoded->pixels();
+    const int value = static_cast<int>(out[0]) | (static_cast<int>(out[1]) << 8);
+    EXPECT_EQ(value, 1023) << "10-bit white decoded as " << value;
+}
+
+TEST(RoundtripTest, Lossy12BitQ100SolidWhiteUniformAcrossBlocks) {
+    // The in-loop clamp fix (PR3) made the reconstruction climb back to
+    // white block by block; with the wider range there is nothing to
+    // climb back from -- every block decodes exact white.
+    Image image(64, 8, BitDepth::Bits12, false);
+    auto pixels = image.pixels();
+    for (size_t i = 0; i + 1 < pixels.size(); i += 2) {
+        pixels[i] = 0xFF;
+        pixels[i + 1] = 0x0F;  // 4095 little-endian
+    }
+
+    EncoderConfig config;
+    config.quality = 100;
+    config.bit_depth = BitDepth::Bits12;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+
+    const auto out = decoded->pixels();
+    for (int bx = 0; bx < 8; ++bx) {
+        const size_t o = static_cast<size_t>(bx * 8) * 6;
+        const int value = static_cast<int>(out[o]) | (static_cast<int>(out[o + 1]) << 8);
+        EXPECT_EQ(value, 4095) << "block " << bx << " decoded as " << value;
+    }
+}
+
+TEST(RoundtripTest, Lossy8BitQ100SolidWhiteStillExact) {
+    // Guard: the range change must not touch 8-bit behaviour at all
+    // (8-bit keeps the historical +-1024 range).
+    Image image(8, 8, BitDepth::Bits8, false);
+    auto pixels = image.pixels();
+    for (size_t i = 0; i < pixels.size(); ++i) {
+        pixels[i] = 255;
+    }
+
+    EncoderConfig config;
+    config.quality = 100;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+
+    EXPECT_EQ(decoded->pixels()[0], 255);
+}
+
+TEST(RoundtripTest, LossyYuv420TinyImageDecodesCorrectly) {
+    Image image(8, 8, BitDepth::Bits8, false);
+    auto pixels = image.pixels();
+    for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x) {
+            const size_t o = static_cast<size_t>(y * 8 + x) * 3;
+            if (x < 4) {
+                pixels[o] = 255;
+                pixels[o + 1] = 0;
+                pixels[o + 2] = 0;
+            } else {
+                pixels[o] = 0;
+                pixels[o + 1] = 0;
+                pixels[o + 2] = 255;
+            }
+        }
+    }
+
+    EncoderConfig config;
+    config.quality = 90;
+    config.subsampling = Subsampling::YUV420;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+
+    const auto out = decoded->pixels();
+    // Left half must stay red, right half blue. Before the fix the file
+    // decoded as 4:4:4 and came back with R(3,0)=36, B(7,0)=0.
+    EXPECT_GT(out[(0 * 8 + 3) * 3 + 0], 200);
+    EXPECT_LT(out[(0 * 8 + 3) * 3 + 2], 50);
+    EXPECT_LT(out[(0 * 8 + 7) * 3 + 0], 50);
+    EXPECT_GT(out[(0 * 8 + 7) * 3 + 2], 200);
+}
+
+TEST(RoundtripTest, LossyYuv420NormalSizeStillWorks) {
+    // Guard against the tiny-image fallback leaking into normal sizes:
+    // a 64x64 YUV420 encode must still decode close to the original.
+    Image image = make_rgb_gradient(64, 64);
+
+    EncoderConfig config;
+    config.quality = 90;
+    config.subsampling = Subsampling::YUV420;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+
+    EXPECT_LT(mean_abs_error(image, *decoded), 10.0);
+}
+
+TEST(RoundtripTest, QualityLowersSizeAndErrorMonotonically) {
+    // Photo-like content: a gradient plus deterministic high-frequency
+    // texture. (A perfectly smooth gradient alone is not used here: on
+    // it, discrete RDO mode choices make the size non-monotonic -- q75
+    // can come out smaller than q50 while also being more accurate --
+    // which is an encoder tuning quirk, not the knob being disconnected.)
+    Image image(128, 128, BitDepth::Bits8, false);
+    for (int y = 0; y < 128; ++y) {
+        for (int x = 0; x < 128; ++x) {
+            uint8_t* row = image.row(static_cast<uint32_t>(y)) +
+                           static_cast<size_t>(x) * 3;
+            const int texture = ((x * 7 + y * 13) % 17) * 3 - 24;
+            row[0] = static_cast<uint8_t>(
+                std::clamp((x * 255) / 127 + texture, 0, 255));
+            row[1] = static_cast<uint8_t>(
+                std::clamp((y * 255) / 127 + texture, 0, 255));
+            row[2] = static_cast<uint8_t>(
+                std::clamp(((x + y) * 255) / 254 + texture, 0, 255));
+        }
+    }
+
+    std::vector<size_t> sizes;
+    std::vector<double> errors;
+    for (float quality : {10.0f, 50.0f, 75.0f, 100.0f}) {
+        EncoderConfig config;
+        config.quality = quality;
+        auto encoded = encode(image, config);
+        ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+        auto decoded = decode(*encoded);
+        ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+        sizes.push_back(encoded->size());
+        errors.push_back(mean_abs_error(image, *decoded));
+    }
+
+    for (size_t i = 1; i < sizes.size(); ++i) {
+        EXPECT_GT(sizes[i], sizes[i - 1])
+            << "size did not grow with quality at step " << i;
+        EXPECT_LT(errors[i], errors[i - 1])
+            << "error did not shrink with quality at step " << i;
+    }
 }
 
 

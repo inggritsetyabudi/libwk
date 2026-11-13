@@ -97,7 +97,12 @@ struct LzToken {
 };
 
 std::vector<LzToken> lz_encode_indices(const uint8_t* indices, size_t count);
-void lz_decode_indices(const std::vector<LzToken>& tokens, uint8_t* indices, size_t count);
+// Decodes LZ tokens into exactly `count` indices. Every bound is checked
+// against the caller-supplied output size because the token stream comes
+// from an untrusted file: unknown types, distances that reach before the
+// start of the output, and streams that produce too few or too many
+// indices are all rejected instead of reading/writing out of bounds.
+Result<void> lz_decode_indices(const std::vector<LzToken>& tokens, uint8_t* indices, size_t count);
 
 
 

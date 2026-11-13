@@ -19,6 +19,18 @@
 
 namespace wk {
 
+// Coefficient symbol range is bit-depth aware. A quantized DCT
+// coefficient scales with the pixel range (the DC of a constant block is
+// 8x the residual), so the stream must be able to carry larger magnitudes
+// at higher bit depths: 8-bit keeps the historical +-1024 range, 10-bit
+// uses +-4096, 12-bit uses +-16384. The 8-bit range is unchanged, so
+// 8-bit files are byte-identical to before. The shift is clamped so an
+// unexpected bit depth can never produce a huge or negative range.
+[[nodiscard]] inline int coeff_symbol_offset(uint8_t bit_depth) {
+    const int shift = std::clamp(static_cast<int>(bit_depth) - 8, 0, 4);
+    return 1024 << shift;
+}
+
 struct LossyCoeffStreamConfig {
     bool use_plane_max_coeff_span = false;
     bool adaptive_coefficient_tables = true;
@@ -28,6 +40,9 @@ struct LossyCoeffStreamConfig {
     bool elide_single_symbol_streams = false;
     bool use_significance_maps = false;
     bool use_adaptive_sign_streams = false;
+    // Bit depth of the image being coded (8, 10 or 12). Drives the
+    // coefficient symbol range via coeff_symbol_offset().
+    uint8_t bit_depth = 8;
 };
 
 struct DecodedLossyChromaPayload {

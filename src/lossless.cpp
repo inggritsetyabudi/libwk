@@ -214,19 +214,39 @@ std::vector<LzToken> lz_encode_indices(const uint8_t* indices, size_t count) {
     return tokens;
 }
 
-void lz_decode_indices(const std::vector<LzToken>& tokens,
-                        uint8_t* indices, size_t ) {
+Result<void> lz_decode_indices(const std::vector<LzToken>& tokens,
+                               uint8_t* indices, size_t count) {
     size_t pos = 0;
     for (const auto& tok : tokens) {
         if (tok.type == LzToken::LITERAL) {
+            if (pos >= count) {
+                return std::unexpected(Error{ErrorCode::LosslessError,
+                    "LZ literal exceeds pixel count"});
+            }
             indices[pos++] = tok.literal;
-        } else {
+        } else if (tok.type == LzToken::BACKREFERENCE) {
+            if (tok.distance == 0 || tok.distance > pos) {
+                return std::unexpected(Error{ErrorCode::LosslessError,
+                    "LZ backref distance out of range"});
+            }
+            if (tok.length > count - pos) {
+                return std::unexpected(Error{ErrorCode::LosslessError,
+                    "LZ backref exceeds pixel count"});
+            }
             for (uint16_t j = 0; j < tok.length; j++) {
                 indices[pos] = indices[pos - tok.distance];
                 pos++;
             }
+        } else {
+            return std::unexpected(Error{ErrorCode::LosslessError,
+                "unknown LZ token type"});
         }
     }
+    if (pos != count) {
+        return std::unexpected(Error{ErrorCode::LosslessError,
+            "LZ stream produced fewer indices than pixels"});
+    }
+    return {};
 }
 
 
@@ -459,6 +479,15 @@ Result<std::vector<uint8_t>> lossless_decode(
         auto count_r = reader.read_u16();
         if (!count_r) return std::unexpected(count_r.error());
 
+        // The palette array holds 256 entries; the count comes straight
+        // from the file, so reject anything it cannot hold before writing
+        // a single color. Zero is invalid too: a non-empty image always
+        // has at least one palette entry.
+        if (*count_r == 0 || *count_r > 256) {
+            return std::unexpected(Error{ErrorCode::LosslessError,
+                "palette count out of range"});
+        }
+
         Palette palette;
         palette.count = *count_r;
         for (int i = 0; i < palette.count; i++) {
@@ -469,6 +498,15 @@ Result<std::vector<uint8_t>> lossless_decode(
 
         auto token_count_r = reader.read_u32();
         if (!token_count_r) return std::unexpected(token_count_r.error());
+
+        // Each token occupies at least its 1-byte type in the remaining
+        // payload, so a larger claim cannot describe this tile. Check
+        // before allocating the token vector: the count is a u32 from
+        // the file and allocating it blindly is a trivial OOM.
+        if (*token_count_r > reader.remaining()) {
+            return std::unexpected(Error{ErrorCode::LosslessError,
+                "LZ token count exceeds remaining payload"});
+        }
 
         std::vector<LzToken> tokens(*token_count_r);
         for (uint32_t i = 0; i < *token_count_r; i++) {
@@ -491,7 +529,18 @@ Result<std::vector<uint8_t>> lossless_decode(
         }
 
         std::vector<uint8_t> indices(pixel_count);
-        lz_decode_indices(tokens, indices.data(), pixel_count);
+        auto lz = lz_decode_indices(tokens, indices.data(), pixel_count);
+        if (!lz) return std::unexpected(lz.error());
+        // Indices are uint8, so they are always in range of the 256-entry
+        // array, but only the first palette.count entries were read from
+        // the file; the rest are uninitialized. Reject out-of-palette
+        // indices instead of decoding with garbage colors.
+        for (size_t i = 0; i < pixel_count; ++i) {
+            if (indices[i] >= palette.count) {
+                return std::unexpected(Error{ErrorCode::LosslessError,
+                    "palette index out of range"});
+            }
+        }
         undo_palette(indices.data(), width, height, palette, output.data());
     } else {
 

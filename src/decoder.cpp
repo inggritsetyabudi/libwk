@@ -26,6 +26,8 @@
 #include <wk/wk.h>
 #include <cmath>
 #include <cstring>
+#include <exception>
+#include <new>
 #include <optional>
 
 namespace wk {
@@ -354,6 +356,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
         .elide_single_symbol_streams = elide_single_symbol_streams,
         .use_significance_maps = coefficient_significance_maps,
         .use_adaptive_sign_streams = adaptive_coefficient_signs,
+        .bit_depth = bit_depth,
     };
 
     auto y_coeffs = decode_lossy_plane_payload(reader, y_spans, y_max_coeff_span, coeff_config);
@@ -626,7 +629,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
 }
 }
 
-Result<ImageInfo> get_info(std::span<const uint8_t> data) {
+Result<ImageInfo> get_info_impl(std::span<const uint8_t> data) {
     auto file = parse_container(data);
     if (!file) return std::unexpected(file.error());
 
@@ -648,7 +651,7 @@ Result<ImageInfo> get_info(std::span<const uint8_t> data) {
     return info;
 }
 
-Result<Image> decode(std::span<const uint8_t> data, const DecoderConfig& config) {
+Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& config) {
     auto file = parse_container(data);
     if (!file) return std::unexpected(file.error());
 
@@ -766,6 +769,37 @@ Result<Image> decode(std::span<const uint8_t> data, const DecoderConfig& config)
                  width, height, hdr.cicp_matrix, hdr.bit_depth, hdr.full_range(),
                  hdr.has_alpha(), hdr.has_alpha() ? full_a.data() : nullptr);
     return output;
+}
+
+// Public API boundary: decode works on untrusted files, and allocation
+// failure (std::bad_alloc / std::length_error) must surface as a Result
+// error, never escape as an exception -- callers in C (wk_decode) and
+// tools have no handler, so an escaping exception would terminate the
+// process (SPEC section 10: the decoder must never crash on malformed
+// input). The checks above already bound the known huge allocations;
+// this is the last line of defense for any allocation left.
+Result<ImageInfo> get_info(std::span<const uint8_t> data) {
+    try {
+        return get_info_impl(data);
+    } catch (const std::bad_alloc&) {
+        return std::unexpected(Error{ErrorCode::OutOfMemory, "out of memory while reading info"});
+    } catch (const std::exception& e) {
+        return std::unexpected(Error{ErrorCode::DecodeFailed, std::string("exception while reading info: ") + e.what()});
+    } catch (...) {
+        return std::unexpected(Error{ErrorCode::DecodeFailed, "unknown exception while reading info"});
+    }
+}
+
+Result<Image> decode(std::span<const uint8_t> data, const DecoderConfig& config) {
+    try {
+        return decode_impl(data, config);
+    } catch (const std::bad_alloc&) {
+        return std::unexpected(Error{ErrorCode::OutOfMemory, "out of memory while decoding"});
+    } catch (const std::exception& e) {
+        return std::unexpected(Error{ErrorCode::DecodeFailed, std::string("exception while decoding: ") + e.what()});
+    } catch (...) {
+        return std::unexpected(Error{ErrorCode::DecodeFailed, "unknown exception while decoding"});
+    }
 }
 
 }
