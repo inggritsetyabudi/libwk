@@ -261,7 +261,7 @@ std::expected<Timestamp, MetaError> gps_timestamp(const TiffReader& reader,
         return std::unexpected(MetaError{MetaErrorCode::TagNotFound, "missing GPS timestamp tags"});
     }
     auto date = reader.ascii_string(*date_entry);
-    if (!date || date->size() < 10) {
+    if (!date || date->size() != 10) {
         return std::unexpected(MetaError{MetaErrorCode::InvalidValue, "invalid GPS date"});
     }
     if (time_entry->type != kTiffRational || time_entry->count < 3) {
@@ -275,17 +275,45 @@ std::expected<Timestamp, MetaError> gps_timestamp(const TiffReader& reader,
         return std::unexpected(MetaError{MetaErrorCode::MalformedInput, "invalid GPS time value"});
     }
 
-    int year = std::stoi(date->substr(0, 4));
-    int month = std::stoi(date->substr(5, 2));
-    int day = std::stoi(date->substr(8, 2));
+    // The date must be exactly "YYYY:MM:DD": std::stoi on anything else
+    // throws (std::invalid_argument / std::out_of_range) out of this
+    // function with no handler, aborting the importer. Parse the digits
+    // by hand, and reject months/days timegm would silently normalize
+    // into a different, wrong date (e.g. month 13, day 45).
+    auto parse_two_digits = [](const std::string& s, size_t pos) -> std::expected<int, MetaError> {
+        const char hi = s[pos];
+        const char lo = s[pos + 1];
+        if (hi < '0' || hi > '9' || lo < '0' || lo > '9') {
+            return std::unexpected(MetaError{MetaErrorCode::InvalidValue, "invalid GPS date"});
+        }
+        return (hi - '0') * 10 + (lo - '0');
+    };
+    auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    if (!is_digit((*date)[0]) || !is_digit((*date)[1]) || !is_digit((*date)[2]) ||
+        !is_digit((*date)[3]) || (*date)[4] != ':' || (*date)[7] != ':') {
+        return std::unexpected(MetaError{MetaErrorCode::InvalidValue, "invalid GPS date"});
+    }
+    const int year = ((*date)[0] - '0') * 1000 + ((*date)[1] - '0') * 100 +
+                     ((*date)[2] - '0') * 10 + ((*date)[3] - '0');
+    auto month = parse_two_digits(*date, 5);
+    if (!month) {
+        return std::unexpected(month.error());
+    }
+    auto day = parse_two_digits(*date, 8);
+    if (!day) {
+        return std::unexpected(day.error());
+    }
+    if (*month < 1 || *month > 12 || *day < 1 || *day > 31) {
+        return std::unexpected(MetaError{MetaErrorCode::InvalidValue, "invalid GPS date"});
+    }
     double seconds_value = rational_to_double(*seconds);
     int whole_seconds = static_cast<int>(seconds_value);
     int microseconds = static_cast<int>((seconds_value - whole_seconds) * 1000000.0 + 0.5);
 
     std::tm tm_value = {};
     tm_value.tm_year = year - 1900;
-    tm_value.tm_mon = month - 1;
-    tm_value.tm_mday = day;
+    tm_value.tm_mon = *month - 1;
+    tm_value.tm_mday = *day;
     tm_value.tm_hour = static_cast<int>(rational_to_double(*hours));
     tm_value.tm_min = static_cast<int>(rational_to_double(*minutes));
     tm_value.tm_sec = whole_seconds;

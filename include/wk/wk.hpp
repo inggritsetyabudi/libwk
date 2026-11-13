@@ -26,8 +26,62 @@
 namespace wk
 {
 
-    struct Error;
-    enum class ErrorCode : uint32_t;
+    // ErrorCode and Error are defined here, in the public header, so that
+    // <wk/wk.hpp> is self-contained: a translation unit that includes only
+    // this header must be able to name the error type of the Result it
+    // gets back from encode()/decode()/get_info(). They used to be only
+    // forward-declared here and fully defined in the internal
+    // src/common.h, which made any such use fail to compile with
+    // "invalid use of incomplete type 'wk::Error'".
+    enum class ErrorCode : uint32_t
+    {
+        Ok = 0,
+        InvalidMagic,
+        InvalidVersion,
+        InvalidChunkType,
+        InvalidChunkSize,
+        TruncatedInput,
+        InvalidHeader,
+        InvalidTileCoord,
+        InvalidBitDepth,
+        InvalidCICP,
+        UnsupportedFeature,
+        EncodeFailed,
+        DecodeFailed,
+        RansError,
+        DctError,
+        PredictionError,
+        QuantizeError,
+        MetaParseError,
+        MetaSerializeError,
+        MetaTagNotFound,
+        MetaTypeMismatch,
+        InvalidParameter,
+        IoError,
+        OutOfMemory,
+        ThreadingError,
+        AnimationError,
+        ColorSpaceError,
+        LosslessError,
+        ChecksumMismatch,
+    };
+
+    struct Error
+    {
+        ErrorCode code;
+        std::string message;
+
+        Error() = default;
+        Error(ErrorCode c, std::string msg = {})
+            : code(c), message(std::move(msg)) {}
+        Error(const Error&) = default;
+        Error(Error&&) = default;
+        Error& operator=(const Error&) = default;
+        Error& operator=(Error&&) = default;
+        bool operator==(const Error& other) const {
+            return code == other.code && message == other.message;
+        }
+    };
 
     template <typename T>
     using Result = std::expected<T, Error>;

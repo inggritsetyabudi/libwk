@@ -87,6 +87,29 @@ Result<std::string> next_ppm_token(std::span<const uint8_t> data, size_t& offset
     return std::string(reinterpret_cast<const char*>(data.data() + start), offset - start);
 }
 
+// PPM header numbers come from the file, so they must be parsed without
+// throwing: std::stoul on a 26-digit width threw std::out_of_range out of
+// load_ppm with no handler (wkenc aborted, exit 134), and "-5" wrapped to
+// ULONG_MAX and was only caught later by the payload-size check.
+Result<uint32_t> parse_ppm_u32(const std::string& token) {
+    if (token.empty()) {
+        return std::unexpected(Error{ErrorCode::InvalidHeader, "empty PPM header value"});
+    }
+    uint64_t value = 0;
+    for (char c : token) {
+        if (c < '0' || c > '9') {
+            return std::unexpected(Error{ErrorCode::InvalidHeader,
+                                         "PPM header value is not a number"});
+        }
+        value = value * 10 + static_cast<uint64_t>(c - '0');
+        if (value > UINT32_MAX) {
+            return std::unexpected(Error{ErrorCode::InvalidHeader,
+                                         "PPM header value out of range"});
+        }
+    }
+    return static_cast<uint32_t>(value);
+}
+
 Result<Image> load_ppm(std::string_view path) {
     auto file_bytes = read_file_bytes(path);
     if (!file_bytes) {
@@ -109,10 +132,22 @@ Result<Image> load_ppm(std::string_view path) {
         return std::unexpected(Error{ErrorCode::InvalidHeader, "incomplete PPM header"});
     }
 
-    const uint32_t width = static_cast<uint32_t>(std::stoul(*width_token));
-    const uint32_t height = static_cast<uint32_t>(std::stoul(*height_token));
-    const uint32_t max_value = static_cast<uint32_t>(std::stoul(*max_token));
-    if (max_value != 255) {
+    auto width = parse_ppm_u32(*width_token);
+    if (!width) {
+        return std::unexpected(width.error());
+    }
+    auto height = parse_ppm_u32(*height_token);
+    if (!height) {
+        return std::unexpected(height.error());
+    }
+    auto max_value = parse_ppm_u32(*max_token);
+    if (!max_value) {
+        return std::unexpected(max_value.error());
+    }
+    if (*width == 0 || *height == 0) {
+        return std::unexpected(Error{ErrorCode::InvalidHeader, "PPM dimensions must be non-zero"});
+    }
+    if (*max_value != 255) {
         return std::unexpected(Error{ErrorCode::UnsupportedFeature, "PPM max value must be 255"});
     }
 
@@ -120,12 +155,12 @@ Result<Image> load_ppm(std::string_view path) {
         ++offset;
     }
 
-    const size_t rgb_size = static_cast<size_t>(width) * height * 3;
+    const size_t rgb_size = static_cast<size_t>(*width) * *height * 3;
     if (file_bytes->size() - offset != rgb_size) {
         return std::unexpected(Error{ErrorCode::InvalidChunkSize, "PPM payload size does not match dimensions"});
     }
 
-    Image image(width, height, BitDepth::Bits8, false);
+    Image image(*width, *height, BitDepth::Bits8, false);
     std::copy(file_bytes->begin() + static_cast<std::ptrdiff_t>(offset), file_bytes->end(), image.pixels().begin());
     return image;
 }
