@@ -96,6 +96,22 @@ TEST(ImageIoTest, LoadPpmAcceptsValid) {
     EXPECT_TRUE(std::equal(payload.begin(), payload.end(), loaded->pixels().begin()));
 }
 
+TEST(ImageIoTest, LoadPpmKeepsLeadingWhitespaceRasterByte) {
+    // Regression: load_ppm skipped ALL whitespace after maxval, so a
+    // first raster byte that is itself whitespace (0x09 tab here) was
+    // eaten and the payload-size check rejected the file. The raster
+    // follows a single whitespace delimiter after maxval.
+    std::vector<uint8_t> payload = {0x09, 0x76, 0xaf, 0x09, 0x76, 0xaf,
+                                    0x09, 0x76, 0xaf, 0x09, 0x76, 0xaf};
+    auto path = write_temp_ppm("wk_ws_raster.ppm", "P6\n2 2\n255\n", payload);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 2u);
+    EXPECT_EQ(loaded->height(), 2u);
+    EXPECT_TRUE(std::equal(payload.begin(), payload.end(), loaded->pixels().begin()));
+}
+
 TEST(ImageIoTest, LoadPpmRejectsTruncatedPayload) {
     // Control: the pre-existing payload-size check still works.
     auto path = write_temp_ppm("wk_short.ppm", "P6\n2 2\n255\n",
