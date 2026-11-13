@@ -1654,19 +1654,51 @@ wk_error_t wk_encode(
     if (!pixels || !config || !out_data || !out_size) {
         return WK_ERROR_INVALID_PARAM;
     }
+    if (width == 0 || height == 0) {
+        return WK_ERROR_INVALID_PARAM;
+    }
+
+    // bit_depth is the caller's claim about the pixel data: anything other
+    // than 8/10/12 used to be silently treated as 8-bit, encoding the
+    // wrong data without telling the caller.
+    if (config->bit_depth != 8 && config->bit_depth != 10 && config->bit_depth != 12) {
+        return WK_ERROR_INVALID_PARAM;
+    }
+
+    // bpp must agree with bit depth: 3 (RGB) / 4 (RGBA) at 8-bit,
+    // 6 / 8 at 10/12-bit. A mismatch used to make the row copies below
+    // read/write past the Image rows -- e.g. bpp 6 at 8-bit copied twice
+    // the row size (heap overflow).
+    const bool is_16bit = config->bit_depth != 8;
+    if (bpp != (is_16bit ? 6 : 3) && bpp != (is_16bit ? 8 : 4)) {
+        return WK_ERROR_INVALID_PARAM;
+    }
+
+    bool has_alpha = (bpp == 4 || bpp == 8);
+    const size_t row_bytes = static_cast<size_t>(width) * bpp;
+    const size_t src_stride = pixel_stride > 0 ? pixel_stride : row_bytes;
+    // An explicit stride smaller than the row would make the row copies
+    // overlap. The API has no buffer-size parameter, so no bound on the
+    // stride itself can be checked here -- a stride is just a row pitch.
+    // The overflow guard below only matters on 32-bit targets: on
+    // 64-bit, y < 2^32 and stride < 2^32, so (height-1)*stride can never
+    // wrap size_t; on 32-bit it can, and this rejects it.
+    if (pixel_stride > 0 && pixel_stride < row_bytes) {
+        return WK_ERROR_INVALID_PARAM;
+    }
+    if (height > 1 && src_stride > (SIZE_MAX - row_bytes) / (height - 1)) {
+        return WK_ERROR_INVALID_PARAM;
+    }
 
     wk::BitDepth bd = wk::BitDepth::Bits8;
     if (config->bit_depth == 10) bd = wk::BitDepth::Bits10;
     else if (config->bit_depth == 12) bd = wk::BitDepth::Bits12;
 
-    bool has_alpha = (bpp == 4 || bpp == 8);
     // The Image constructor allocates width*height*bpp bytes from
     // caller-supplied dimensions; guard it so a huge claim returns
     // WK_ERROR_OOM instead of letting bad_alloc escape extern "C"
     // (which would terminate the caller).
     std::optional<wk::Image> image;
-    size_t row_bytes = static_cast<size_t>(width) * bpp;
-    size_t src_stride = pixel_stride > 0 ? pixel_stride : row_bytes;
     try {
         image.emplace(width, height, bd, has_alpha);
         for (uint32_t y = 0; y < height; y++) {

@@ -14,6 +14,7 @@
 // limitations under the License.
 #pragma once
 
+#include <wk/wk.hpp>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -31,58 +32,9 @@
 namespace wk
 {
 
-    enum class ErrorCode : uint32_t
-    {
-        Ok = 0,
-        InvalidMagic,
-        InvalidVersion,
-        InvalidChunkType,
-        InvalidChunkSize,
-        TruncatedInput,
-        InvalidHeader,
-        InvalidTileCoord,
-        InvalidBitDepth,
-        InvalidCICP,
-        UnsupportedFeature,
-        EncodeFailed,
-        DecodeFailed,
-        RansError,
-        DctError,
-        PredictionError,
-        QuantizeError,
-        MetaParseError,
-        MetaSerializeError,
-        MetaTagNotFound,
-        MetaTypeMismatch,
-        InvalidParameter,
-        IoError,
-        OutOfMemory,
-        ThreadingError,
-        AnimationError,
-        ColorSpaceError,
-        LosslessError,
-        ChecksumMismatch,
-    };
-
-    struct Error
-    {
-        ErrorCode code;
-        std::string message;
-
-        Error() = default;
-        Error(ErrorCode c, std::string msg = {})
-            : code(c), message(std::move(msg)) {}
-        Error(const Error&) = default;
-        Error(Error&&) = default;
-        Error& operator=(const Error&) = default;
-        Error& operator=(Error&&) = default;
-        bool operator==(const Error& other) const {
-            return code == other.code && message == other.message;
-        }
-    };
-
-    template <typename T>
-    using Result = std::expected<T, Error>;
+    // ErrorCode, Error, and Result<T> live in the public <wk/wk.hpp>
+    // (see the note there) so the public header is self-contained.
+    // This file adds the internal helpers shared by the implementation.
 
     inline uint16_t read_le16(const uint8_t *p)
     {
