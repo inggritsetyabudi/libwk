@@ -1426,6 +1426,101 @@ TEST(RoundtripTest, QualityLowersSizeAndErrorMonotonically) {
     }
 }
 
+// Regression tests for the PR4 strict-container review (2026-11-13):
+// decode() never compared the TILE chunks against the frame grid, so a
+// file missing one tile decoded to exit 0 with a blank quadrant, a
+// duplicated tile silently overwrote the first copy, and a lossless file
+// with extra tiles decoded using only the first one.
+TEST(RoundtripTest, DecodeRejectsMissingTile) {
+    Image image = make_rgb_gradient(128, 128);
+
+    EncoderConfig config;
+    config.quality = 75.0f;
+    config.tile_size_log2 = 6;  // 64px tiles -> 2x2 = 4 tiles
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    ASSERT_EQ(file->tile_chunks.size(), 4u);
+    file->tile_chunks.erase(file->tile_chunks.begin() + 2);
+
+    auto rewritten = write_container(*file);
+    ASSERT_TRUE(rewritten.has_value()) << rewritten.error().message;
+
+    auto decoded = decode(*rewritten);
+    ASSERT_FALSE(decoded.has_value()) << "decode accepted a file missing one tile";
+}
+
+TEST(RoundtripTest, DecodeRejectsDuplicateTile) {
+    Image image = make_rgb_gradient(128, 128);
+
+    EncoderConfig config;
+    config.quality = 75.0f;
+    config.tile_size_log2 = 6;  // 64px tiles -> 2x2 = 4 tiles
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    ASSERT_EQ(file->tile_chunks.size(), 4u);
+    // Keep the chunk count at 4 but cover only 3 grid positions: drop
+    // one tile and duplicate another. A bare count check would miss this.
+    file->tile_chunks.erase(file->tile_chunks.begin() + 2);
+    file->tile_chunks.push_back(file->tile_chunks.front());
+
+    auto rewritten = write_container(*file);
+    ASSERT_TRUE(rewritten.has_value()) << rewritten.error().message;
+
+    auto decoded = decode(*rewritten);
+    ASSERT_FALSE(decoded.has_value()) << "decode accepted a file with a duplicated tile";
+}
+
+TEST(RoundtripTest, DecodeRejectsExtraTileLossless) {
+    Image image = make_rgb_gradient(64, 64);
+
+    EncoderConfig config;
+    config.lossless = true;
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    ASSERT_EQ(file->tile_chunks.size(), 1u);
+    file->tile_chunks.push_back(file->tile_chunks.front());
+
+    auto rewritten = write_container(*file);
+    ASSERT_TRUE(rewritten.has_value()) << rewritten.error().message;
+
+    auto decoded = decode(*rewritten);
+    ASSERT_FALSE(decoded.has_value()) << "lossless decode accepted a file with an extra tile";
+}
+
+TEST(RoundtripTest, DecodeAcceptsRewrittenContainer) {
+    // Control: parsing and rewriting a complete file without changing
+    // anything must still decode -- the rejections above must come from
+    // the missing/duplicated tiles, not from the rewrite itself.
+    Image image = make_rgb_gradient(128, 128);
+
+    EncoderConfig config;
+    config.quality = 75.0f;
+    config.tile_size_log2 = 6;  // 64px tiles -> 2x2 = 4 tiles
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    ASSERT_EQ(file->tile_chunks.size(), 4u);
+
+    auto rewritten = write_container(*file);
+    ASSERT_TRUE(rewritten.has_value()) << rewritten.error().message;
+
+    auto decoded = decode(*rewritten);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    EXPECT_EQ(decoded->width(), 128u);
+    EXPECT_EQ(decoded->height(), 128u);
+}
+
 
 
 

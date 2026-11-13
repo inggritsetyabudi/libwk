@@ -665,8 +665,11 @@ Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& co
 
     Image output(width, height, static_cast<BitDepth>(hdr.bit_depth), hdr.has_alpha());
     if (hdr.is_lossless()) {
-        if (file->tile_chunks.empty()) {
-            return std::unexpected(Error{ErrorCode::DecodeFailed, "no tile chunks"});
+        // The lossless path decodes a single tile holding the whole
+        // frame: extra tiles would be silently ignored if accepted.
+        if (file->tile_chunks.size() != 1) {
+            return std::unexpected(Error{ErrorCode::DecodeFailed,
+                                         "lossless image must have exactly one tile"});
         }
 
         TileHeader header;
@@ -692,6 +695,42 @@ Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& co
 
     if (file->tile_chunks.empty()) {
         return std::unexpected(Error{ErrorCode::DecodeFailed, "no tile chunks"});
+    }
+
+    // A lossy frame must be covered by its TILE chunks exactly once:
+    // a missing tile used to decode as a blank quadrant and a duplicated
+    // tile silently overwrote the first copy. Check before decoding
+    // anything, so a malformed file fails fast instead of after work.
+    // Animated files are excluded: their frames reuse tile coordinates
+    // across frames, so grid coverage does not apply to them (animation
+    // is unfinished -- the encoder never produces it and decode ignores
+    // it -- so this stays out of scope rather than guessing its layout).
+    if (!hdr.is_animated()) {
+        const uint32_t tiles_x = hdr.tiles_x();
+        const uint32_t tiles_y = hdr.tiles_y();
+        if (file->tile_chunks.size() != hdr.tile_count()) {
+            return std::unexpected(Error{ErrorCode::DecodeFailed,
+                                         "tile chunk count does not match frame grid"});
+        }
+        std::vector<char> seen(static_cast<size_t>(tiles_x) * tiles_y, 0);
+        for (const auto& tile_chunk : file->tile_chunks) {
+            TileHeader tile_header;
+            auto tile_data = tile_payload_view(tile_chunk, tile_header);
+            if (!tile_data) return std::unexpected(tile_data.error());
+            if (tile_header.tile_x >= tiles_x || tile_header.tile_y >= tiles_y) {
+                return std::unexpected(Error{ErrorCode::InvalidTileCoord,
+                                             "tile coordinates out of range"});
+            }
+            const size_t index = static_cast<size_t>(tile_header.tile_y) * tiles_x +
+                                 tile_header.tile_x;
+            if (seen[index]) {
+                return std::unexpected(Error{ErrorCode::InvalidTileCoord,
+                                             "duplicate tile chunk"});
+            }
+            seen[index] = 1;
+        }
+        // Chunk count equals the grid size and every coordinate is unique,
+        // so the grid is fully covered by the pigeonhole principle.
     }
 
     const uint32_t tile_size = hdr.tile_size();

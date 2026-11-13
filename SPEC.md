@@ -45,7 +45,7 @@ FILE HEADER (magic + version)
 
 ---
 
-## 2. FHDR Chunk — Frame Header (20 bytes)
+## 2. FHDR Chunk — Frame Header (19 bytes)
 
 | Offset | Size | Field          | Type    | Description |
 |--------|------|----------------|---------|-------------|
@@ -402,3 +402,12 @@ A conforming decoder MUST:
 6. Implement rANS decoding with the specified parameters
 7. Preserve unknown WKMETA entries on round-trip
 8. Never crash or invoke UB on malformed input
+9. Reject an FHDR payload that is not exactly 19 bytes, and an ANIM
+   payload whose size is not exactly `10 + frame_count * 16` bytes
+10. Reject duplicate META, ICCP, PROV, and ANIM chunks (TILE is the only
+    repeatable chunk), and reject a META chunk that fails to parse
+    instead of silently dropping it
+11. For a non-animated frame, reject TILE chunks that do not cover the
+    frame grid exactly once: the chunk count must equal `tile_count()`
+    and every `(tile_x, tile_y)` must appear exactly once; a lossless
+    frame must have exactly one TILE chunk
