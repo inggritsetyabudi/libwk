@@ -18,7 +18,10 @@
 #include "../src/common.h"
 #include "../src/container.h"
 #include "../src/exif_import.h"
+#include <algorithm>
+#include <charconv>
 #include <cstdlib>
+#include <expected>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -27,7 +30,7 @@
 
 namespace {
 
-wk::meta::Namespace parse_namespace(const std::string& ns_str) {
+std::expected<wk::meta::Namespace, std::string> parse_namespace(const std::string& ns_str) {
     if (ns_str == "CAPTURE")  return wk::meta::Namespace::Capture;
     if (ns_str == "GEO")      return wk::meta::Namespace::Geo;
     if (ns_str == "TIME")     return wk::meta::Namespace::Time;
@@ -39,49 +42,149 @@ wk::meta::Namespace parse_namespace(const std::string& ns_str) {
     if (ns_str == "RATING")   return wk::meta::Namespace::Rating;
     if (ns_str == "CUSTOM")   return wk::meta::Namespace::Custom;
     if (ns_str == "PROV_REF") return wk::meta::Namespace::ProvRef;
-    return wk::meta::Namespace::Custom;
+    // An unknown namespace used to silently become Custom, writing the
+    // entry under the wrong namespace. Fail loudly instead.
+    return std::unexpected("unknown namespace '" + ns_str +
+                           "' (expected one of CAPTURE, GEO, TIME, RIGHTS, CONTENT, "
+                           "ANIM, REGION, DEVICE, RATING, CUSTOM, PROV_REF)");
 }
 
-uint16_t parse_tag(const std::string& ns_str, const std::string& tag_str) {
+namespace {
+struct TagName {
+    const char* ns;
+    const char* name;
+    uint16_t tag;
+};
+// Every documented tag name (see include/wk/wkmeta.hpp), so a real tag
+// is never mis-resolved to tag 0 the way atoi() used to do.
+constexpr TagName kTagNames[] = {
+    {"GEO", "LAT", wk::meta::geo::LAT},
+    {"GEO", "LON", wk::meta::geo::LON},
+    {"GEO", "ALT", wk::meta::geo::ALT},
+    {"GEO", "HPOS_ERR", wk::meta::geo::HPOS_ERR},
+    {"GEO", "VPOS_ERR", wk::meta::geo::VPOS_ERR},
+    {"GEO", "SPEED", wk::meta::geo::SPEED},
+    {"GEO", "HEADING", wk::meta::geo::HEADING},
+    {"GEO", "PITCH", wk::meta::geo::PITCH},
+    {"GEO", "ROLL", wk::meta::geo::ROLL},
+    {"GEO", "COUNTRY", wk::meta::geo::COUNTRY},
+    {"GEO", "REGION", wk::meta::geo::REGION},
+    {"GEO", "CITY", wk::meta::geo::CITY},
+    {"GEO", "SUBLOC", wk::meta::geo::SUBLOC},
+    {"GEO", "PLACE_NAME", wk::meta::geo::PLACE_NAME},
+    {"GEO", "WHAT3WORDS", wk::meta::geo::WHAT3WORDS},
+    {"GEO", "PLUS_CODE", wk::meta::geo::PLUS_CODE},
+    {"GEO", "CAPTURE_TS", wk::meta::geo::CAPTURE_TS},
+    {"GEO", "DEST_LAT", wk::meta::geo::DEST_LAT},
+    {"GEO", "DEST_LON", wk::meta::geo::DEST_LON},
+    {"TIME", "CAPTURE_UTC", wk::meta::time_tags::CAPTURE_UTC},
+    {"TIME", "OFFSET_SEC", wk::meta::time_tags::OFFSET_SEC},
+    {"TIME", "CREATED_UTC", wk::meta::time_tags::CREATED_UTC},
+    {"TIME", "MODIFIED_UTC", wk::meta::time_tags::MODIFIED_UTC},
+    {"TIME", "DIGITIZED_UTC", wk::meta::time_tags::DIGITIZED_UTC},
+    {"TIME", "SUBSEC", wk::meta::time_tags::SUBSEC},
+    {"TIME", "TIMEZONE_ID", wk::meta::time_tags::TIMEZONE_ID},
+    {"CAPTURE", "MAKE", wk::meta::capture::MAKE},
+    {"CAPTURE", "MODEL", wk::meta::capture::MODEL},
+    {"CAPTURE", "SERIAL", wk::meta::capture::SERIAL},
+    {"CAPTURE", "LENS_MAKE", wk::meta::capture::LENS_MAKE},
+    {"CAPTURE", "LENS_MODEL", wk::meta::capture::LENS_MODEL},
+    {"CAPTURE", "FOCAL_LEN", wk::meta::capture::FOCAL_LEN},
+    {"CAPTURE", "FOCAL_35MM", wk::meta::capture::FOCAL_35MM},
+    {"CAPTURE", "FNUMBER", wk::meta::capture::FNUMBER},
+    {"CAPTURE", "EXPOSURE_TIME", wk::meta::capture::EXPOSURE_TIME},
+    {"CAPTURE", "ISO", wk::meta::capture::ISO},
+    {"CAPTURE", "EV_COMP", wk::meta::capture::EV_COMP},
+    {"CAPTURE", "FLASH", wk::meta::capture::FLASH},
+    {"CAPTURE", "WHITE_BAL", wk::meta::capture::WHITE_BAL},
+    {"CAPTURE", "METERING", wk::meta::capture::METERING},
+    {"CAPTURE", "SCENE_TYPE", wk::meta::capture::SCENE_TYPE},
+    {"CAPTURE", "SHARPNESS", wk::meta::capture::SHARPNESS},
+    {"CAPTURE", "SATURATION", wk::meta::capture::SATURATION},
+    {"CAPTURE", "SOFTWARE", wk::meta::capture::SOFTWARE},
+    {"CAPTURE", "UNIQUE_IMG_ID", wk::meta::capture::UNIQUE_IMG_ID},
+    {"CAPTURE", "BURST_INDEX", wk::meta::capture::BURST_INDEX},
+    {"CAPTURE", "BURST_COUNT", wk::meta::capture::BURST_COUNT},
+    {"CAPTURE", "HDR_FRAMES", wk::meta::capture::HDR_FRAMES},
+    {"RIGHTS", "CREATOR", wk::meta::rights::CREATOR},
+    {"RIGHTS", "CREATOR_ROLE", wk::meta::rights::CREATOR_ROLE},
+    {"RIGHTS", "COPYRIGHT", wk::meta::rights::COPYRIGHT},
+    {"RIGHTS", "LICENSE_SPDX", wk::meta::rights::LICENSE_SPDX},
+    {"RIGHTS", "LICENSE", wk::meta::rights::LICENSE_SPDX},
+    {"RIGHTS", "LICENSE_URL", wk::meta::rights::LICENSE_URL},
+    {"RIGHTS", "CREDIT_LINE", wk::meta::rights::CREDIT_LINE},
+    {"RIGHTS", "SOURCE", wk::meta::rights::SOURCE},
+    {"RIGHTS", "INSTRUCTIONS", wk::meta::rights::INSTRUCTIONS},
+    {"RIGHTS", "EMBARGO_UTC", wk::meta::rights::EMBARGO_UTC},
+    {"CONTENT", "TITLE", wk::meta::content::TITLE},
+    {"CONTENT", "DESCRIPTION", wk::meta::content::DESCRIPTION},
+    {"CONTENT", "ALT_TEXT", wk::meta::content::ALT_TEXT},
+    {"CONTENT", "KEYWORDS", wk::meta::content::KEYWORDS},
+    {"CONTENT", "GENRE", wk::meta::content::GENRE},
+    {"CONTENT", "SUBJECT_CODES", wk::meta::content::SUBJECT_CODES},
+    {"CONTENT", "SCENE_CODES", wk::meta::content::SCENE_CODES},
+    {"CONTENT", "EVENT", wk::meta::content::EVENT},
+    {"CONTENT", "OBJECT_NAME", wk::meta::content::OBJECT_NAME},
+    {"CONTENT", "CATEGORY", wk::meta::content::CATEGORY},
+    {"CONTENT", "LANGUAGE", wk::meta::content::LANGUAGE},
+    {"CONTENT", "SMARTCROP", wk::meta::content::SMARTCROP},
+    {"ANIM", "TITLE", wk::meta::anim_tags::TITLE},
+    {"ANIM", "DESCRIPTION", wk::meta::anim_tags::DESCRIPTION},
+    {"ANIM", "CREATOR", wk::meta::anim_tags::CREATOR},
+    {"ANIM", "DURATION_MS", wk::meta::anim_tags::DURATION_MS},
+    {"ANIM", "FPS_TARGET", wk::meta::anim_tags::FPS_TARGET},
+    {"ANIM", "CATEGORY", wk::meta::anim_tags::CATEGORY},
+    {"ANIM", "SCENE_LABELS", wk::meta::anim_tags::SCENE_LABELS},
+    {"ANIM", "THUMB_TILE", wk::meta::anim_tags::THUMB_TILE},
+    {"REGION", "NAME", wk::meta::region::NAME},
+    {"REGION", "TYPE", wk::meta::region::TYPE},
+    {"REGION", "ROLE", wk::meta::region::ROLE},
+    {"REGION", "RECT_NORM", wk::meta::region::RECT_NORM},
+    {"REGION", "CONFIDENCE", wk::meta::region::CONFIDENCE},
+    {"REGION", "PERSON_NAME", wk::meta::region::PERSON_NAME},
+    {"REGION", "PERSON_ID", wk::meta::region::PERSON_ID},
+    {"REGION", "OBJECT_CLASS", wk::meta::region::OBJECT_CLASS},
+    {"REGION", "CREATOR", wk::meta::region::CREATOR},
+    {"RATING", "STARS", wk::meta::rating::STARS},
+    {"RATING", "AUDIENCE", wk::meta::rating::AUDIENCE},
+    {"RATING", "NSFW", wk::meta::rating::NSFW},
+    {"RATING", "AI_GENERATED", wk::meta::rating::AI_GENERATED},
+    {"RATING", "QUALITY_SCORE", wk::meta::rating::QUALITY_SCORE},
+    {"RATING", "CAPTION_SRC", wk::meta::rating::CAPTION_SRC},
+};
+}  // namespace
+
+std::expected<uint16_t, std::string> parse_tag(const std::string& ns_str, const std::string& tag_str) {
     using namespace wk::meta;
 
-    if (ns_str == "GEO") {
-        if (tag_str == "LAT")        return geo::LAT;
-        if (tag_str == "LON")        return geo::LON;
-        if (tag_str == "ALT")        return geo::ALT;
-        if (tag_str == "COUNTRY")    return geo::COUNTRY;
-        if (tag_str == "CITY")       return geo::CITY;
-        if (tag_str == "PLACE_NAME") return geo::PLACE_NAME;
-    }
-    if (ns_str == "CONTENT") {
-        if (tag_str == "TITLE")       return content::TITLE;
-        if (tag_str == "DESCRIPTION") return content::DESCRIPTION;
-        if (tag_str == "ALT_TEXT")    return content::ALT_TEXT;
-        if (tag_str == "KEYWORDS")    return content::KEYWORDS;
-    }
-    if (ns_str == "RIGHTS") {
-        if (tag_str == "CREATOR")      return rights::CREATOR;
-        if (tag_str == "COPYRIGHT")    return rights::COPYRIGHT;
-        if (tag_str == "LICENSE")      return rights::LICENSE_SPDX;
-        if (tag_str == "LICENSE_SPDX") return rights::LICENSE_SPDX;
-        if (tag_str == "LICENSE_URL")  return rights::LICENSE_URL;
-    }
-    if (ns_str == "RATING") {
-        if (tag_str == "STARS")         return rating::STARS;
-        if (tag_str == "AI_GENERATED")  return rating::AI_GENERATED;
-        if (tag_str == "QUALITY_SCORE") return rating::QUALITY_SCORE;
-    }
-    if (ns_str == "CAPTURE") {
-        if (tag_str == "MAKE")     return capture::MAKE;
-        if (tag_str == "MODEL")    return capture::MODEL;
-        if (tag_str == "ISO")      return capture::ISO;
-        if (tag_str == "SOFTWARE") return capture::SOFTWARE;
+    for (const auto& known : kTagNames) {
+        if (ns_str == known.ns && tag_str == known.name) {
+            return known.tag;
+        }
     }
 
-    if (tag_str.starts_with("0x")) {
-        return static_cast<uint16_t>(std::strtoul(tag_str.c_str() + 2, nullptr, 16));
+    // Numeric tag: 0xNNNN hex or plain decimal, strictly parsed and
+    // range-checked. atoi()/strtoul() used to turn any garbage into 0
+    // (and wrap out-of-range numbers), silently writing the wrong tag.
+    if (tag_str.size() > 2 && tag_str[0] == '0' && (tag_str[1] == 'x' || tag_str[1] == 'X')) {
+        uint32_t value = 0;
+        auto r = std::from_chars(tag_str.data() + 2, tag_str.data() + tag_str.size(), value, 16);
+        if (r.ec == std::errc() && r.ptr == tag_str.data() + tag_str.size() && value <= 0xFFFF) {
+            return static_cast<uint16_t>(value);
+        }
+        return std::unexpected("invalid hex tag '" + tag_str + "' (expected 0x0000-0xFFFF)");
     }
-    return static_cast<uint16_t>(std::atoi(tag_str.c_str()));
+    if (!tag_str.empty() &&
+        std::all_of(tag_str.begin(), tag_str.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        uint32_t value = 0;
+        auto r = std::from_chars(tag_str.data(), tag_str.data() + tag_str.size(), value, 10);
+        if (r.ec == std::errc() && r.ptr == tag_str.data() + tag_str.size() && value <= 0xFFFF) {
+            return static_cast<uint16_t>(value);
+        }
+        return std::unexpected("invalid decimal tag '" + tag_str + "' (expected 0-65535)");
+    }
+    return std::unexpected("unknown tag '" + tag_str + "' for namespace '" + ns_str +
+                           "' (use a documented tag name or a 0xNNNN number)");
 }
 
 bool parse_key(const std::string& key, std::string& ns_out, std::string& tag_out) {
@@ -94,22 +197,174 @@ bool parse_key(const std::string& key, std::string& ns_out, std::string& tag_out
     return true;
 }
 
-wk::meta::Value parse_value_str(const std::string& ns_str,
-                                const std::string& tag_str,
-                                const std::string& value_str) {
+// Strict number parsing: atof()/atoi() used to turn any garbage into 0
+// (and silently truncate out-of-range values), so "--set GEO.LAT abc"
+// wrote 0.0 as if the user had asked for it.
+std::expected<double, std::string> parse_double_strict(const std::string& s, const char* what) {
+    double value = 0;
+    auto r = std::from_chars(s.data(), s.data() + s.size(), value);
+    if (r.ec != std::errc() || r.ptr != s.data() + s.size()) {
+        return std::unexpected(std::string("invalid number '") + s + "' for " + what);
+    }
+    return value;
+}
+
+std::expected<uint32_t, std::string> parse_u32_strict(const std::string& s, const char* what) {
+    uint32_t value = 0;
+    auto r = std::from_chars(s.data(), s.data() + s.size(), value);
+    if (r.ec != std::errc() || r.ptr != s.data() + s.size()) {
+        return std::unexpected(std::string("invalid number '") + s + "' for " + what);
+    }
+    return value;
+}
+
+std::expected<int32_t, std::string> parse_i32_strict(const std::string& s, const char* what) {
+    int32_t value = 0;
+    auto r = std::from_chars(s.data(), s.data() + s.size(), value);
+    if (r.ec != std::errc() || r.ptr != s.data() + s.size()) {
+        return std::unexpected(std::string("invalid number '") + s + "' for " + what);
+    }
+    return value;
+}
+
+std::expected<wk::meta::Value, std::string> parse_value_str(const std::string& ns_str,
+                                                            const std::string& tag_str,
+                                                            const std::string& value_str) {
     using namespace wk::meta;
 
-    if (ns_str == "GEO" && (tag_str == "LAT" || tag_str == "LON")) {
-        return static_cast<double>(std::atof(value_str.c_str()));
+    auto ranged_double = [&](double lo, double hi, const char* what)
+        -> std::expected<double, std::string> {
+        auto v = parse_double_strict(value_str, what);
+        if (!v)
+            return v;
+        if (*v < lo || *v > hi) {
+            return std::unexpected(std::string("value '") + value_str + "' for " + what +
+                                   " is out of range [" + std::to_string(lo) + ", " +
+                                   std::to_string(hi) + "]");
+        }
+        return v;
+    };
+
+    if (ns_str == "GEO" && tag_str == "LAT") {
+        auto v = ranged_double(-90.0, 90.0, "GEO.LAT");
+        if (!v)
+            return std::unexpected(v.error());
+        return static_cast<double>(*v);
+    }
+    if (ns_str == "GEO" && tag_str == "LON") {
+        auto v = ranged_double(-180.0, 180.0, "GEO.LON");
+        if (!v)
+            return std::unexpected(v.error());
+        return static_cast<double>(*v);
+    }
+    if (ns_str == "GEO" && tag_str == "DEST_LAT") {
+        auto v = ranged_double(-90.0, 90.0, "GEO.DEST_LAT");
+        if (!v)
+            return std::unexpected(v.error());
+        return static_cast<double>(*v);
+    }
+    if (ns_str == "GEO" && tag_str == "DEST_LON") {
+        auto v = ranged_double(-180.0, 180.0, "GEO.DEST_LON");
+        if (!v)
+            return std::unexpected(v.error());
+        return static_cast<double>(*v);
     }
     if (ns_str == "GEO" && tag_str == "ALT") {
-        return static_cast<float>(std::atof(value_str.c_str()));
+        auto v = parse_double_strict(value_str, "GEO.ALT");
+        if (!v)
+            return std::unexpected(v.error());
+        return static_cast<float>(*v);
     }
-    if (ns_str == "RATING" && (tag_str == "STARS" || tag_str == "AI_GENERATED")) {
-        return static_cast<uint8_t>(std::atoi(value_str.c_str()));
+    if (ns_str == "GEO" && (tag_str == "HPOS_ERR" || tag_str == "VPOS_ERR" || tag_str == "SPEED")) {
+        auto v = parse_double_strict(value_str, ("GEO." + tag_str).c_str());
+        if (!v)
+            return std::unexpected(v.error());
+        return static_cast<float>(*v);
+    }
+    if (ns_str == "GEO" && tag_str == "HEADING") {
+        auto v = ranged_double(0.0, 360.0, "GEO.HEADING");
+        if (!v)
+            return std::unexpected(v.error());
+        return static_cast<float>(*v);
+    }
+    if (ns_str == "GEO" && tag_str == "PITCH") {
+        auto v = ranged_double(-90.0, 90.0, "GEO.PITCH");
+        if (!v)
+            return std::unexpected(v.error());
+        return static_cast<float>(*v);
+    }
+    if (ns_str == "GEO" && tag_str == "ROLL") {
+        auto v = ranged_double(-180.0, 180.0, "GEO.ROLL");
+        if (!v)
+            return std::unexpected(v.error());
+        return static_cast<float>(*v);
+    }
+    if (ns_str == "RATING" &&
+        (tag_str == "STARS" || tag_str == "AUDIENCE" || tag_str == "NSFW" || tag_str == "AI_GENERATED")) {
+        auto v = parse_u32_strict(value_str, ("RATING." + tag_str).c_str());
+        if (!v)
+            return std::unexpected(v.error());
+        if (*v > 255) {
+            return std::unexpected("value '" + value_str + "' for RATING." + tag_str +
+                                   " is out of range [0, 255]");
+        }
+        return static_cast<uint8_t>(*v);
     }
     if (ns_str == "RATING" && tag_str == "QUALITY_SCORE") {
-        return static_cast<float>(std::atof(value_str.c_str()));
+        auto v = parse_double_strict(value_str, "RATING.QUALITY_SCORE");
+        if (!v)
+            return std::unexpected(v.error());
+        return static_cast<float>(*v);
+    }
+    if (ns_str == "CAPTURE" && tag_str == "ISO") {
+        auto v = parse_u32_strict(value_str, "CAPTURE.ISO");
+        if (!v)
+            return std::unexpected(v.error());
+        return *v;
+    }
+    if (ns_str == "CAPTURE" &&
+        (tag_str == "FOCAL_LEN" || tag_str == "FNUMBER" || tag_str == "EXPOSURE_TIME" || tag_str == "EV_COMP")) {
+        auto slash = value_str.find('/');
+        if (slash == std::string::npos) {
+            return std::unexpected("invalid rational '" + value_str + "' for CAPTURE." + tag_str +
+                                   " (expected NUM/DEN)");
+        }
+        auto num = parse_i32_strict(value_str.substr(0, slash), ("CAPTURE." + tag_str).c_str());
+        if (!num)
+            return std::unexpected(num.error());
+        auto den = parse_i32_strict(value_str.substr(slash + 1), ("CAPTURE." + tag_str).c_str());
+        if (!den)
+            return std::unexpected(den.error());
+        if (*den == 0) {
+            return std::unexpected("rational denominator is 0 for CAPTURE." + tag_str);
+        }
+        return Rational{*num, *den};
+    }
+    if (ns_str == "ANIM" && tag_str == "DURATION_MS") {
+        auto v = parse_u32_strict(value_str, "ANIM.DURATION_MS");
+        if (!v)
+            return std::unexpected(v.error());
+        return *v;
+    }
+    if (ns_str == "ANIM" && tag_str == "FPS_TARGET") {
+        auto v = parse_double_strict(value_str, "ANIM.FPS_TARGET");
+        if (!v)
+            return std::unexpected(v.error());
+        return static_cast<float>(*v);
+    }
+    if ((ns_str == "TIME" &&
+         (tag_str == "CAPTURE_UTC" || tag_str == "CREATED_UTC" || tag_str == "MODIFIED_UTC" ||
+          tag_str == "DIGITIZED_UTC")) ||
+        (ns_str == "GEO" && tag_str == "CAPTURE_TS") ||
+        (ns_str == "RIGHTS" && tag_str == "EMBARGO_UTC")) {
+        // ISO-8601 UTC timestamp, e.g. 2024-04-09T12:34:56Z.
+        bool shape_ok = value_str.size() >= 20 && value_str[4] == '-' && value_str[7] == '-' &&
+                        value_str[10] == 'T' && value_str[13] == ':' && value_str[16] == ':';
+        if (!shape_ok) {
+            return std::unexpected("invalid timestamp '" + value_str + "' for " + ns_str + "." +
+                                   tag_str + " (expected ISO-8601, e.g. 2024-04-09T12:34:56Z)");
+        }
+        return Timestamp::from_iso8601(value_str);
     }
 
     const auto colon = value_str.find(':');
@@ -260,9 +515,23 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        auto set_result = file->metadata->set(parse_namespace(ns_str),
-                                              parse_tag(ns_str, tag_str),
-                                              parse_value_str(ns_str, tag_str, operation.value));
+        auto ns = parse_namespace(ns_str);
+        if (!ns) {
+            std::cerr << "Error: " << ns.error() << '\n';
+            return 1;
+        }
+        auto tag = parse_tag(ns_str, tag_str);
+        if (!tag) {
+            std::cerr << "Error: " << tag.error() << '\n';
+            return 1;
+        }
+        auto value = parse_value_str(ns_str, tag_str, operation.value);
+        if (!value) {
+            std::cerr << "Error: " << value.error() << '\n';
+            return 1;
+        }
+
+        auto set_result = file->metadata->set(*ns, *tag, std::move(*value));
         if (!set_result) {
             std::cerr << "Error: failed to set " << operation.key << ": " << set_result.error().message << '\n';
             return 1;
@@ -276,7 +545,17 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: invalid metadata key " << key << " (expected NS.TAG)\n";
             return 1;
         }
-        file->metadata->remove(parse_namespace(ns_str), parse_tag(ns_str, tag_str));
+        auto ns = parse_namespace(ns_str);
+        if (!ns) {
+            std::cerr << "Error: " << ns.error() << '\n';
+            return 1;
+        }
+        auto tag = parse_tag(ns_str, tag_str);
+        if (!tag) {
+            std::cerr << "Error: " << tag.error() << '\n';
+            return 1;
+        }
+        file->metadata->remove(*ns, *tag);
     }
 
     if (!exif_source_path.empty()) {

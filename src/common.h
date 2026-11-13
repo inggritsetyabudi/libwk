@@ -197,7 +197,14 @@ namespace wk
 
         [[nodiscard]] size_t remaining() const { return data_.size() - pos_; }
         [[nodiscard]] size_t position() const { return pos_; }
+        [[nodiscard]] size_t size() const { return data_.size(); }
         [[nodiscard]] bool at_end() const { return pos_ >= data_.size(); }
+
+        // Reposition the reader. Used by the WKMETA parser to move past an
+        // entry whose declared size is authoritative for framing (see
+        // MetaBlock::parse). The target is clamped to the buffer end so a
+        // seek can never run the reader out of bounds.
+        void seek(size_t pos) { pos_ = std::min(pos, data_.size()); }
 
         [[nodiscard]] Result<uint8_t> read_u8()
         {
