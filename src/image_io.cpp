@@ -151,8 +151,18 @@ Result<Image> load_ppm(std::string_view path) {
         return std::unexpected(Error{ErrorCode::UnsupportedFeature, "PPM max value must be 255"});
     }
 
-    while (offset < file_bytes->size() && std::isspace(static_cast<unsigned char>((*file_bytes)[offset]))) {
-        ++offset;
+    // The raster follows a single whitespace delimiter after maxval.
+    // Skip exactly one byte (a CRLF pair counts as one line ending).
+    // Skipping all whitespace here is wrong: a leading raster byte can
+    // itself be a whitespace value (e.g. 0x09), and eating it shifts the
+    // raster and trips the payload-size check below.
+    if (offset < file_bytes->size()) {
+        if ((*file_bytes)[offset] == '\r' && offset + 1 < file_bytes->size() &&
+            (*file_bytes)[offset + 1] == '\n') {
+            offset += 2;
+        } else if (std::isspace(static_cast<unsigned char>((*file_bytes)[offset]))) {
+            ++offset;
+        }
     }
 
     const size_t rgb_size = static_cast<size_t>(*width) * *height * 3;
