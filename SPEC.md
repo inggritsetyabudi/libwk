@@ -284,6 +284,17 @@ Frequencies are normalized to sum to M = 2^12 = 4096 using the FSE "spread" algo
 | 4      | 4    | value_size   | uint32 |
 | 8      | N    | value        | value_size bytes |
 
+`value_size` is authoritative for framing: an entry occupies exactly
+8 header + `value_size` bytes. A decoder MUST reject a chunk whose
+entry claims bytes past the chunk end, and MUST reject an entry whose
+value does not consume exactly `value_size` bytes (fixed-size types
+must match their section 7.4 size exactly). An ARRAY of
+variable-length elements may leave padding at the end of its declared
+value. An entry whose type is unknown, or whose value is malformed
+for its type, MUST be preserved verbatim (header + declared value
+bytes) so a later serialize writes back exactly the same bytes
+(conformance rule 7).
+
 ### 7.3 Namespace Table
 
 | ID   | Name     | Description |
@@ -345,6 +356,24 @@ Frequencies are normalized to sum to M = 2^12 = 4096 using the FSE "spread" algo
 | 0x0013 | GEO_DEST_LON  | FLOAT64 | Destination longitude |
 
 *(Complete tag listings for all namespaces follow the same pattern as documented in wkmeta.hpp)*
+
+### 7.6 REGION Namespace Tags
+
+Region annotations are stored as a STRUCT value (one STRUCT per
+region, under namespace REGION). String fields accept STR or LSTR on
+read.
+
+| Tag    | Name          | Type             | Description |
+|--------|---------------|------------------|-------------|
+| 0x0001 | NAME          | LSTR             | Region name |
+| 0x0002 | TYPE          | UINT8            | Application-defined region type |
+| 0x0003 | ROLE          | STR              | Role of the region (e.g. `subject`) |
+| 0x0004 | RECT_NORM     | ARRAY of 4 FLOAT32 | Normalized rect (x, y, w, h), 0..1 |
+| 0x0005 | CONFIDENCE    | FLOAT32          | Detection confidence, 0..1 |
+| 0x0006 | PERSON_NAME   | LSTR             | Name of the person in the region |
+| 0x0007 | PERSON_ID     | UUID             | Identity of the person |
+| 0x0008 | OBJECT_CLASS  | STR              | Object class label |
+| 0x0009 | CREATOR       | STR              | Who created the annotation |
 
 ---
 
