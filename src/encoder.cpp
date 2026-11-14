@@ -2358,7 +2358,7 @@ void wk_free(void* ptr) {
 }
 
 const char* wk_version(void) {
-    return "0.2.1";
+    return "0.2.6";
 }
 
 }

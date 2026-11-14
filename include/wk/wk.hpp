@@ -162,13 +162,14 @@ namespace wk
         uint32_t threads = 0;
         // Phase 2 perceptual control field: when true, the encoder
         // analyzes each tile's luma into a per-block content field
-        // (flat / textured / edge / normal) and biases quant from it
-        // via the V9 superblock quant map (one scale per 64x64
-        // superblock, shared by luma and chroma): a superblock that is
-        // >= 75% textured uses scale 1.25, everything else stays at
-        // identity. Default on since 2026-11-14 (measured: q75 files
-        // -0.47%, q85 -0.25%, PSNR -0.09/-0.05 dB, SSIM flat).
-        bool use_control_field = true;
+        // (flat / textured / edge / normal) and aggregates it to a
+        // per-superblock quant map (V9). The quant policy is
+        // currently disabled: since 2026-11-14 every superblock stays
+        // at identity (the >=75% textured -> 1.25 boost cost meadow
+        // -0.97 dB), so the field changes nothing and only costs CPU.
+        // Default off; set true to re-enable the analysis for a
+        // future policy.
+        bool use_control_field = false;
         // Cross-component linear model (CCLM) chroma prediction (V10):
         // predict each chroma block from its co-located reconstructed
         // luma as a*luma + b, with (a, b) derived from the neighbours.
@@ -253,6 +254,6 @@ namespace wk
 
     [[nodiscard]] Result<Image> decode(std::span<const uint8_t> data, const DecoderConfig &config = {});
 
-    constexpr std::string_view version() { return "0.2.1"; }
+    constexpr std::string_view version() { return "0.2.6"; }
 
 }
