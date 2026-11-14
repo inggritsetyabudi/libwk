@@ -11,6 +11,8 @@
 
 **v0.2.2 changes:** lossy layout `0x384D4843` (V8) entropy-codes the prediction-mode and coefficient-span streams with rANS (see §3.2). The encoder writes V8 whenever the rANS-coded modes+spans are smaller than the packed/adaptive forms, otherwise it writes V6/V7 as before. V8 is identical to V7 in every respect except the mode and span streams are rANS-coded; the quant-scale streams are present (possibly empty) exactly as in V7. Decoded pixels are identical to V7 for the same quant/modes — the re-coding is lossless. The container format (`0x0001`) is unchanged and V1–V7 files decode identically.
 
+**v0.2.3 changes:** lossless frequency tables use the adaptive coefficient-table encoding (transform-flags bit 1, see §3.3) instead of raw 256 x uint16. Legacy files (bit 1 clear) still decode. The container format is unchanged.
+
 ---
 
 ## 1. File Structure
@@ -177,9 +179,9 @@ FILE HEADER (magic + version)
 
 ### 3.3 Lossless Tile Payload
 
-1. **Transform flags**: uint8 (bit0 = palette mode)
+1. **Transform flags**: uint8. Bit 0 = palette mode. Bit 1 = adaptive frequency tables (see below); only valid on the non-palette path. Bits 2–7 are reserved and must be zero; a decoder MUST reject a tile with reserved bits set, or with bit 1 set on the palette path.
 2. **Predictor mode**: uint8 (0..12)
-3. **Per-channel data**: frequency table (256 × uint16) + rANS bitstream
+3. **Per-channel data**: frequency table + rANS bitstream. When transform-flags bit 1 is clear (legacy), the table is raw: 256 x uint16 frequencies (512 B per channel). When bit 1 is set, the table is written with the adaptive coefficient-table encoding (`write_coefficient_table`, 256 symbols: single-symbol / sparse-pairs / dense-range forms, whichever is smallest). The adaptive form is never more than ~5 B larger than raw per channel and is typically far smaller: on photo residuals most tables are sparse (e.g. mira: 2048 B raw -> 834 B adaptive; the alpha channel alone drops from 512 B to 11 B). Small tiles benefit most — a 64x64 photo tile drops from 4770 B to 3178 B (-33%) because the fixed 2048 B table cost dominated it.
 
 ---
 

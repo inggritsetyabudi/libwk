@@ -41,6 +41,14 @@ enum class LosslessPred : uint8_t {
     NUM_PREDS= 13,
 };
 
+// Lossless tile transform-flags byte: the first byte of the tile's
+// lossless payload (after the 9-byte tile header). Bit 0 selects the
+// palette path; bit 1 selects adaptive frequency tables (see
+// coeff_table_stream.h) instead of raw 256 x uint16 tables on the
+// non-palette path. Bits 2-7 are reserved and must be zero.
+inline constexpr uint8_t kLosslessTransformFlagPalette = 0x01;
+inline constexpr uint8_t kLosslessTransformFlagAdaptiveTables = 0x02;
+
 
 
 

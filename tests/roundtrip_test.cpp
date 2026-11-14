@@ -34,6 +34,7 @@
 #include "../src/rans.h"
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 
 using namespace wk;
 
@@ -2028,4 +2029,110 @@ TEST(RoundtripTest, V7EmptyScaleListsDecodeIdenticalToV6) {
     EXPECT_TRUE(std::equal(decoded_v7->pixels().begin(), decoded_v7->pixels().end(),
                            decoded_v6->pixels().begin()))
         << "V7 with identity scales must decode exactly like V6";
+}
+
+// Slice 3 (lossless syntax): the per-channel frequency tables used to be
+// written raw (256 x uint16 = 512 B per channel, 2048 B per tile) even
+// though most entries are zero. They are now written with the adaptive
+// coefficient-table encoding (see coeff_table_stream.h), signalled by
+// transform-flags bit 1. The flag lives in the lossless tile payload at
+// offset 9 (after the 9-byte tile header): bit 0 = palette, bit 1 =
+// adaptive tables.
+namespace {
+Image make_lossless_colorful(uint32_t width, uint32_t height, bool alpha = true) {
+    // Lossless always encodes 4 channels internally, but the decoded
+    // image keeps the source's channel count: RGBA in -> RGBA out,
+    // RGB in -> RGB out. The expected pixels must match that count.
+    Image image(width, height, BitDepth::Bits8, alpha);
+    const uint32_t stride = alpha ? 4 : 3;
+    for (uint32_t y = 0; y < height; ++y) {
+        uint8_t* row = image.row(y);
+        for (uint32_t x = 0; x < width; ++x) {
+            row[x * stride + 0] = static_cast<uint8_t>((x * 8) % 256);
+            row[x * stride + 1] = static_cast<uint8_t>((y * 8) % 256);
+            row[x * stride + 2] = static_cast<uint8_t>(((x + y) * 4) % 256);
+            if (alpha) row[x * stride + 3] = 255;
+        }
+    }
+    return image;
+}
+
+std::vector<uint8_t> read_fixture_bytes(const char* name) {
+    // Fixtures are stored as hex text (snapshot pushes cannot carry
+    // binary files); decode pairs of hex digits back to bytes.
+    const std::filesystem::path p =
+        std::filesystem::path(__FILE__).parent_path() / "fixtures" / name;
+    std::ifstream in(p, std::ios::binary);
+    if (!in) return {};
+    const std::string hex{std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>()};
+    if (hex.size() % 2 != 0) return {};
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::vector<uint8_t> bytes;
+    bytes.reserve(hex.size() / 2);
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        const int hi = nibble(hex[i]);
+        const int lo = nibble(hex[i + 1]);
+        if (hi < 0 || lo < 0) return {};
+        bytes.push_back(static_cast<uint8_t>((hi << 4) | lo));
+    }
+    return bytes;
+}
+}  // namespace
+
+TEST(RoundtripTest, LosslessAdaptiveTablesRoundtrip) {
+    Image image = make_lossless_colorful(32, 32);
+
+    EncoderConfig config;
+    config.lossless = true;
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto parsed = parse_container(*encoded);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ASSERT_EQ(parsed->tile_chunks.size(), 1u);
+    const auto& payload = parsed->tile_chunks[0].payload;
+    ASSERT_GE(payload.size(), 10u);
+    // Transform flags at payload offset 9; bit 1 = adaptive tables.
+    EXPECT_NE(payload[9] & 0x02, 0) << "new lossless encodes must set the adaptive-tables flag";
+
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    EXPECT_EQ(decoded->width(), 32u);
+    EXPECT_EQ(decoded->height(), 32u);
+    EXPECT_EQ(image.pixels().size(), decoded->pixels().size());
+    EXPECT_TRUE(std::equal(image.pixels().begin(), image.pixels().end(),
+                           decoded->pixels().begin()))
+        << "lossless with adaptive tables must decode pixel-identical";
+
+    // The same 32x32 image encoded with legacy raw tables is the golden
+    // fixture at 2336 B; adaptive tables must make it smaller.
+    const auto legacy = read_fixture_bytes("lossless_legacy_v1.wk.hex");
+    ASSERT_FALSE(legacy.empty()) << "missing tests/fixtures/lossless_legacy_v1.wk.hex";
+    EXPECT_LT(encoded->size(), legacy.size())
+        << "adaptive tables must shrink the lossless file vs raw tables";
+}
+
+TEST(RoundtripTest, LosslessLegacyRawTablesStillDecode) {
+    // Golden file written by the pre-Slice-3 encoder: transform flags 0
+    // (raw 256xuint16 tables, 4 channels). It must still decode exactly.
+    const auto bytes = read_fixture_bytes("lossless_legacy_v1.wk.hex");
+    ASSERT_FALSE(bytes.empty()) << "missing tests/fixtures/lossless_legacy_v1.wk.hex";
+
+    auto decoded = decode(bytes);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    // The golden file was encoded from an RGB PPM, so the decoded
+    // image is RGB (3 channels).
+    Image expected = make_lossless_colorful(32, 32, false);
+    EXPECT_EQ(decoded->width(), 32u);
+    EXPECT_EQ(decoded->height(), 32u);
+    EXPECT_EQ(expected.pixels().size(), decoded->pixels().size());
+    EXPECT_TRUE(std::equal(expected.pixels().begin(), expected.pixels().end(),
+                           decoded->pixels().begin()))
+        << "legacy raw-table lossless file must decode pixel-identical";
 }
