@@ -448,6 +448,7 @@ namespace wk
     constexpr uint8_t TILE_HAS_BASE = 0x01;
     constexpr uint8_t TILE_HAS_REFINEMENT = 0x02;
     constexpr uint8_t TILE_HAS_ALPHA = 0x04;
+    constexpr uint8_t TILE_CHROMA_420 = 0x08;
 
     struct AnimFrame
     {

@@ -174,6 +174,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
                                             uint32_t image_width, uint32_t image_height,
                                             uint8_t bit_depth,
                                             ChromaSubsampling subsampling,
+                                            uint8_t layer_flags,
                                             bool has_alpha,
                                             bool tile_has_alpha) {
     ByteReader reader(tile_data);
@@ -217,8 +218,9 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     const bool is_v8 = *layout_tag == kLossyTileLayoutTagV8;
     const bool is_v9 = *layout_tag == kLossyTileLayoutTagV9;
     const bool is_v10 = *layout_tag == kLossyTileLayoutTagV10;
-    const bool is_v6_family = *layout_tag == kLossyTileLayoutTagV6 || is_v7 || is_v8 || is_v9 || is_v10;
-    const bool has_scale_streams = is_v7 || is_v8 || is_v9 || is_v10;
+    const bool is_v11 = *layout_tag == kLossyTileLayoutTagV11;
+    const bool is_v6_family = *layout_tag == kLossyTileLayoutTagV6 || is_v7 || is_v8 || is_v9 || is_v10 || is_v11;
+    const bool has_scale_streams = is_v7 || is_v8 || is_v9 || is_v10 || is_v11;
     const bool packed_mode_streams = *layout_tag == kLossyTileLayoutTagV2 ||
                                      *layout_tag == kLossyTileLayoutTagV3 ||
                                      *layout_tag == kLossyTileLayoutTagV4 ||
@@ -232,8 +234,16 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     const bool adaptive_coefficient_tables = *layout_tag == kLossyTileLayoutTagV4 ||
                                              *layout_tag == kLossyTileLayoutTagV5 ||
                                              is_v6_family;
-    if (!packed_mode_streams && !raw_mode_streams && !is_v8 && !is_v9 && !is_v10) {
+    if (!packed_mode_streams && !raw_mode_streams && !is_v8 && !is_v9 && !is_v10 && !is_v11) {
         return std::unexpected(Error{ErrorCode::DecodeFailed, "unsupported lossy tile layout"});
+    }
+
+    // V11: the tile's chroma subsampling comes from the tile header
+    // flag, not from the caller (the caller only knows the image-wide
+    // inference, which is meaningless for a mixed file).
+    if (is_v11) {
+        subsampling = (layer_flags & TILE_CHROMA_420) != 0
+            ? ChromaSubsampling::YUV420 : ChromaSubsampling::YUV444;
     }
 
     uint8_t syntax_flags = 0;
@@ -322,7 +332,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     // carries the map section (it may be empty, count 0); V9 carries
     // it because the map is nontrivial there by construction.
     std::vector<uint8_t> superblock_scales;
-    if (is_v9 || is_v10) {
+    if (is_v9 || is_v10 || is_v11) {
         const size_t superblock_count =
             static_cast<size_t>(superblocks_x(blocks_x)) * superblocks_y(blocks_y);
         auto map = read_superblock_quant_map(reader, superblock_count);
@@ -355,6 +365,19 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     if (!geometry) {
         return std::unexpected(geometry.error());
     }
+    // V11: the flag is authoritative, so the block dimensions must
+    // agree with it (a tile that claims 420 in the flag but carries
+    // 444 block counts, or vice versa, is corrupt).
+    if (is_v11 && geometry->subsampling != subsampling) {
+        return std::unexpected(Error{ErrorCode::DecodeFailed,
+            "V11 tile chroma block dimensions do not match the header subsampling flag"});
+    }
+    // The geometry (from the block counts) is authoritative for this
+    // tile: the caller's subsampling is only the image-wide inference
+    // from the first tile, which is wrong for a legacy 444 tile in a
+    // mixed file. Sync it so the superblock mapping and CCLM below
+    // use this tile's real subsampling.
+    subsampling = geometry->subsampling;
 
     const size_t num_y_blocks = static_cast<size_t>(blocks_x) * blocks_y;
     const size_t num_c_blocks = static_cast<size_t>(chroma_blocks_x) * chroma_blocks_y;
@@ -375,14 +398,14 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
         return modes;
     };
 
-    auto y_modes = (is_v8 || is_v9 || is_v10) ? read_rans_prediction_modes(reader, num_y_blocks, "luma")
+    auto y_modes = (is_v8 || is_v9 || is_v10 || is_v11) ? read_rans_prediction_modes(reader, num_y_blocks, "luma")
                          : packed_mode_streams ? read_packed_prediction_modes(reader, num_y_blocks, "luma")
                                                : read_raw_modes(num_y_blocks, "luma");
     if (!y_modes) {
         return std::unexpected(y_modes.error());
     }
 
-    auto chroma_modes = (is_v8 || is_v9 || is_v10) ? read_rans_prediction_modes(reader, num_c_blocks, "chroma")
+    auto chroma_modes = (is_v8 || is_v9 || is_v10 || is_v11) ? read_rans_prediction_modes(reader, num_c_blocks, "chroma")
                               : packed_mode_streams ? read_packed_prediction_modes(reader, num_c_blocks, "chroma")
                                                     : read_raw_modes(num_c_blocks, "chroma");
     if (!chroma_modes) {
@@ -404,9 +427,9 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
             return std::unexpected(Error{ErrorCode::DecodeFailed,
                                          "CCLM prediction mode is chroma-only"});
         }
-        if (!is_v10 && uses_cclm(*chroma_modes)) {
+        if (!is_v10 && !is_v11 && uses_cclm(*chroma_modes)) {
             return std::unexpected(Error{ErrorCode::DecodeFailed,
-                                         "CCLM prediction mode requires layout V10"});
+                                         "CCLM prediction mode requires layout V10 or V11"});
         }
     }
 
@@ -427,7 +450,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     }
 
     std::vector<uint8_t> y_spans(num_y_blocks, 64);
-    if (is_v8 || is_v9 || is_v10) {
+    if (is_v8 || is_v9 || is_v10 || is_v11) {
         auto spans = read_rans_coefficient_spans(reader, num_y_blocks, "luma");
         if (!spans) {
             return std::unexpected(spans.error());
@@ -444,7 +467,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     }
 
     std::vector<uint8_t> chroma_spans(num_c_blocks, 64);
-    if (is_v8 || is_v9 || is_v10) {
+    if (is_v8 || is_v9 || is_v10 || is_v11) {
         auto spans = read_rans_coefficient_spans(reader, num_c_blocks, "chroma");
         if (!spans) {
             return std::unexpected(spans.error());
@@ -534,7 +557,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
         for (uint32_t bx = 0; bx < blocks_x; ++bx) {
             const size_t block_index = static_cast<size_t>(by) * blocks_x + bx;
             float block_scale = has_scale_streams ? y_scales[block_index] : 1.0f;
-            if ((is_v9 || is_v10) && block_scale == 1.0f) {
+            if ((is_v9 || is_v10 || is_v11) && block_scale == 1.0f) {
                 const uint8_t sb = superblock_scale_for(superblock_scales, blocks_x, bx, by);
                 block_scale = QuantTable::kQuantScaleFactors[sb];
             }
@@ -598,7 +621,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
             for (uint32_t bx = 0; bx < chroma_blocks_x; ++bx) {
                 const size_t block_index = static_cast<size_t>(by) * chroma_blocks_x + bx;
                 float block_scale = has_scale_streams ? c_scales[block_index] : 1.0f;
-                if ((is_v9 || is_v10) && block_scale == 1.0f) {
+                if ((is_v9 || is_v10 || is_v11) && block_scale == 1.0f) {
                     // Chroma is luma-block indexed; map to the
                     // top-left covered luma block, as in the encoder.
                     const uint32_t luma_bx =
@@ -695,7 +718,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
             a_steps[i] = *value;
         }
 
-        auto a_modes = (is_v8 || is_v9 || is_v10) ? read_rans_prediction_modes(reader, num_y_blocks, "alpha")
+        auto a_modes = (is_v8 || is_v9 || is_v10 || is_v11) ? read_rans_prediction_modes(reader, num_y_blocks, "alpha")
                              : packed_mode_streams ? read_packed_prediction_modes(reader, num_y_blocks, "alpha")
                                                    : read_raw_modes(num_y_blocks, "alpha");
         if (!a_modes) {
@@ -711,7 +734,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
         }
 
         std::vector<uint8_t> alpha_spans(num_y_blocks, 64);
-        if (is_v8 || is_v9 || is_v10) {
+        if (is_v8 || is_v9 || is_v10 || is_v11) {
             auto spans = read_rans_coefficient_spans(reader, num_y_blocks, "alpha");
             if (!spans) {
                 return std::unexpected(spans.error());
@@ -837,6 +860,19 @@ Result<ImageInfo> get_info_impl(std::span<const uint8_t> data) {
     return info;
 }
 
+// Peeks the lossy layout tag of a tile payload (the quant tables plus
+// the block dimensions precede it). Returns nullopt when the payload
+// is too short to hold a tag; the tile decode reports that truncation.
+[[nodiscard]] std::optional<uint32_t> peek_lossy_layout_tag(std::span<const uint8_t> tile_data) {
+    constexpr size_t kLayoutTagOffset = 64 * sizeof(uint16_t) * 2 + 4 * sizeof(uint16_t);
+    if (tile_data.size() < kLayoutTagOffset + sizeof(uint32_t)) {
+        return std::nullopt;
+    }
+    uint32_t tag = 0;
+    std::memcpy(&tag, tile_data.data() + kLayoutTagOffset, sizeof(tag));
+    return tag;
+}
+
 Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& config) {
     auto file = parse_container(data);
     if (!file) return std::unexpected(file.error());
@@ -924,17 +960,40 @@ Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& co
     auto first_tile_payload = tile_payload_view(file->tile_chunks.front(), first_tile_header);
     if (!first_tile_payload) return std::unexpected(first_tile_payload.error());
 
+    // Image-wide fallback subsampling, inferred from the first tile as
+    // before. It is only the preferred value for pre-V11 tiles (whose
+    // block counts are the sole signal); V11 tiles take their
+    // subsampling from the tile header flag instead, so a mixed file
+    // needs no single image-wide subsampling.
     auto subsampling = infer_subsampling_from_tile(*first_tile_payload, first_tile_header.tile_x,
                                                    first_tile_header.tile_y, tile_size,
                                                    width, height);
     if (!subsampling) return std::unexpected(subsampling.error());
 
+    // A file is mixed (per-tile subsampling) when any tile uses the
+    // V11 layout. Legacy files take the old path below, so they decode
+    // bit-identically (one global upsample); mixed files composite
+    // chroma at full resolution, upsampling each 420 tile to its own
+    // region (SPEC v0.2.6).
+    bool has_v11_tile = false;
+    for (const auto& tile_chunk : file->tile_chunks) {
+        TileHeader tile_header;
+        auto tile_data = tile_payload_view(tile_chunk, tile_header);
+        if (!tile_data) return std::unexpected(tile_data.error());
+        if (peek_lossy_layout_tag(*tile_data) == kLossyTileLayoutTagV11) {
+            has_v11_tile = true;
+            break;
+        }
+    }
+
     const int16_t max_val = static_cast<int16_t>((1 << hdr.bit_depth) - 1);
     const size_t pixel_count = static_cast<size_t>(width) * height;
     std::vector<int16_t> full_y(pixel_count, 0);
 
-    const uint32_t chroma_w = *subsampling == ChromaSubsampling::YUV420 ? (width + 1) / 2 : width;
-    const uint32_t chroma_h = *subsampling == ChromaSubsampling::YUV420 ? (height + 1) / 2 : height;
+    const uint32_t chroma_w = has_v11_tile ? width
+        : (*subsampling == ChromaSubsampling::YUV420 ? (width + 1) / 2 : width);
+    const uint32_t chroma_h = has_v11_tile ? height
+        : (*subsampling == ChromaSubsampling::YUV420 ? (height + 1) / 2 : height);
     std::vector<int16_t> full_cb(static_cast<size_t>(chroma_w) * chroma_h, max_val / 2);
     std::vector<int16_t> full_cr(static_cast<size_t>(chroma_w) * chroma_h, max_val / 2);
     std::vector<int16_t> full_a;
@@ -949,6 +1008,7 @@ Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& co
 
         auto tile = decode_lossy_tile(*tile_data, tile_header.tile_x, tile_header.tile_y,
                                       tile_size, width, height, hdr.bit_depth, *subsampling,
+                                      tile_header.layer_flags,
                                       hdr.has_alpha(), (tile_header.layer_flags & TILE_HAS_ALPHA) != 0);
         if (!tile) return std::unexpected(tile.error());
 
@@ -968,21 +1028,51 @@ Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& co
             }
         }
 
-        const uint32_t chroma_x0 = *subsampling == ChromaSubsampling::YUV420 ? tile->geometry.x0 / 2 : tile->geometry.x0;
-        const uint32_t chroma_y0 = *subsampling == ChromaSubsampling::YUV420 ? tile->geometry.y0 / 2 : tile->geometry.y0;
-        for (uint32_t row = 0; row < tile->geometry.chroma_th; ++row) {
-            for (uint32_t col = 0; col < tile->geometry.chroma_tw; ++col) {
-                full_cb[(chroma_y0 + row) * chroma_w + (chroma_x0 + col)] =
-                    tile->cb_plane[row * tile->geometry.chroma_tw + col];
-                full_cr[(chroma_y0 + row) * chroma_w + (chroma_x0 + col)] =
-                    tile->cr_plane[row * tile->geometry.chroma_tw + col];
+        if (has_v11_tile) {
+            if (tile->geometry.subsampling == ChromaSubsampling::YUV420) {
+                // Upsample this tile's chroma to its full-resolution
+                // region (same bilinear filter as the image-wide
+                // upsample, clamped to the tile's own chroma plane),
+                // then copy it in.
+                std::vector<int16_t> cb_up(static_cast<size_t>(tile->geometry.tw) * tile->geometry.th);
+                std::vector<int16_t> cr_up(static_cast<size_t>(tile->geometry.tw) * tile->geometry.th);
+                upsample_420(tile->cb_plane.data(), cb_up.data(), tile->geometry.tw, tile->geometry.th);
+                upsample_420(tile->cr_plane.data(), cr_up.data(), tile->geometry.tw, tile->geometry.th);
+                for (uint32_t row = 0; row < tile->geometry.th; ++row) {
+                    for (uint32_t col = 0; col < tile->geometry.tw; ++col) {
+                        full_cb[(tile->geometry.y0 + row) * width + (tile->geometry.x0 + col)] =
+                            cb_up[row * tile->geometry.tw + col];
+                        full_cr[(tile->geometry.y0 + row) * width + (tile->geometry.x0 + col)] =
+                            cr_up[row * tile->geometry.tw + col];
+                    }
+                }
+            } else {
+                for (uint32_t row = 0; row < tile->geometry.chroma_th; ++row) {
+                    for (uint32_t col = 0; col < tile->geometry.chroma_tw; ++col) {
+                        full_cb[(tile->geometry.y0 + row) * width + (tile->geometry.x0 + col)] =
+                            tile->cb_plane[row * tile->geometry.chroma_tw + col];
+                        full_cr[(tile->geometry.y0 + row) * width + (tile->geometry.x0 + col)] =
+                            tile->cr_plane[row * tile->geometry.chroma_tw + col];
+                    }
+                }
+            }
+        } else {
+            const uint32_t chroma_x0 = *subsampling == ChromaSubsampling::YUV420 ? tile->geometry.x0 / 2 : tile->geometry.x0;
+            const uint32_t chroma_y0 = *subsampling == ChromaSubsampling::YUV420 ? tile->geometry.y0 / 2 : tile->geometry.y0;
+            for (uint32_t row = 0; row < tile->geometry.chroma_th; ++row) {
+                for (uint32_t col = 0; col < tile->geometry.chroma_tw; ++col) {
+                    full_cb[(chroma_y0 + row) * chroma_w + (chroma_x0 + col)] =
+                        tile->cb_plane[row * tile->geometry.chroma_tw + col];
+                    full_cr[(chroma_y0 + row) * chroma_w + (chroma_x0 + col)] =
+                        tile->cr_plane[row * tile->geometry.chroma_tw + col];
+                }
             }
         }
     }
 
     std::vector<int16_t> cb_full(pixel_count);
     std::vector<int16_t> cr_full(pixel_count);
-    if (*subsampling == ChromaSubsampling::YUV420) {
+    if (!has_v11_tile && *subsampling == ChromaSubsampling::YUV420) {
         upsample_420(full_cb.data(), cb_full.data(), width, height);
         upsample_420(full_cr.data(), cr_full.data(), width, height);
     } else {
