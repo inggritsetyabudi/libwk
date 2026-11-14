@@ -126,6 +126,7 @@ void print_usage() {
         << "  --yuv420                Use 4:2:0 chroma\n"
         << "  --tile-stats            Print a per-tile byte breakdown (tables vs coded data)\n"
         << "  --coeff-stats           Print per-coefficient-position stream sizes\n"
+        << "  --control-field         Enable the Phase 2 perceptual control field (per-block quant bias)\n"
         << "  --import-exif FILE      Import EXIF from JPEG/TIFF donor file\n"
         << "  --version               Print version\n"
         << "  -h, --help              Show this help\n\n"
@@ -258,6 +259,8 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--coeff-stats") {
             coeff_stats = true;
             tile_stats = true;  // coeff stats ride on the same EncodeStats
+        } else if (arg == "--control-field") {
+            config.use_control_field = true;
         } else if (arg == "--import-exif") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --import-exif requires a donor file\n";
