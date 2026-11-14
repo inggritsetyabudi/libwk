@@ -10,10 +10,14 @@
 //
 // The map is shared by luma and chroma (one scale per superblock);
 // chroma follows luma content, which is the perceptually right
-// behavior. A superblock's scale comes from its blocks' content:
-// clearly-textured superblocks go coarser (1.25, masking hides the
-// loss); everything else stays at identity. There is deliberately no
-// finer scale: finer quant on smooth blocks was measured and rejected
+// behavior. The textured-superblock coarser step (1.25) is DISABLED
+// by measurement (2026-11-14, option (d) policy review): threshold
+// tuning (0.75 / 0.85 / 0.90 / 1.0) could not recover meadow's
+// -0.97 dB PSNR loss, because the texture is real detail, not
+// masking-friendly noise. Every superblock currently stays at
+// identity; the map format is unchanged, so old V9/V10 files with a
+// non-trivial map still decode. There is deliberately no finer
+// scale: finer quant on smooth blocks was measured and rejected
 // (Phase 2 variant 1 grew files +24% to +39%).
 #pragma once
 
@@ -35,8 +39,11 @@ inline uint32_t superblocks_y(uint32_t blocks_y) { return (blocks_y + 7) / 8; }
 
 // Aggregates a per-block control field into one quant scale index per
 // superblock (raster order, superblocks_x * superblocks_y entries).
-// A superblock is marked coarser (index 5 = 1.25) when at least half
-// of its blocks are Textured; otherwise it stays at identity (4).
+// Currently every superblock stays at identity (index 4 = 1.0): the
+// textured-superblock coarser step is disabled by measurement (see the
+// file comment above and src/superblock_quant.cpp). The `field`
+// parameter is kept so the call site and any future policy do not
+// need to change.
 // `blocks_x` is the tile's block-grid width (the field is
 // blocks_x * blocks_y entries, raster order).
 std::vector<uint8_t> aggregate_superblock_scales(
