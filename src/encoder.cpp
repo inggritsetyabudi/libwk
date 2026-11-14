@@ -16,6 +16,7 @@
 #include "common.h"
 #include "coeff_span_stream.h"
 #include "container.h"
+#include "control_field.h"
 #include "dct.h"
 #include "lossy_coeff_stream.h"
 #include "mode_span_rans.h"
@@ -433,6 +434,7 @@ static Result<TileEncodeResult> encode_lossy_tile(
     uint32_t tile_x, uint32_t tile_y, uint32_t tile_size,
     float quality, uint8_t bit_depth, bool has_alpha,
     ChromaSubsampling subsampling,
+    bool use_control_field,
     TileStats* stats = nullptr) {
 
     if (has_alpha && alpha_plane == nullptr) {
@@ -509,6 +511,20 @@ static Result<TileEncodeResult> encode_lossy_tile(
             tile_y_data[r * tw + c] = y_plane[(y0 + r) * image_width + (x0 + c)];
         }
     }
+
+    // Phase 2 control field: per-block content analysis of this tile's
+    // luma. When enabled, its quant-scale suggestion becomes the
+    // block's scale (the seed boost below still overrides it for seed
+    // blocks). Computed once per tile, not per block.
+    const std::vector<BlockControl> control_field =
+        use_control_field ? analyze_control_field(tile_y_data.data(), tw, th)
+                          : std::vector<BlockControl>{};
+    const auto control_scale_for = [&](uint32_t bx, uint32_t by) -> uint8_t {
+        if (control_field.empty()) return QuantTable::kQuantScaleIdentity;
+        const size_t idx = static_cast<size_t>(by) * blocks_x + bx;
+        if (idx >= control_field.size()) return QuantTable::kQuantScaleIdentity;
+        return control_field[idx].quant_scale_index;
+    };
 
     // The smooth-ramp gate (fix #2) still drives the chroma table
     // refinement. NOTE: a seed boost (first row/column at quant scale
@@ -597,7 +613,7 @@ static Result<TileEncodeResult> encode_lossy_tile(
 
             const uint8_t block_scale_index =
                 (seed_boost_tile && (by == 0 || bx == 0))
-                    ? 2 : QuantTable::kQuantScaleIdentity;
+                    ? 2 : control_scale_for(bx, by);
             const float block_scale =
                 QuantTable::kQuantScaleFactors[block_scale_index];
             auto rd = select_best_mode(original_block,
@@ -822,9 +838,17 @@ static Result<TileEncodeResult> encode_lossy_tile(
                 cr_above_left = reconstructed_cr[(by0 - 1) * chroma_tw + (bx0 - 1)];
             }
 
+            // The control field is luma-block indexed. In YUV444 the
+            // chroma block (bx,by) is the same block; in YUV420 it
+            // covers luma blocks (2bx,2by)..(2bx+1,2by+1), so use the
+            // top-left one as representative.
+            const uint32_t luma_bx =
+                subsampling == ChromaSubsampling::YUV420 ? bx * 2 : bx;
+            const uint32_t luma_by =
+                subsampling == ChromaSubsampling::YUV420 ? by * 2 : by;
             const uint8_t c_block_scale_index =
                 (seed_boost_tile && (by == 0 || bx == 0))
-                    ? 2 : QuantTable::kQuantScaleIdentity;
+                    ? 2 : control_scale_for(luma_bx, luma_by);
             const float c_block_scale =
                 QuantTable::kQuantScaleFactors[c_block_scale_index];
             const PredMode chroma_mode = select_joint_chroma_mode(
@@ -1901,6 +1925,7 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
                         source_has_alpha,
                         use_yuv420 ? ChromaSubsampling::YUV420
                                    : ChromaSubsampling::YUV444,
+                        config.use_control_field,
                         tile_stats_ptr);
                 });
                 futures.push_back(std::move(future));
