@@ -170,3 +170,10 @@ TEST(CApiTest, EncodeAcceptsPaddedStride) {
     EXPECT_EQ(info.height, height);
     wk_free(out_data);
 }
+
+TEST(CApiTest, VersionMatchesSpec) {
+    // Pins the C API version to the SPEC/CMake version, so it cannot
+    // silently go stale again (it stayed "0.2.1" through V11 / 0.2.6).
+    ASSERT_NE(wk_version(), nullptr);
+    EXPECT_STREQ(wk_version(), "0.2.6");
+}

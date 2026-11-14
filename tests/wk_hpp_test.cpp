@@ -46,3 +46,9 @@ TEST(WkHppTest, PublicHeaderIsSelfContained) {
     EXPECT_EQ(error.code, wk::ErrorCode::EncodeFailed);
     EXPECT_EQ(error.message, "test");
 }
+
+TEST(WkHppTest, VersionMatchesSpec) {
+    // Pins the reported version to the SPEC/CMake version, so it cannot
+    // silently go stale again (it stayed "0.2.1" through V11 / 0.2.6).
+    EXPECT_EQ(wk::version(), "0.2.6");
+}

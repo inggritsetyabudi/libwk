@@ -126,7 +126,7 @@ void print_usage() {
         << "  --yuv420                Use 4:2:0 chroma\n"
         << "  --tile-stats            Print a per-tile byte breakdown (tables vs coded data)\n"
         << "  --coeff-stats           Print per-coefficient-position stream sizes\n"
-        << "  --control-field         Enable the Phase 2 perceptual control field (on by default)\n"
+        << "  --control-field         Enable the Phase 2 perceptual control field (off by default)\n"
         << "  --no-control-field      Disable the perceptual control field\n"
         << "  --cclm                  Enable CCLM chroma prediction (on by default)\n"
         << "  --no-cclm               Disable CCLM chroma prediction\n"
