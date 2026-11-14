@@ -38,7 +38,8 @@ enum class LosslessPred : uint8_t {
     AVG_LTRTL= 10,
     SELECT   = 11,
     CLAMP_ADD= 12,
-    NUM_PREDS= 13,
+    MED      = 13,
+    NUM_PREDS= 14,
 };
 
 // Lossless tile transform-flags byte: the first byte of the tile's

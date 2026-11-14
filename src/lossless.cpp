@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace wk {
 
@@ -252,11 +253,67 @@ static inline uint8_t predict_pixel(LosslessPred mode, uint8_t l, uint8_t t,
             int v = static_cast<int>(l) + t - tl;
             return static_cast<uint8_t>(std::clamp(v, 0, 255));
         }
+        // JPEG-LS MED (ISO/IEC 14495): median edge detector. Best
+        // lossless predictor on the benchmark photos (measured
+        // 2026-11-15: -1.83% vs SELECT; see lossless_gap_diag).
+        case LosslessPred::MED: {
+            if (tl >= std::max(l, t)) return std::min(l, t);
+            if (tl <= std::min(l, t)) return std::max(l, t);
+            return static_cast<uint8_t>(l + t - tl);
+        }
         default: return 0;
     }
 }
 
 
+
+// Encodes the non-palette path for one predictor: per channel,
+// residuals -> adaptive rANS table -> rANS stream, appended to
+// `out`. Used by the predictor selection (measure each candidate,
+// keep the smallest) so the winner's bytes are already encoded.
+static Result<void> encode_nonpalette_channels(const uint8_t* transformed,
+                                               uint32_t width, uint32_t height,
+                                               size_t pixel_count,
+                                               LosslessPred pred_mode,
+                                               ByteWriter& out) {
+    for (int ch = 0; ch < 4; ch++) {
+        std::vector<uint8_t> residuals(pixel_count);
+        for (uint32_t y = 0; y < height; y++) {
+            for (uint32_t x = 0; x < width; x++) {
+                size_t idx = y * width + x;
+                uint8_t val = transformed[idx * 4 + ch];
+                uint8_t l  = (x > 0) ? transformed[(idx - 1) * 4 + ch] : 0;
+                uint8_t t  = (y > 0) ? transformed[(idx - width) * 4 + ch] : 0;
+                uint8_t tr = (y > 0 && x < width - 1) ?
+                              transformed[(idx - width + 1) * 4 + ch] : t;
+                uint8_t tl = (y > 0 && x > 0) ?
+                              transformed[(idx - width - 1) * 4 + ch] : 0;
+                uint8_t predicted = predict_pixel(pred_mode, l, t, tr, tl);
+                residuals[idx] = static_cast<uint8_t>((val - predicted) & 0xFF);
+            }
+        }
+        uint32_t counts[256] = {};
+        for (size_t i = 0; i < pixel_count; i++) {
+            counts[residuals[i]]++;
+        }
+        RansTable<RANS_PRECISION_BITS> table;
+        table.build_from_counts(counts, 256);
+        // Adaptive table encoding (Slice 3): picks the smallest of
+        // single-symbol / sparse / dense forms instead of raw
+        // 256 x uint16. Never more than ~5 B worse per channel.
+        auto table_r = write_coefficient_table(out, table, 256, nullptr);
+        if (!table_r) return std::unexpected(table_r.error());
+        RansEncoder<RANS_PRECISION_BITS> enc;
+        enc.init();
+        for (size_t i = pixel_count; i > 0; i--) {
+            enc.encode(table, residuals[i - 1]);
+        }
+        auto encoded = enc.finish();
+        out.write_u32(static_cast<uint32_t>(encoded.size()));
+        out.write_bytes(encoded);
+    }
+    return {};
+}
 
 Result<std::vector<uint8_t>> lossless_encode(
     const uint8_t* rgba, uint32_t width, uint32_t height, uint8_t bit_depth) {
@@ -279,8 +336,29 @@ Result<std::vector<uint8_t>> lossless_encode(
 
 
 
+    // Predictor selection (non-palette path only): measure the true
+    // coded size of the top-3 candidates and keep the smallest.
+    // Ranking from tools/lossless_gap_diag (2026-11-15): MED, SELECT,
+    // CLAMP_ADD are the top 3 on every benchmark photo by a clear
+    // margin; the rest are 5-15% worse. The winner's bytes are
+    // already encoded, so there is no re-encode.
     LosslessPred pred_mode = LosslessPred::SELECT;
-
+    std::vector<uint8_t> nonpalette_payload;
+    if (!use_palette) {
+        size_t best_size = std::numeric_limits<size_t>::max();
+        for (LosslessPred cand : {LosslessPred::SELECT, LosslessPred::MED,
+                                  LosslessPred::CLAMP_ADD}) {
+            ByteWriter cand_out;
+            auto enc_r = encode_nonpalette_channels(transformed.data(), width, height,
+                                                    pixel_count, cand, cand_out);
+            if (!enc_r) return std::unexpected(enc_r.error());
+            if (cand_out.size() < best_size) {
+                best_size = cand_out.size();
+                pred_mode = cand;
+                nonpalette_payload = cand_out.finish();
+            }
+        }
+    }
 
     ByteWriter header;
     // Adaptive frequency tables (bit 1) apply to the non-palette path
@@ -315,56 +393,8 @@ Result<std::vector<uint8_t>> lossless_encode(
             }
         }
     } else {
-
-        for (int ch = 0; ch < 4; ch++) {
-
-            std::vector<uint8_t> residuals(pixel_count);
-
-            for (uint32_t y = 0; y < height; y++) {
-                for (uint32_t x = 0; x < width; x++) {
-                    size_t idx = y * width + x;
-                    uint8_t val = transformed[idx * 4 + ch];
-
-                    uint8_t l  = (x > 0) ? transformed[(idx - 1) * 4 + ch] : 0;
-                    uint8_t t  = (y > 0) ? transformed[(idx - width) * 4 + ch] : 0;
-                    uint8_t tr = (y > 0 && x < width - 1) ?
-                                  transformed[(idx - width + 1) * 4 + ch] : t;
-                    uint8_t tl = (y > 0 && x > 0) ?
-                                  transformed[(idx - width - 1) * 4 + ch] : 0;
-
-                    uint8_t predicted = predict_pixel(pred_mode, l, t, tr, tl);
-                    residuals[idx] = static_cast<uint8_t>((val - predicted) & 0xFF);
-                }
-            }
-
-
-            uint32_t counts[256] = {};
-            for (size_t i = 0; i < pixel_count; i++) {
-                counts[residuals[i]]++;
-            }
-
-
-            RansTable<RANS_PRECISION_BITS> table;
-            table.build_from_counts(counts, 256);
-
-            // Adaptive table encoding (Slice 3): picks the smallest of
-            // single-symbol / sparse / dense forms instead of raw
-            // 256 x uint16. Never more than ~5 B worse per channel.
-            auto table_r = write_coefficient_table(header, table, 256, nullptr);
-            if (!table_r) return std::unexpected(table_r.error());
-
-
-            RansEncoder<RANS_PRECISION_BITS> enc;
-            enc.init();
-
-            for (size_t i = pixel_count; i > 0; i--) {
-                enc.encode(table, residuals[i - 1]);
-            }
-            auto encoded = enc.finish();
-
-            header.write_u32(static_cast<uint32_t>(encoded.size()));
-            header.write_bytes(encoded);
-        }
+        // Winner's bytes were encoded during selection above.
+        header.write_bytes(nonpalette_payload);
     }
 
     return header.finish();
@@ -405,6 +435,15 @@ Result<std::vector<uint8_t>> lossless_decode(
     auto pred_mode_r = reader.read_u8();
     if (!pred_mode_r) return std::unexpected(pred_mode_r.error());
     LosslessPred pred_mode = static_cast<LosslessPred>(*pred_mode_r);
+
+    // Reject an unknown predictor before decoding a single pixel: a
+    // value outside the enum would silently decode to wrong pixels
+    // (predict_pixel returns 0 for it). MED=13 is the newest valid
+    // value; anything at or above NUM_PREDS is corrupt.
+    if (static_cast<uint8_t>(pred_mode) >= static_cast<uint8_t>(LosslessPred::NUM_PREDS)) {
+        return std::unexpected(Error{ErrorCode::LosslessError,
+            "lossless predictor mode out of range"});
+    }
 
     std::vector<uint8_t> output(pixel_count * 4);
 

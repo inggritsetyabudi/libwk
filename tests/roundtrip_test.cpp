@@ -28,6 +28,7 @@
 #include "../src/coeff_span_stream.h"
 #include "../src/coeff_table_stream.h"
 #include "../src/image_io.h"
+#include "../src/lossless.h"
 #include "../src/metrics.h"
 #include "../src/mode_span_rans.h"
 #include "../src/mode_stream.h"
@@ -2229,6 +2230,59 @@ TEST(RoundtripTest, LosslessLegacyRawTablesStillDecode) {
     EXPECT_TRUE(std::equal(expected.pixels().begin(), expected.pixels().end(),
                            decoded->pixels().begin()))
         << "legacy raw-table lossless file must decode pixel-identical";
+}
+
+TEST(RoundtripTest, LosslessMedPredictorSelectedOnPhoto) {
+    // MED (JPEG-LS, mode 13) is the best lossless predictor on the
+    // benchmark photos (measured 2026-11-15: -1.83% vs SELECT). This
+    // 64x64 crop of mira is a real photo texture where MED strictly
+    // wins (diagnostic: MED 4813 B vs SELECT 4951 B, CLAMP_ADD 4979 B),
+    // so the encoder must pick it.
+    const auto rgb = read_fixture_bytes("mira_crop_64x64.rgb.hex");
+    ASSERT_EQ(rgb.size(), 64u * 64u * 3u) << "missing tests/fixtures/mira_crop_64x64.rgb.hex";
+    Image image(64, 64, BitDepth::Bits8, false);
+    std::memcpy(image.pixels().data(), rgb.data(), rgb.size());
+
+    EncoderConfig config;
+    config.lossless = true;
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto parsed = parse_container(*encoded);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ASSERT_EQ(parsed->tile_chunks.size(), 1u);
+    const auto& payload = parsed->tile_chunks[0].payload;
+    ASSERT_GE(payload.size(), 11u);
+    // Tile payload offset 9 = transform flags, offset 10 = predictor.
+    EXPECT_EQ(payload[10], 13u) << "encoder must select MED (13) on this photo crop";
+
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    EXPECT_EQ(decoded->width(), 64u);
+    EXPECT_EQ(decoded->height(), 64u);
+    EXPECT_TRUE(std::equal(image.pixels().begin(), image.pixels().end(),
+                           decoded->pixels().begin()))
+        << "lossless with MED must decode pixel-identical";
+}
+
+TEST(RoundtripTest, LosslessUnknownPredictorRejected) {
+    // A predictor mode outside the enum (>= NUM_PREDS = 14) must be
+    // rejected, not silently decoded to wrong pixels.
+    const auto rgb = read_fixture_bytes("mira_crop_64x64.rgb.hex");
+    ASSERT_EQ(rgb.size(), 64u * 64u * 3u) << "missing tests/fixtures/mira_crop_64x64.rgb.hex";
+    std::vector<uint8_t> rgba(64u * 64u * 4u, 255);
+    for (size_t i = 0; i < 64u * 64u; ++i) {
+        rgba[i * 4 + 0] = rgb[i * 3 + 0];
+        rgba[i * 4 + 1] = rgb[i * 3 + 1];
+        rgba[i * 4 + 2] = rgb[i * 3 + 2];
+    }
+    auto payload = lossless_encode(rgba.data(), 64, 64, 8);
+    ASSERT_TRUE(payload.has_value()) << payload.error().message;
+    ASSERT_GE(payload->size(), 2u);
+    // Payload byte 0 = transform flags, byte 1 = predictor mode.
+    (*payload)[1] = 14;
+    auto decoded = lossless_decode(*payload, 64, 64, 8);
+    EXPECT_FALSE(decoded.has_value()) << "predictor mode 14 must be rejected";
 }
 
 TEST(RoundtripTest, ControlFieldSuperblockMapRoundtrips) {

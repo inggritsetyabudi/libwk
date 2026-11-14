@@ -18,6 +18,7 @@
 #include "../src/common.h"
 #include "../src/container.h"
 #include "../src/image_io.h"
+#include "../src/metrics.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -25,6 +26,7 @@
 #include <string_view>
 #include <vector>
 #include "tool_common.h"
+#include "tool_log.h"
 
 namespace {
 
@@ -76,6 +78,11 @@ void print_usage() {
         << "Options:\n"
         << "  --info               Print image info only\n"
         << "  --export-meta FILE   Export WKMETA as JSON\n"
+        << "  --metrics FILE       Decode, then report PSNR/SSIM vs FILE (reference image)\n"
+        << "  -v, --verbose        Show debug logs (per-step detail)\n"
+        << "  -q, --quiet          Only warnings and errors\n"
+        << "  --color              Force colored log output\n"
+        << "  --no-color           Disable colored log output\n"
         << "  --version            Print version\n"
         << "  -h, --help           Show this help\n";
 }
@@ -86,6 +93,7 @@ int main(int argc, char* argv[]) {
     std::string input_path;
     std::string output_path;
     std::string metadata_path;
+    std::string metrics_path;
     bool info_only = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -98,6 +106,20 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             metadata_path = argv[++i];
+        } else if (arg == "--metrics") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --metrics requires a reference file\n";
+                return 1;
+            }
+            metrics_path = argv[++i];
+        } else if (arg == "-v" || arg == "--verbose") {
+            wk::tool::set_log_level(wk::tool::LogLevel::Debug);
+        } else if (arg == "-q" || arg == "--quiet") {
+            wk::tool::set_log_level(wk::tool::LogLevel::Warn);
+        } else if (arg == "--color") {
+            wk::tool::set_log_color(true);
+        } else if (arg == "--no-color") {
+            wk::tool::set_log_color(false);
         } else if (arg == "--version") {
             std::cout << wk::version() << '\n';
             return 0;
@@ -125,61 +147,82 @@ int main(int argc, char* argv[]) {
 
     auto input_bytes = wk::tool::read_file_bytes(input_path);
     if (!input_bytes) {
-        std::cerr << "Error: " << input_bytes.error().message << '\n';
+        wk::tool::log_error(input_bytes.error().message + ": " + input_path);
         return 1;
     }
+    wk::tool::log_info("loaded " + input_path + " (" + std::to_string(input_bytes->size()) + " B)");
 
     if (!metadata_path.empty()) {
         auto parsed = wk::parse_container(*input_bytes);
         if (!parsed) {
-            std::cerr << "Error: failed to parse container: " << parsed.error().message << '\n';
+            wk::tool::log_error("failed to parse container: " + parsed.error().message);
             return 1;
         }
         if (!parsed->metadata) {
-            std::cerr << "Error: input has no metadata block\n";
+            wk::tool::log_error("input has no metadata block");
             return 1;
         }
 
         auto write_result = write_text_file(metadata_path, parsed->metadata->to_json());
         if (!write_result) {
-            std::cerr << "Error: " << write_result.error().message << '\n';
+            wk::tool::log_error(write_result.error().message);
             return 1;
         }
-        std::cerr << "Exported metadata to " << metadata_path << '\n';
+        wk::tool::log_info("exported metadata to " + metadata_path);
     }
 
     auto info = wk::get_info(*input_bytes);
     if (!info) {
-        std::cerr << "Error: failed to read image info: " << info.error().message << '\n';
+        wk::tool::log_error("failed to read image info: " + info.error().message);
         return 1;
     }
     if (info_only) {
         print_info(*info);
         return 0;
     }
+    wk::tool::log_debug(std::string("container: ") + std::to_string(info->width) + "x" +
+                        std::to_string(info->height) + ", " +
+                        (info->is_lossless ? "lossless" : "lossy") + ", tile " +
+                        std::to_string(info->tile_size) + "px");
 
     if (output_path.empty()) {
         output_path = default_output_path(input_path);
     }
 
     if (std::filesystem::path(output_path).extension() == ".png" && info->bit_depth != wk::BitDepth::Bits8) {
-        std::cerr << "Error: PNG output is only available for 8-bit images; use .ppm for now\n";
+        wk::tool::log_error("PNG output is only available for 8-bit images; use .ppm for now");
         return 1;
     }
 
     auto image = wk::decode(*input_bytes);
     if (!image) {
-        std::cerr << "Error: decode failed: " << image.error().message << '\n';
+        wk::tool::log_error("decode failed: " + image.error().message);
         return 1;
     }
 
     auto save_result = wk::io::save_image_file(output_path, *image);
     if (!save_result) {
-        std::cerr << "Error: failed to write output image: " << save_result.error().message << '\n';
+        wk::tool::log_error("failed to write output image: " + save_result.error().message);
         return 1;
     }
 
-    std::cerr << "Decoded " << input_path << " -> " << output_path
-              << " (" << image->width() << 'x' << image->height() << ")\n";
+    wk::tool::log_ok("decoded " + input_path + " -> " + output_path + " (" +
+                     std::to_string(image->width()) + "x" + std::to_string(image->height()) + ")");
+
+    if (!metrics_path.empty()) {
+        // Decode + metrics in one run: a bad decode is visible at once.
+        auto reference = wk::io::load_image_file(metrics_path);
+        if (!reference) {
+            wk::tool::log_warn("metrics skipped: could not load reference: " + reference.error().message);
+            return 0;
+        }
+        auto m = wk::metrics::compare_images(*reference, *image);
+        if (!m) {
+            wk::tool::log_warn("metrics skipped: compare failed: " + m.error().message);
+            return 0;
+        }
+        wk::tool::log_info("metrics: PSNR " + wk::tool::color_psnr(m->psnr, wk::tool::log_color_enabled()) +
+                           " dB, SSIM " + wk::tool::color_ssim(m->ssim, wk::tool::log_color_enabled()));
+    }
     return 0;
 }

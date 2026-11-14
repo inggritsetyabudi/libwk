@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(wk VERSION 0.2.6 LANGUAGES CXX)
+project(wk VERSION 0.2.7 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -142,6 +142,7 @@ if(WK_BUILD_TESTS)
     wk_add_test(superblock_quant_test tests/superblock_quant_test.cpp)
     wk_add_test(cclm_test tests/cclm_test.cpp)
     wk_add_test(adaptive_chroma_test tests/adaptive_chroma_test.cpp)
+    wk_add_test(tool_log_test tests/tool_log_test.cpp)
 endif()
 
 # Install the library, the command-line tools, and the public headers.
