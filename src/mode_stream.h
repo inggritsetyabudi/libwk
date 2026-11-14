@@ -26,6 +26,7 @@ constexpr uint32_t kLossyTileLayoutTagV4 = 0x344d4843u;
 constexpr uint32_t kLossyTileLayoutTagV5 = 0x354d4843u;
 constexpr uint32_t kLossyTileLayoutTagV6 = 0x364d4843u;
 constexpr uint32_t kLossyTileLayoutTagV7 = 0x374d4843u;
+constexpr uint32_t kLossyTileLayoutTagV8 = 0x384d4843u;
 
 constexpr uint8_t kLossyTileSyntaxFlagAdaptiveSpanStreams = 1u << 0;
 constexpr uint8_t kLossyTileSyntaxFlagPlaneCoeffExtents = 1u << 1;

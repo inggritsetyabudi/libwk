@@ -168,6 +168,44 @@ namespace wk
 
     [[nodiscard]] Result<std::vector<uint8_t>> encode(const Image &image, const EncoderConfig &config = {});
 
+    // Byte breakdown of one encoded lossy tile, for syntax-efficiency
+    // diagnostics. mode/span bytes cover the luma+chroma streams; an
+    // alpha tile's small mode/span streams are not split out (they are
+    // in total_bytes). The coefficient-payload split (tables vs coded
+    // data) is measured by re-encoding the final payloads with the
+    // winning config, so it stays correct no matter which candidate
+    // the encoder's size race picks.
+    struct TileStats
+    {
+        size_t quant_table_bytes = 0;
+        size_t layout_bytes = 0;  // layout tag + flags + block dims
+        size_t v7_scale_bytes = 0;
+        size_t mode_bytes = 0;    // luma + chroma mode streams
+        size_t span_bytes = 0;    // luma + chroma span streams
+        size_t max_span_bytes = 0;
+        size_t y_coeff_table_bytes = 0;
+        size_t y_coeff_stream_bytes = 0;
+        size_t y_coeff_flag_bytes = 0;
+        size_t chroma_coeff_table_bytes = 0;
+        size_t chroma_coeff_stream_bytes = 0;
+        size_t chroma_coeff_flag_bytes = 0;
+        size_t alpha_coeff_table_bytes = 0;
+        size_t alpha_coeff_stream_bytes = 0;
+        size_t alpha_coeff_flag_bytes = 0;
+        size_t total_bytes = 0;  // whole tile payload (excl. 9B header)
+    };
+
+    struct EncodeStats
+    {
+        std::vector<TileStats> tiles;  // one entry per tile, row-major
+    };
+
+    // Like encode(), but also fills `stats` with a per-tile byte
+    // breakdown. Costs one extra re-encode of the final coefficient
+    // payloads per tile, so use it for diagnostics, not production.
+    [[nodiscard]] Result<std::vector<uint8_t>> encode_with_stats(
+        const Image &image, const EncoderConfig &config, EncodeStats &stats);
+
     struct DecoderConfig
     {
         uint32_t threads = 0;

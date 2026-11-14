@@ -124,6 +124,7 @@ void print_usage() {
         << "  --threads N             Thread count (0 = auto)\n"
         << "  --yuv444                Use 4:4:4 chroma (default)\n"
         << "  --yuv420                Use 4:2:0 chroma\n"
+        << "  --tile-stats            Print a per-tile byte breakdown (tables vs coded data)\n"
         << "  --import-exif FILE      Import EXIF from JPEG/TIFF donor file\n"
         << "  --version               Print version\n"
         << "  -h, --help              Show this help\n\n"
@@ -134,11 +135,42 @@ void print_usage() {
 
 }
 
+void print_tile_stats(const wk::EncodeStats& stats) {
+    // Per-tile byte breakdown, with the coefficient-payload split that
+    // decides Phase 1 priorities (tables vs coded data).
+    for (size_t i = 0; i < stats.tiles.size(); ++i) {
+        const auto& t = stats.tiles[i];
+        const auto pct = [&](size_t n) {
+            return t.total_bytes == 0 ? 0.0 : 100.0 * static_cast<double>(n) / t.total_bytes;
+        };
+        std::cerr << "tile " << i << ": " << t.total_bytes << " B\n"
+                  << "  quant tables : " << t.quant_table_bytes << " B (" << pct(t.quant_table_bytes) << "%)\n"
+                  << "  layout       : " << t.layout_bytes << " B (" << pct(t.layout_bytes) << "%)\n"
+                  << "  V7 scales    : " << t.v7_scale_bytes << " B (" << pct(t.v7_scale_bytes) << "%)\n"
+                  << "  modes        : " << t.mode_bytes << " B (" << pct(t.mode_bytes) << "%)\n"
+                  << "  spans        : " << t.span_bytes << " B (" << pct(t.span_bytes) << "%)\n"
+                  << "  max spans    : " << t.max_span_bytes << " B (" << pct(t.max_span_bytes) << "%)\n"
+                  << "  Y coeff tbl  : " << t.y_coeff_table_bytes << " B (" << pct(t.y_coeff_table_bytes) << "%)\n"
+                  << "  Y coeff data : " << t.y_coeff_stream_bytes << " B (" << pct(t.y_coeff_stream_bytes) << "%)\n"
+                  << "  Y coeff flag : " << t.y_coeff_flag_bytes << " B (" << pct(t.y_coeff_flag_bytes) << "%)\n"
+                  << "  C coeff tbl  : " << t.chroma_coeff_table_bytes << " B (" << pct(t.chroma_coeff_table_bytes) << "%)\n"
+                  << "  C coeff data : " << t.chroma_coeff_stream_bytes << " B (" << pct(t.chroma_coeff_stream_bytes) << "%)\n"
+                  << "  C coeff flag : " << t.chroma_coeff_flag_bytes << " B (" << pct(t.chroma_coeff_flag_bytes) << "%)\n";
+        if (t.alpha_coeff_table_bytes + t.alpha_coeff_stream_bytes + t.alpha_coeff_flag_bytes > 0) {
+            std::cerr << "  A coeff tbl  : " << t.alpha_coeff_table_bytes << " B (" << pct(t.alpha_coeff_table_bytes) << "%)\n"
+                      << "  A coeff data : " << t.alpha_coeff_stream_bytes << " B (" << pct(t.alpha_coeff_stream_bytes) << "%)\n"
+                      << "  A coeff flag : " << t.alpha_coeff_flag_bytes << " B (" << pct(t.alpha_coeff_flag_bytes) << "%)\n";
+        }
+    }
+}
+
+
 int main(int argc, char* argv[]) {
     wk::EncoderConfig config;
     std::string input_path;
     std::string output_path;
     std::string exif_source_path;
+    bool tile_stats = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -186,6 +218,8 @@ int main(int argc, char* argv[]) {
             config.subsampling = wk::Subsampling::YUV444;
         } else if (arg == "--yuv420") {
             config.subsampling = wk::Subsampling::YUV420;
+        } else if (arg == "--tile-stats") {
+            tile_stats = true;
         } else if (arg == "--import-exif") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --import-exif requires a donor file\n";
@@ -226,13 +260,25 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    auto encoded = wk::encode(*image, config);
-    if (!encoded) {
-        std::cerr << "Error: encode failed: " << encoded.error().message << '\n';
-        return 1;
+    std::vector<uint8_t> output_bytes;
+    if (tile_stats) {
+        wk::EncodeStats stats;
+        auto encoded = wk::encode_with_stats(*image, config, stats);
+        if (!encoded) {
+            std::cerr << "Error: encode failed: " << encoded.error().message << '\n';
+            return 1;
+        }
+        output_bytes = std::move(*encoded);
+        print_tile_stats(stats);
+    } else {
+        auto encoded = wk::encode(*image, config);
+        if (!encoded) {
+            std::cerr << "Error: encode failed: " << encoded.error().message << '\n';
+            return 1;
+        }
+        output_bytes = std::move(*encoded);
     }
 
-    std::vector<uint8_t> output_bytes = std::move(*encoded);
     if (!exif_source_path.empty()) {
         auto with_exif = apply_exif_metadata(output_bytes, exif_source_path);
         if (!with_exif) {

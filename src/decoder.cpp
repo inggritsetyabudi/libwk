@@ -18,6 +18,7 @@
 #include "container.h"
 #include "dct.h"
 #include "lossy_coeff_stream.h"
+#include "mode_span_rans.h"
 #include "mode_stream.h"
 #include "predict.h"
 #include "quantize.h"
@@ -208,22 +209,25 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     }
     // V7 behaves exactly like V6 for every syntax feature; it only adds
     // the per-block quant-scale streams after the syntax-flags byte.
+    // V8 is V7 plus rANS-coded modes and spans (SPEC 3.2/6).
     const bool is_v7 = *layout_tag == kLossyTileLayoutTagV7;
-    const bool is_v6_family = *layout_tag == kLossyTileLayoutTagV6 || is_v7;
+    const bool is_v8 = *layout_tag == kLossyTileLayoutTagV8;
+    const bool is_v6_family = *layout_tag == kLossyTileLayoutTagV6 || is_v7 || is_v8;
+    const bool has_scale_streams = is_v7 || is_v8;
     const bool packed_mode_streams = *layout_tag == kLossyTileLayoutTagV2 ||
                                      *layout_tag == kLossyTileLayoutTagV3 ||
                                      *layout_tag == kLossyTileLayoutTagV4 ||
                                      *layout_tag == kLossyTileLayoutTagV5 ||
-                                     is_v6_family;
+                                     *layout_tag == kLossyTileLayoutTagV6 || is_v7;
     const bool raw_mode_streams = *layout_tag == kLossyTileLayoutTagV1;
     const bool packed_coefficient_spans = *layout_tag == kLossyTileLayoutTagV3 ||
                                           *layout_tag == kLossyTileLayoutTagV4 ||
                                           *layout_tag == kLossyTileLayoutTagV5 ||
-                                          is_v6_family;
+                                          *layout_tag == kLossyTileLayoutTagV6 || is_v7;
     const bool adaptive_coefficient_tables = *layout_tag == kLossyTileLayoutTagV4 ||
                                              *layout_tag == kLossyTileLayoutTagV5 ||
                                              is_v6_family;
-    if (!packed_mode_streams && !raw_mode_streams) {
+    if (!packed_mode_streams && !raw_mode_streams && !is_v8) {
         return std::unexpected(Error{ErrorCode::DecodeFailed, "unsupported lossy tile layout"});
     }
 
@@ -293,7 +297,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
 
     std::vector<float> y_scales;
     std::vector<float> c_scales;
-    if (is_v7) {
+    if (has_scale_streams) {
         auto y = read_quant_scale_stream(static_cast<size_t>(blocks_x) * blocks_y, "luma");
         if (!y) {
             return std::unexpected(y.error());
@@ -349,20 +353,22 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
         return modes;
     };
 
-    auto y_modes = packed_mode_streams ? read_packed_prediction_modes(reader, num_y_blocks, "luma")
-                                       : read_raw_modes(num_y_blocks, "luma");
+    auto y_modes = is_v8 ? read_rans_prediction_modes(reader, num_y_blocks, "luma")
+                         : packed_mode_streams ? read_packed_prediction_modes(reader, num_y_blocks, "luma")
+                                               : read_raw_modes(num_y_blocks, "luma");
     if (!y_modes) {
         return std::unexpected(y_modes.error());
     }
 
-    auto chroma_modes = packed_mode_streams ? read_packed_prediction_modes(reader, num_c_blocks, "chroma")
-                                            : read_raw_modes(num_c_blocks, "chroma");
+    auto chroma_modes = is_v8 ? read_rans_prediction_modes(reader, num_c_blocks, "chroma")
+                              : packed_mode_streams ? read_packed_prediction_modes(reader, num_c_blocks, "chroma")
+                                                    : read_raw_modes(num_c_blocks, "chroma");
     if (!chroma_modes) {
         return std::unexpected(chroma_modes.error());
     }
 
-    // PLANAR (mode 13) is only valid in layout V7 (SPEC 6).
-    if (!is_v7) {
+    // PLANAR (mode 13) is only valid in layout V7+ (SPEC 6).
+    if (!has_scale_streams) {
         auto uses_planar = [](const std::vector<PredMode>& modes) {
             for (PredMode mode : modes) {
                 if (mode == PredMode::PLANAR) {
@@ -378,7 +384,13 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     }
 
     std::vector<uint8_t> y_spans(num_y_blocks, 64);
-    if (packed_coefficient_spans) {
+    if (is_v8) {
+        auto spans = read_rans_coefficient_spans(reader, num_y_blocks, "luma");
+        if (!spans) {
+            return std::unexpected(spans.error());
+        }
+        y_spans = std::move(*spans);
+    } else if (packed_coefficient_spans) {
         auto spans = adaptive_span_streams
             ? read_adaptive_coefficient_spans(reader, num_y_blocks, "luma")
             : read_packed_coefficient_spans(reader, num_y_blocks, "luma");
@@ -389,7 +401,13 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     }
 
     std::vector<uint8_t> chroma_spans(num_c_blocks, 64);
-    if (packed_coefficient_spans) {
+    if (is_v8) {
+        auto spans = read_rans_coefficient_spans(reader, num_c_blocks, "chroma");
+        if (!spans) {
+            return std::unexpected(spans.error());
+        }
+        chroma_spans = std::move(*spans);
+    } else if (packed_coefficient_spans) {
         auto spans = adaptive_span_streams
             ? read_adaptive_coefficient_spans(reader, num_c_blocks, "chroma")
             : read_packed_coefficient_spans(reader, num_c_blocks, "chroma");
@@ -472,7 +490,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     for (uint32_t by = 0; by < blocks_y; ++by) {
         for (uint32_t bx = 0; bx < blocks_x; ++bx) {
             const size_t block_index = static_cast<size_t>(by) * blocks_x + bx;
-            const float block_scale = is_v7 ? y_scales[block_index] : 1.0f;
+            const float block_scale = has_scale_streams ? y_scales[block_index] : 1.0f;
             DctBlock recon_dct{};
             for (int i = 0; i < 64; ++i) {
                 recon_dct[ZIGZAG_ORDER[i]] = static_cast<float>((*y_coeffs)[block_index][i]) * y_steps[i] * block_scale;
@@ -532,7 +550,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
         for (uint32_t by = 0; by < chroma_blocks_y; ++by) {
             for (uint32_t bx = 0; bx < chroma_blocks_x; ++bx) {
                 const size_t block_index = static_cast<size_t>(by) * chroma_blocks_x + bx;
-                const float block_scale = is_v7 ? c_scales[block_index] : 1.0f;
+                const float block_scale = has_scale_streams ? c_scales[block_index] : 1.0f;
                 DctBlock recon_dct{};
                 for (int i = 0; i < 64; ++i) {
                     recon_dct[ZIGZAG_ORDER[i]] = static_cast<float>(coeffs[block_index][i]) * c_steps[i] * block_scale;
@@ -607,12 +625,13 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
             a_steps[i] = *value;
         }
 
-        auto a_modes = packed_mode_streams ? read_packed_prediction_modes(reader, num_y_blocks, "alpha")
-                                           : read_raw_modes(num_y_blocks, "alpha");
+        auto a_modes = is_v8 ? read_rans_prediction_modes(reader, num_y_blocks, "alpha")
+                             : packed_mode_streams ? read_packed_prediction_modes(reader, num_y_blocks, "alpha")
+                                                   : read_raw_modes(num_y_blocks, "alpha");
         if (!a_modes) {
             return std::unexpected(a_modes.error());
         }
-        if (!is_v7) {
+        if (!has_scale_streams) {
             for (PredMode mode : *a_modes) {
                 if (mode == PredMode::PLANAR) {
                     return std::unexpected(Error{ErrorCode::DecodeFailed,
@@ -622,7 +641,13 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
         }
 
         std::vector<uint8_t> alpha_spans(num_y_blocks, 64);
-        if (packed_coefficient_spans) {
+        if (is_v8) {
+            auto spans = read_rans_coefficient_spans(reader, num_y_blocks, "alpha");
+            if (!spans) {
+                return std::unexpected(spans.error());
+            }
+            alpha_spans = std::move(*spans);
+        } else if (packed_coefficient_spans) {
             auto spans = adaptive_span_streams
                 ? read_adaptive_coefficient_spans(reader, num_y_blocks, "alpha")
                 : read_packed_coefficient_spans(reader, num_y_blocks, "alpha");

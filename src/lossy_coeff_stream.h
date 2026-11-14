@@ -64,18 +64,31 @@ struct DecodedLossyChromaPayload {
     std::vector<DctBlockI16> cr_blocks;
 };
 
+// Byte breakdown of one lossy coefficient payload, for the Phase 1
+// syntax-efficiency work: it tells which part of the payload dominates
+// (the rANS frequency tables, the rANS-coded coefficient data, or the
+// small flag streams), so an optimization targets the biggest piece.
+struct LossyCoeffPayloadStats {
+    size_t flag_bytes = 0;   // significance / sign mode flags
+    size_t table_bytes = 0;  // rANS frequency tables (or table bank)
+    size_t stream_bytes = 0; // rANS-coded coefficient data
+    size_t total_bytes = 0;  // whole payload (== flag + table + stream)
+};
+
 [[nodiscard]] Result<std::vector<uint8_t>> encode_lossy_plane_payload(
     std::span<const DctBlockI16> blocks,
     std::span<const uint8_t> spans,
     uint8_t max_coeff_span,
-    const LossyCoeffStreamConfig& config);
+    const LossyCoeffStreamConfig& config,
+    LossyCoeffPayloadStats* stats = nullptr);
 
 [[nodiscard]] Result<std::vector<uint8_t>> encode_lossy_chroma_payload(
     std::span<const DctBlockI16> cb_blocks,
     std::span<const DctBlockI16> cr_blocks,
     std::span<const uint8_t> spans,
     uint8_t max_coeff_span,
-    const LossyCoeffStreamConfig& config);
+    const LossyCoeffStreamConfig& config,
+    LossyCoeffPayloadStats* stats = nullptr);
 
 [[nodiscard]] Result<std::vector<DctBlockI16>> decode_lossy_plane_payload(
     ByteReader& reader,

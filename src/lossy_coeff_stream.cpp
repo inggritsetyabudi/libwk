@@ -973,7 +973,8 @@ Result<std::vector<uint8_t>> encode_lossy_plane_payload(
     std::span<const DctBlockI16> blocks,
     std::span<const uint8_t> spans,
     uint8_t max_coeff_span,
-    const LossyCoeffStreamConfig& config) {
+    const LossyCoeffStreamConfig& config,
+    LossyCoeffPayloadStats* stats) {
     if (config.use_table_bank && !config.adaptive_coefficient_tables) {
         return std::unexpected(Error{ErrorCode::InvalidParameter,
                                      "coefficient table bank requires adaptive coefficient tables"});
@@ -1088,41 +1089,63 @@ Result<std::vector<uint8_t>> encode_lossy_plane_payload(
         return std::unexpected(cluster_result.error());
     }
 
+    // Byte breakdown (Phase 1 diagnostic): measure each section as it is
+    // written, so the caller can see whether tables or coded data dominate.
+    size_t flag_bytes = 0;
+    size_t table_bytes = 0;
+    size_t stream_bytes = 0;
     if (config.use_significance_maps) {
+        const size_t before = writer.size();
         auto flag_result = write_significance_mode_flags(writer, significance_flags);
         if (!flag_result) {
             return std::unexpected(flag_result.error());
         }
+        flag_bytes += writer.size() - before;
     }
     if (coding.split_magnitude_signs && config.use_adaptive_sign_streams) {
+        const size_t before = writer.size();
         auto sign_result = write_sign_mode_flags(writer, sign_modes);
         if (!sign_result) {
             return std::unexpected(sign_result.error());
         }
+        flag_bytes += writer.size() - before;
     }
 
     if (config.use_table_bank) {
+        const size_t before = writer.size();
         auto bank_result = write_coefficient_table_bank(writer, tables, coding.num_symbols);
         if (!bank_result) {
             return std::unexpected(bank_result.error());
         }
+        table_bytes += writer.size() - before;
     }
 
     const LossyCoeffTable* previous_table = nullptr;
     for (size_t context_index = 0; context_index < tables.size(); ++context_index) {
         if (!config.use_table_bank) {
+            const size_t before = writer.size();
             auto table_result = write_lossy_coeff_table(writer, tables[context_index], coding.num_symbols, config,
                                                         previous_table);
             if (!table_result) {
                 return std::unexpected(table_result.error());
             }
+            table_bytes += writer.size() - before;
             previous_table = &tables[context_index];
         }
+        const size_t before = writer.size();
         auto write_result = write_coeff_context_stream(writer, streams[context_index],
                                                        tables[context_index], coding, config);
         if (!write_result) {
             return std::unexpected(write_result.error());
         }
+        stream_bytes += writer.size() - before;
+    }
+
+    if (stats != nullptr) {
+        stats->flag_bytes = flag_bytes;
+        stats->table_bytes = table_bytes;
+        stats->stream_bytes = stream_bytes;
+        stats->total_bytes = writer.size();
     }
 
     return writer.finish();
@@ -1133,7 +1156,8 @@ Result<std::vector<uint8_t>> encode_lossy_chroma_payload(
     std::span<const DctBlockI16> cr_blocks,
     std::span<const uint8_t> spans,
     uint8_t max_coeff_span,
-    const LossyCoeffStreamConfig& config) {
+    const LossyCoeffStreamConfig& config,
+    LossyCoeffPayloadStats* stats) {
     if (config.use_table_bank && !config.adaptive_coefficient_tables) {
         return std::unexpected(Error{ErrorCode::InvalidParameter,
                                      "coefficient table bank requires adaptive coefficient tables"});
@@ -1282,50 +1306,75 @@ Result<std::vector<uint8_t>> encode_lossy_chroma_payload(
         return std::unexpected(cluster_result.error());
     }
 
+    // Byte breakdown (Phase 1 diagnostic): see encode_lossy_plane_payload.
+    size_t flag_bytes = 0;
+    size_t table_bytes = 0;
+    size_t stream_bytes = 0;
     if (config.use_significance_maps) {
+        const size_t before = writer.size();
         auto flag_result = write_significance_mode_flags(writer, significance_flags);
         if (!flag_result) {
             return std::unexpected(flag_result.error());
         }
+        flag_bytes += writer.size() - before;
     }
     if (coding.split_magnitude_signs && config.use_adaptive_sign_streams) {
+        const size_t before = writer.size();
         auto cb_sign_result = write_sign_mode_flags(writer, cb_sign_modes);
         if (!cb_sign_result) {
             return std::unexpected(cb_sign_result.error());
         }
+        flag_bytes += writer.size() - before;
+        const size_t before_cr = writer.size();
         auto cr_sign_result = write_sign_mode_flags(writer, cr_sign_modes);
         if (!cr_sign_result) {
             return std::unexpected(cr_sign_result.error());
         }
+        flag_bytes += writer.size() - before_cr;
     }
 
     if (config.use_table_bank) {
+        const size_t before = writer.size();
         auto bank_result = write_coefficient_table_bank(writer, tables, coding.num_symbols);
         if (!bank_result) {
             return std::unexpected(bank_result.error());
         }
+        table_bytes += writer.size() - before;
     }
 
     const LossyCoeffTable* previous_table = nullptr;
     for (size_t context_index = 0; context_index < tables.size(); ++context_index) {
         if (!config.use_table_bank) {
+            const size_t before = writer.size();
             auto table_result = write_lossy_coeff_table(writer, tables[context_index], coding.num_symbols, config,
                                                         previous_table);
             if (!table_result) {
                 return std::unexpected(table_result.error());
             }
+            table_bytes += writer.size() - before;
             previous_table = &tables[context_index];
         }
+        const size_t before_cb = writer.size();
         auto write_cb = write_coeff_context_stream(writer, cb_streams[context_index],
                                                    tables[context_index], coding, config);
         if (!write_cb) {
             return std::unexpected(write_cb.error());
         }
+        stream_bytes += writer.size() - before_cb;
+        const size_t before_cr = writer.size();
         auto write_cr = write_coeff_context_stream(writer, cr_streams[context_index],
                                                    tables[context_index], coding, config);
         if (!write_cr) {
             return std::unexpected(write_cr.error());
         }
+        stream_bytes += writer.size() - before_cr;
+    }
+
+    if (stats != nullptr) {
+        stats->flag_bytes = flag_bytes;
+        stats->table_bytes = table_bytes;
+        stats->stream_bytes = stream_bytes;
+        stats->total_bytes = writer.size();
     }
 
     return writer.finish();
