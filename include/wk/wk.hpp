@@ -181,8 +181,9 @@ namespace wk
         // is YUV444, each tile is encoded YUV420 or YUV444 from its
         // source chroma Laplacian (see adaptive_chroma.h). A tile whose
         // chroma is subsampled is written with layout V11 and flagged
-        // in the tile header. Default off.
-        bool adaptive_chroma_subsampling = false;
+        // in the tile header. Default on since 2026-11-14 (measured:
+        // -13.3% @ -0.59 dB q75, visually clean; set false for pure 444).
+        bool adaptive_chroma_subsampling = true;
         // Laplacian threshold for the adaptive decision above: a tile
         // with c_lap below this is subsampled. Measured 2026-11-14:
         // 2.1 selects exactly the oracle tile set at 1024px tiles

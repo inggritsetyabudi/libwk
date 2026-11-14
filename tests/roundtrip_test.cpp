@@ -647,6 +647,9 @@ TEST(RoundtripTest, SeedBoostFixesRampAtQ50) {
     EncoderConfig config;
     config.quality = 50.0f;
     config.subsampling = Subsampling::YUV444;
+    // Seed boost is a 444-chroma fixture: the smooth ramp below would
+    // otherwise be subsampled (V11) and the tag check would not hold.
+    config.adaptive_chroma_subsampling = false;
 
     auto encoded = encode(image, config);
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
@@ -862,6 +865,8 @@ TEST(RoundtripTest, PackedCoefficientSpanCorruptionRejected) {
     EncoderConfig config;
     config.quality = 85.0f;
     config.subsampling = Subsampling::YUV444;
+    // Fixture needs 444 chroma (packed modes, 9 chroma blocks).
+    config.adaptive_chroma_subsampling = false;
 
     auto encoded = encode(image, config);
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
@@ -921,6 +926,8 @@ TEST(RoundtripTest, CoefficientSignCorruptionRejected) {
     EncoderConfig config;
     config.quality = 85.0f;
     config.subsampling = Subsampling::YUV444;
+    // Fixture needs 444 chroma (packed modes, 64 chroma blocks).
+    config.adaptive_chroma_subsampling = false;
 
     auto encoded = encode(image, config);
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
@@ -1168,6 +1175,8 @@ TEST(RoundtripTest, PlaneCoefficientExtentCorruptionRejected) {
     EncoderConfig config;
     config.quality = 85.0f;
     config.subsampling = Subsampling::YUV444;
+    // Fixture needs 444 chroma (packed-mode offset arithmetic).
+    config.adaptive_chroma_subsampling = false;
 
     auto encoded = encode(image, config);
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
@@ -1210,6 +1219,8 @@ TEST(RoundtripTest, CoefficientTableCorruptionRejected) {
     EncoderConfig config;
     config.quality = 85.0f;
     config.subsampling = Subsampling::YUV444;
+    // Fixture needs 444 chroma (packed-mode offset arithmetic).
+    config.adaptive_chroma_subsampling = false;
 
     auto encoded = encode(image, config);
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
@@ -1928,6 +1939,8 @@ TEST(RoundtripTest, V7OnlyWhenPlanarOrScaleUsed) {
     EncoderConfig config;
     config.quality = 75.0f;
     config.subsampling = Subsampling::YUV444;
+    // Fixture needs 444 chroma (64 chroma blocks, V7-V10 layouts).
+    config.adaptive_chroma_subsampling = false;
 
     auto layout_tag_of = [](const Image& image, const EncoderConfig& cfg) {
         auto encoded = encode(image, cfg);
@@ -2059,6 +2072,9 @@ TEST(RoundtripTest, V7EmptyScaleListsDecodeIdenticalToV6) {
     // The control field is on by default; this fixture needs a plain
     // V6 tile, so turn it off explicitly.
     config.use_control_field = false;
+    // Same for adaptive subsampling: the checkerboard's constant
+    // chroma would otherwise be subsampled (V11), not V6.
+    config.adaptive_chroma_subsampling = false;
 
     auto encoded = encode(image, config);
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
