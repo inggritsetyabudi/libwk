@@ -193,6 +193,12 @@ namespace wk
         size_t alpha_coeff_stream_bytes = 0;
         size_t alpha_coeff_flag_bytes = 0;
         size_t total_bytes = 0;  // whole tile payload (excl. 9B header)
+        // Serialized coeff-stream bytes per coefficient position in
+        // zigzag order (0 = DC), for the coeff-squeezing work.
+        std::array<size_t, 64> y_position_stream_bytes{};
+        std::array<size_t, 64> chroma_position_stream_bytes{};
+        size_t y_sign_bytes = 0;      // packed sign bits, luma
+        size_t chroma_sign_bytes = 0; // packed sign bits, chroma
     };
 
     struct EncodeStats

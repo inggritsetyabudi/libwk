@@ -1711,6 +1711,11 @@ static Result<TileEncodeResult> encode_lossy_tile(
                     chroma_stats.table_bytes = cb_stats.table_bytes + cr_stats.table_bytes;
                     chroma_stats.stream_bytes = cb_stats.stream_bytes + cr_stats.stream_bytes;
                     chroma_stats.total_bytes = cb_stats.total_bytes + cr_stats.total_bytes;
+                    chroma_stats.sign_bytes = cb_stats.sign_bytes + cr_stats.sign_bytes;
+                    for (size_t i = 0; i < 64; ++i) {
+                        chroma_stats.position_stream_bytes[i] =
+                            cb_stats.position_stream_bytes[i] + cr_stats.position_stream_bytes[i];
+                    }
                 } else {
                     chroma_stats = {};
                 }
@@ -1741,6 +1746,10 @@ static Result<TileEncodeResult> encode_lossy_tile(
         stats->alpha_coeff_table_bytes = alpha_stats.table_bytes;
         stats->alpha_coeff_stream_bytes = alpha_stats.stream_bytes;
         stats->alpha_coeff_flag_bytes = alpha_stats.flag_bytes;
+        stats->y_position_stream_bytes = y_stats.position_stream_bytes;
+        stats->chroma_position_stream_bytes = chroma_stats.position_stream_bytes;
+        stats->y_sign_bytes = y_stats.sign_bytes;
+        stats->chroma_sign_bytes = chroma_stats.sign_bytes;
         stats->total_bytes = result.compressed.size();
         result.stats = *stats;
     }

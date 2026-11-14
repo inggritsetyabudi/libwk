@@ -1121,6 +1121,7 @@ Result<std::vector<uint8_t>> encode_lossy_plane_payload(
     }
 
     const LossyCoeffTable* previous_table = nullptr;
+    std::array<size_t, 64> position_stream_bytes{};
     for (size_t context_index = 0; context_index < tables.size(); ++context_index) {
         if (!config.use_table_bank) {
             const size_t before = writer.size();
@@ -1138,7 +1139,11 @@ Result<std::vector<uint8_t>> encode_lossy_plane_payload(
         if (!write_result) {
             return std::unexpected(write_result.error());
         }
-        stream_bytes += writer.size() - before;
+        const size_t stream_delta = writer.size() - before;
+        stream_bytes += stream_delta;
+        if (context_index < position_stream_bytes.size()) {
+            position_stream_bytes[context_index] = stream_delta;
+        }
     }
 
     if (stats != nullptr) {
@@ -1146,6 +1151,10 @@ Result<std::vector<uint8_t>> encode_lossy_plane_payload(
         stats->table_bytes = table_bytes;
         stats->stream_bytes = stream_bytes;
         stats->total_bytes = writer.size();
+        stats->position_stream_bytes = position_stream_bytes;
+        size_t sign_total = 0;
+        for (const auto& s : streams) sign_total += s.sign_bits.size();
+        stats->sign_bytes = sign_total;
     }
 
     return writer.finish();
@@ -1343,6 +1352,7 @@ Result<std::vector<uint8_t>> encode_lossy_chroma_payload(
     }
 
     const LossyCoeffTable* previous_table = nullptr;
+    std::array<size_t, 64> position_stream_bytes{};
     for (size_t context_index = 0; context_index < tables.size(); ++context_index) {
         if (!config.use_table_bank) {
             const size_t before = writer.size();
@@ -1360,14 +1370,19 @@ Result<std::vector<uint8_t>> encode_lossy_chroma_payload(
         if (!write_cb) {
             return std::unexpected(write_cb.error());
         }
-        stream_bytes += writer.size() - before_cb;
+        const size_t cb_delta = writer.size() - before_cb;
+        stream_bytes += cb_delta;
         const size_t before_cr = writer.size();
         auto write_cr = write_coeff_context_stream(writer, cr_streams[context_index],
                                                    tables[context_index], coding, config);
         if (!write_cr) {
             return std::unexpected(write_cr.error());
         }
-        stream_bytes += writer.size() - before_cr;
+        const size_t cr_delta = writer.size() - before_cr;
+        stream_bytes += cr_delta;
+        if (context_index < position_stream_bytes.size()) {
+            position_stream_bytes[context_index] = cb_delta + cr_delta;
+        }
     }
 
     if (stats != nullptr) {
@@ -1375,6 +1390,11 @@ Result<std::vector<uint8_t>> encode_lossy_chroma_payload(
         stats->table_bytes = table_bytes;
         stats->stream_bytes = stream_bytes;
         stats->total_bytes = writer.size();
+        stats->position_stream_bytes = position_stream_bytes;
+        size_t sign_total = 0;
+        for (const auto& s : cb_streams) sign_total += s.sign_bits.size();
+        for (const auto& s : cr_streams) sign_total += s.sign_bits.size();
+        stats->sign_bytes = sign_total;
     }
 
     return writer.finish();
