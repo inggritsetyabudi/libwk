@@ -1,4 +1,4 @@
-# WK Image Format — Bitstream Specification v0.2.6
+# WK Image Format — Bitstream Specification v0.2.7
 
 **MIME type:** `image/x-wk`  
 **File extension:** `.wk`  
@@ -14,6 +14,8 @@
 **v0.2.3 changes:** lossless frequency tables use the adaptive coefficient-table encoding (transform-flags bit 1, see §3.3) instead of raw 256 x uint16. Legacy files (bit 1 clear) still decode. The container format is unchanged.
 
 **v0.2.5 changes:** lossy layout `0x3a4d4843` (V10) adds cross-component linear model (CCLM) chroma prediction (see §6). V10 is V9 plus a 15th prediction mode (mode 14, CCLM, chroma-only): a chroma block may be predicted from its co-located reconstructed luma as `a*luma + b`, with `(a, b)` derived from the neighbouring reconstructed luma/chroma by integer least squares (Q8 fixed point), so nothing per block is signalled beyond the mode itself. The encoder writes V10 only when at least one chroma block's RDO picks CCLM; otherwise it writes V9/V8/V7/V6 as before. The container format (`0x0001`) is unchanged and V1–V9 files decode identically.
+
+**v0.2.7 changes:** lossless predictor mode 13 (MED, JPEG-LS median edge detector) added to §3.3; the predictor mode byte is now 0..13. The encoder picks the best of SELECT / MED / CLAMP_ADD per tile by true coded size (measured 2026-11-15 on the 6 benchmark photos: MED is the best single predictor on every non-palette photo, −1.83% total vs the old hardcoded SELECT; GAP was measured and rejected, +19% worse). A decoder MUST reject a predictor mode ≥ 14. Files written before 0.2.7 (modes 0..12) decode unchanged.
 
 **v0.2.6 changes:** lossy layout `0x3b4d4843` (V11) adds per-tile chroma subsampling: a tile's chroma may be YUV420 or YUV444 independently of the other tiles, signalled by `layer_flags` bit 3 (`TILE_CHROMA_420`, see §3.1) in the tile header. V11 is V10 in every other respect (rANS modes with the 15-symbol alphabet, superblock quant map always present, CCLM allowed). The encoder writes V11 for a tile whose chroma is subsampled; the decision is per tile from the source chroma Laplacian `c_lap` (mean |4·C − up − down − left − right| over Cb and Cr, interior pixels of the tile): `c_lap < 2.1` → YUV420, else YUV444. (2.1, not 2.0: the encoder measures c_lap on its int16 chroma planes, and integer rounding adds a small positive bias versus the float reference the 2.0 value was validated on; 2.1 reproduces the same tile selection, still far inside the robust range — the dangerous tile sits at 6.9.) Measured 2026-11-14 (6 benchmark photos): q75 files −13.3% at −0.59 dB whole-image PSNR, q85 −13.1% at −1.10 dB; the criterion selects exactly the oracle tile set at the default 1024px tile size. A V11 tile is rejected by decoders that do not know layout `0x3b4d4843`; V1–V10 files decode unchanged.
 
@@ -187,7 +189,7 @@ FILE HEADER (magic + version)
 ### 3.3 Lossless Tile Payload
 
 1. **Transform flags**: uint8. Bit 0 = palette mode. Bit 1 = adaptive frequency tables (see below); only valid on the non-palette path. Bits 2–7 are reserved and must be zero; a decoder MUST reject a tile with reserved bits set, or with bit 1 set on the palette path.
-2. **Predictor mode**: uint8 (0..12)
+2. **Predictor mode**: uint8 (0..13). Modes 0..12 are the original predictors (NONE, L, T, TR, TL, AVG_LT, AVG_LTR, AVG_LTL, AVG_TTR, AVG_TTL, AVG_LTRTL, SELECT, CLAMP_ADD); mode 13 is MED, the JPEG-LS median edge detector: if `tl >= max(l, t)` predict `min(l, t)`; else if `tl <= min(l, t)` predict `max(l, t)`; else predict `l + t - tl`. A decoder MUST reject a predictor mode ≥ 14.
 3. **Per-channel data**: frequency table + rANS bitstream. When transform-flags bit 1 is clear (legacy), the table is raw: 256 x uint16 frequencies (512 B per channel). When bit 1 is set, the table is written with the adaptive coefficient-table encoding (`write_coefficient_table`, 256 symbols: single-symbol / sparse-pairs / dense-range forms, whichever is smallest). The adaptive form is never more than ~5 B larger than raw per channel and is typically far smaller: on photo residuals most tables are sparse (e.g. mira: 2048 B raw -> 834 B adaptive; the alpha channel alone drops from 512 B to 11 B). Small tiles benefit most — a 64x64 photo tile drops from 4770 B to 3178 B (-33%) because the fixed 2048 B table cost dominated it.
 
 ---

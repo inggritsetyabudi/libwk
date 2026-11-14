@@ -26,6 +26,7 @@
 #include <system_error>
 #include <vector>
 #include "tool_common.h"
+#include "tool_log.h"
 
 namespace {
 
@@ -145,8 +146,10 @@ void print_usage() {
     std::cerr
         << "Usage: wkmetric [options] <reference.{wk,jpg,jpeg,png,ppm}> <candidate.{wk,jpg,jpeg,png,ppm}>\n\n"
         << "Options:\n"
-        << "  --json      Print metrics as JSON\n"
-        << "  --rgb-only  Ignore alpha even if both inputs have it\n";
+        << "  --json      Print metrics as JSON (never colorized)\n"
+        << "  --rgb-only  Ignore alpha even if both inputs have it\n"
+        << "  --color     Force colored PSNR/SSIM in the text report\n"
+        << "  --no-color  Disable colored PSNR/SSIM in the text report\n";
 }
 
 void print_text_report(std::string_view reference_path,
@@ -170,8 +173,8 @@ void print_text_report(std::string_view reference_path,
     std::cout
         << "MAE:            " << metrics.mae << '\n'
         << "MSE:            " << metrics.mse << '\n'
-        << "PSNR:           " << metrics.psnr << " dB\n"
-        << "SSIM:           " << metrics.ssim << '\n';
+        << "PSNR:           " << wk::tool::color_psnr(metrics.psnr, wk::tool::stdout_color_enabled()) << " dB\n"
+        << "SSIM:           " << wk::tool::color_ssim(metrics.ssim, wk::tool::stdout_color_enabled()) << '\n';
 
     for (uint8_t channel_index = 0; channel_index < metrics.compared_channels; ++channel_index) {
         const auto& channel = metrics.channels[channel_index];
@@ -179,8 +182,8 @@ void print_text_report(std::string_view reference_path,
             << channel_label(channel_index) << ":"
             << " MAE=" << channel.mae
             << " MSE=" << channel.mse
-            << " PSNR=" << channel.psnr
-            << " SSIM=" << channel.ssim
+            << " PSNR=" << wk::tool::color_psnr(channel.psnr, wk::tool::stdout_color_enabled())
+            << " SSIM=" << wk::tool::color_ssim(channel.ssim, wk::tool::stdout_color_enabled())
             << '\n';
     }
 
@@ -191,8 +194,8 @@ void print_text_report(std::string_view reference_path,
             << plane_label(static_cast<uint8_t>(plane_index)) << ":"
             << " MAE=" << plane.mae
             << " MSE=" << plane.mse
-            << " PSNR=" << plane.psnr
-            << " SSIM=" << plane.ssim
+            << " PSNR=" << wk::tool::color_psnr(plane.psnr, wk::tool::stdout_color_enabled())
+            << " SSIM=" << wk::tool::color_ssim(plane.ssim, wk::tool::stdout_color_enabled())
             << '\n';
     }
 
@@ -294,6 +297,10 @@ int main(int argc, char* argv[]) {
             json_output = true;
         } else if (arg == "--rgb-only") {
             include_alpha = false;
+        } else if (arg == "--color") {
+            wk::tool::set_log_color(true);
+        } else if (arg == "--no-color") {
+            wk::tool::set_log_color(false);
         } else if (arg == "-h" || arg == "--help") {
             print_usage();
             return 0;

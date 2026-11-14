@@ -19,7 +19,9 @@
 #include "../src/container.h"
 #include "../src/exif_import.h"
 #include "../src/image_io.h"
+#include "../src/metrics.h"
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -27,6 +29,7 @@
 #include <string_view>
 #include <vector>
 #include "tool_common.h"
+#include "tool_log.h"
 
 namespace {
 
@@ -137,6 +140,11 @@ void print_usage() {
         << "  --chroma-lap-threshold F\n"
         << "                          Laplacian threshold for adaptive subsampling (default: 2.1)\n"
         << "  --import-exif FILE      Import EXIF from JPEG/TIFF donor file\n"
+        << "  --metrics               Decode the output and report PSNR/SSIM vs the source\n"
+        << "  -v, --verbose           Show debug logs (per-step detail)\n"
+        << "  -q, --quiet             Only warnings and errors\n"
+        << "  --color                 Force colored log output\n"
+        << "  --no-color              Disable colored log output\n"
         << "  --version               Print version\n"
         << "  -h, --help              Show this help\n\n"
         << "Defaults:\n"
@@ -216,6 +224,7 @@ int main(int argc, char* argv[]) {
     std::string exif_source_path;
     bool tile_stats = false;
     bool coeff_stats = false;
+    bool metrics = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -297,6 +306,16 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             exif_source_path = argv[++i];
+        } else if (arg == "--metrics") {
+            metrics = true;
+        } else if (arg == "-v" || arg == "--verbose") {
+            wk::tool::set_log_level(wk::tool::LogLevel::Debug);
+        } else if (arg == "-q" || arg == "--quiet") {
+            wk::tool::set_log_level(wk::tool::LogLevel::Warn);
+        } else if (arg == "--color") {
+            wk::tool::set_log_color(true);
+        } else if (arg == "--no-color") {
+            wk::tool::set_log_color(false);
         } else if (arg == "--version") {
             std::cout << wk::version() << '\n';
             return 0;
@@ -327,16 +346,26 @@ int main(int argc, char* argv[]) {
 
     auto image = wk::io::load_image_file(input_path);
     if (!image) {
-        std::cerr << "Error: failed to load input image: " << image.error().message << '\n';
+        wk::tool::log_error("failed to load input image: " + image.error().message);
         return 1;
     }
+    wk::tool::log_info("loaded " + input_path + " (" + std::to_string(image->width()) + "x" +
+                       std::to_string(image->height()) + ", " +
+                       (image->has_alpha() ? "RGBA" : "RGB") + ")");
+    wk::tool::log_debug(std::string("encoding: ") + (config.lossless ? "lossless" : "lossy") +
+                        (config.lossless ? "" : " q" + std::to_string(static_cast<int>(config.quality))) +
+                        ", tile " + (config.tile_size_log2 == 0
+                                         ? std::string("auto")
+                                         : std::to_string(1u << config.tile_size_log2) + "px") +
+                        ", adaptive chroma " + (config.adaptive_chroma_subsampling ? "on" : "off") +
+                        ", CCLM " + (config.use_cclm ? "on" : "off"));
 
     std::vector<uint8_t> output_bytes;
     if (tile_stats) {
         wk::EncodeStats stats;
         auto encoded = wk::encode_with_stats(*image, config, stats);
         if (!encoded) {
-            std::cerr << "Error: encode failed: " << encoded.error().message << '\n';
+            wk::tool::log_error("encode failed: " + encoded.error().message);
             return 1;
         }
         output_bytes = std::move(*encoded);
@@ -345,16 +374,17 @@ int main(int argc, char* argv[]) {
     } else {
         auto encoded = wk::encode(*image, config);
         if (!encoded) {
-            std::cerr << "Error: encode failed: " << encoded.error().message << '\n';
+            wk::tool::log_error("encode failed: " + encoded.error().message);
             return 1;
         }
         output_bytes = std::move(*encoded);
     }
+    wk::tool::log_debug("encoded to " + std::to_string(output_bytes.size()) + " B in memory");
 
     if (!exif_source_path.empty()) {
         auto with_exif = apply_exif_metadata(output_bytes, exif_source_path);
         if (!with_exif) {
-            std::cerr << "Error: EXIF import failed: " << with_exif.error().message << '\n';
+            wk::tool::log_error("EXIF import failed: " + with_exif.error().message);
             return 1;
         }
         output_bytes = std::move(*with_exif);
@@ -362,20 +392,39 @@ int main(int argc, char* argv[]) {
 
     std::ofstream output(output_path, std::ios::binary);
     if (!output) {
-        std::cerr << "Error: failed to open output file\n";
+        wk::tool::log_error("failed to open output file " + output_path);
         return 1;
     }
     output.write(reinterpret_cast<const char*>(output_bytes.data()), static_cast<std::streamsize>(output_bytes.size()));
     if (!output) {
-        std::cerr << "Error: failed to write output file\n";
+        wk::tool::log_error("failed to write output file " + output_path);
         return 1;
     }
 
     const double raw_bytes = static_cast<double>(image->pixels().size());
     const double ratio = output_bytes.empty() ? 0.0 : raw_bytes / static_cast<double>(output_bytes.size());
-    std::cerr << "Encoded " << input_path << " -> " << output_path
-              << " (" << image->width() << 'x' << image->height()
-              << ", " << (config.lossless ? "lossless" : "lossy")
-              << ", " << output_bytes.size() << " bytes, ratio " << ratio << "x)\n";
+    char ratio_buf[32];
+    std::snprintf(ratio_buf, sizeof(ratio_buf), "%.2f", ratio);
+    wk::tool::log_ok("encoded " + input_path + " -> " + output_path + " (" +
+                     std::to_string(image->width()) + "x" + std::to_string(image->height()) + ", " +
+                     (config.lossless ? "lossless" : "lossy") + ", " +
+                     std::to_string(output_bytes.size()) + " B, ratio " + ratio_buf + "x)");
+
+    if (metrics) {
+        // Decode the just-written bytes and compare against the source:
+        // encode + metrics in one run, so a bad encode is visible at once.
+        auto decoded = wk::decode(output_bytes);
+        if (!decoded) {
+            wk::tool::log_warn("metrics skipped: could not decode output: " + decoded.error().message);
+            return 0;
+        }
+        auto m = wk::metrics::compare_images(*image, *decoded);
+        if (!m) {
+            wk::tool::log_warn("metrics skipped: compare failed: " + m.error().message);
+            return 0;
+        }
+        wk::tool::log_info("metrics: PSNR " + wk::tool::color_psnr(m->psnr, wk::tool::log_color_enabled()) +
+                           " dB, SSIM " + wk::tool::color_ssim(m->ssim, wk::tool::log_color_enabled()));
+    }
     return 0;
 }
