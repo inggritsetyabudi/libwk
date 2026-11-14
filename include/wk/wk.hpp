@@ -169,6 +169,14 @@ namespace wk
         // identity. Default on since 2026-11-14 (measured: q75 files
         // -0.47%, q85 -0.25%, PSNR -0.09/-0.05 dB, SSIM flat).
         bool use_control_field = true;
+        // Cross-component linear model (CCLM) chroma prediction (V10):
+        // predict each chroma block from its co-located reconstructed
+        // luma as a*luma + b, with (a, b) derived from the neighbours.
+        // Default on since 2026-11-14 (measured: chroma residual
+        // energy -41% to -59% across the 6 benchmark photos, upper
+        // bound from the per-block optimal fit). Set false to disable
+        // CCLM (the encoder then never emits layout V10).
+        bool use_cclm = true;
         // Reserved: accepted but currently ignored -- no
         // SSIMULACRA2-targeted mode exists yet (the wkenc flag was
         // removed rather than advertise a no-op).
