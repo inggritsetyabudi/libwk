@@ -22,6 +22,7 @@
 #include "mode_stream.h"
 #include "predict.h"
 #include "quantize.h"
+#include "superblock_quant.h"
 #include "colorspace.h"
 #include "lossless.h"
 #include <wk/wk.hpp>
@@ -210,10 +211,12 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     // V7 behaves exactly like V6 for every syntax feature; it only adds
     // the per-block quant-scale streams after the syntax-flags byte.
     // V8 is V7 plus rANS-coded modes and spans (SPEC 3.2/6).
+    // V9 is V8 plus the superblock quant map after the scale streams.
     const bool is_v7 = *layout_tag == kLossyTileLayoutTagV7;
     const bool is_v8 = *layout_tag == kLossyTileLayoutTagV8;
-    const bool is_v6_family = *layout_tag == kLossyTileLayoutTagV6 || is_v7 || is_v8;
-    const bool has_scale_streams = is_v7 || is_v8;
+    const bool is_v9 = *layout_tag == kLossyTileLayoutTagV9;
+    const bool is_v6_family = *layout_tag == kLossyTileLayoutTagV6 || is_v7 || is_v8 || is_v9;
+    const bool has_scale_streams = is_v7 || is_v8 || is_v9;
     const bool packed_mode_streams = *layout_tag == kLossyTileLayoutTagV2 ||
                                      *layout_tag == kLossyTileLayoutTagV3 ||
                                      *layout_tag == kLossyTileLayoutTagV4 ||
@@ -227,7 +230,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     const bool adaptive_coefficient_tables = *layout_tag == kLossyTileLayoutTagV4 ||
                                              *layout_tag == kLossyTileLayoutTagV5 ||
                                              is_v6_family;
-    if (!packed_mode_streams && !raw_mode_streams && !is_v8) {
+    if (!packed_mode_streams && !raw_mode_streams && !is_v8 && !is_v9) {
         return std::unexpected(Error{ErrorCode::DecodeFailed, "unsupported lossy tile layout"});
     }
 
@@ -309,6 +312,21 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
         }
         c_scales = std::move(*c);
     }
+
+    // V9 superblock quant map (SPEC 3.2): one sparse list, shared by
+    // luma and chroma, read immediately after the per-block scale
+    // streams. Effective scale for a block: its per-block scale when
+    // non-identity, else its superblock's scale, else 1.0.
+    std::vector<uint8_t> superblock_scales;
+    if (is_v9) {
+        const size_t superblock_count =
+            static_cast<size_t>(superblocks_x(blocks_x)) * superblocks_y(blocks_y);
+        auto map = read_superblock_quant_map(reader, superblock_count);
+        if (!map) {
+            return std::unexpected(map.error());
+        }
+        superblock_scales = std::move(*map);
+    }
     const bool adaptive_span_streams = is_v6_family &&
         (syntax_flags & kLossyTileSyntaxFlagAdaptiveSpanStreams) != 0;
     const bool split_magnitude_signs = is_v6_family &&
@@ -353,14 +371,14 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
         return modes;
     };
 
-    auto y_modes = is_v8 ? read_rans_prediction_modes(reader, num_y_blocks, "luma")
+    auto y_modes = (is_v8 || is_v9) ? read_rans_prediction_modes(reader, num_y_blocks, "luma")
                          : packed_mode_streams ? read_packed_prediction_modes(reader, num_y_blocks, "luma")
                                                : read_raw_modes(num_y_blocks, "luma");
     if (!y_modes) {
         return std::unexpected(y_modes.error());
     }
 
-    auto chroma_modes = is_v8 ? read_rans_prediction_modes(reader, num_c_blocks, "chroma")
+    auto chroma_modes = (is_v8 || is_v9) ? read_rans_prediction_modes(reader, num_c_blocks, "chroma")
                               : packed_mode_streams ? read_packed_prediction_modes(reader, num_c_blocks, "chroma")
                                                     : read_raw_modes(num_c_blocks, "chroma");
     if (!chroma_modes) {
@@ -384,7 +402,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     }
 
     std::vector<uint8_t> y_spans(num_y_blocks, 64);
-    if (is_v8) {
+    if (is_v8 || is_v9) {
         auto spans = read_rans_coefficient_spans(reader, num_y_blocks, "luma");
         if (!spans) {
             return std::unexpected(spans.error());
@@ -401,7 +419,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     }
 
     std::vector<uint8_t> chroma_spans(num_c_blocks, 64);
-    if (is_v8) {
+    if (is_v8 || is_v9) {
         auto spans = read_rans_coefficient_spans(reader, num_c_blocks, "chroma");
         if (!spans) {
             return std::unexpected(spans.error());
@@ -490,7 +508,11 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
     for (uint32_t by = 0; by < blocks_y; ++by) {
         for (uint32_t bx = 0; bx < blocks_x; ++bx) {
             const size_t block_index = static_cast<size_t>(by) * blocks_x + bx;
-            const float block_scale = has_scale_streams ? y_scales[block_index] : 1.0f;
+            float block_scale = has_scale_streams ? y_scales[block_index] : 1.0f;
+            if (is_v9 && block_scale == 1.0f) {
+                const uint8_t sb = superblock_scale_for(superblock_scales, blocks_x, bx, by);
+                block_scale = QuantTable::kQuantScaleFactors[sb];
+            }
             DctBlock recon_dct{};
             for (int i = 0; i < 64; ++i) {
                 recon_dct[ZIGZAG_ORDER[i]] = static_cast<float>((*y_coeffs)[block_index][i]) * y_steps[i] * block_scale;
@@ -550,7 +572,18 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
         for (uint32_t by = 0; by < chroma_blocks_y; ++by) {
             for (uint32_t bx = 0; bx < chroma_blocks_x; ++bx) {
                 const size_t block_index = static_cast<size_t>(by) * chroma_blocks_x + bx;
-                const float block_scale = has_scale_streams ? c_scales[block_index] : 1.0f;
+                float block_scale = has_scale_streams ? c_scales[block_index] : 1.0f;
+                if (is_v9 && block_scale == 1.0f) {
+                    // Chroma is luma-block indexed; map to the
+                    // top-left covered luma block, as in the encoder.
+                    const uint32_t luma_bx =
+                        subsampling == ChromaSubsampling::YUV420 ? bx * 2 : bx;
+                    const uint32_t luma_by =
+                        subsampling == ChromaSubsampling::YUV420 ? by * 2 : by;
+                    const uint8_t sb = superblock_scale_for(
+                        superblock_scales, blocks_x, luma_bx, luma_by);
+                    block_scale = QuantTable::kQuantScaleFactors[sb];
+                }
                 DctBlock recon_dct{};
                 for (int i = 0; i < 64; ++i) {
                     recon_dct[ZIGZAG_ORDER[i]] = static_cast<float>(coeffs[block_index][i]) * c_steps[i] * block_scale;
@@ -625,7 +658,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
             a_steps[i] = *value;
         }
 
-        auto a_modes = is_v8 ? read_rans_prediction_modes(reader, num_y_blocks, "alpha")
+        auto a_modes = (is_v8 || is_v9) ? read_rans_prediction_modes(reader, num_y_blocks, "alpha")
                              : packed_mode_streams ? read_packed_prediction_modes(reader, num_y_blocks, "alpha")
                                                    : read_raw_modes(num_y_blocks, "alpha");
         if (!a_modes) {
@@ -641,7 +674,7 @@ Result<TileDecodeResult> decode_lossy_tile(std::span<const uint8_t> tile_data,
         }
 
         std::vector<uint8_t> alpha_spans(num_y_blocks, 64);
-        if (is_v8) {
+        if (is_v8 || is_v9) {
             auto spans = read_rans_coefficient_spans(reader, num_y_blocks, "alpha");
             if (!spans) {
                 return std::unexpected(spans.error());

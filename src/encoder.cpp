@@ -17,6 +17,7 @@
 #include "coeff_span_stream.h"
 #include "container.h"
 #include "control_field.h"
+#include "superblock_quant.h"
 #include "dct.h"
 #include "lossy_coeff_stream.h"
 #include "mode_span_rans.h"
@@ -513,18 +514,19 @@ static Result<TileEncodeResult> encode_lossy_tile(
     }
 
     // Phase 2 control field: per-block content analysis of this tile's
-    // luma. When enabled, its quant-scale suggestion becomes the
-    // block's scale (the seed boost below still overrides it for seed
-    // blocks). Computed once per tile, not per block.
+    // luma. Phase 3 aggregates it to a per-superblock quant map (V9);
+    // the per-block V7 scales proved too expensive to signal for a
+    // dense field (see superblock_quant.h), so the field's per-block
+    // scale is NOT used directly — only its superblock aggregate is.
     const std::vector<BlockControl> control_field =
         use_control_field ? analyze_control_field(tile_y_data.data(), tw, th)
                           : std::vector<BlockControl>{};
-    const auto control_scale_for = [&](uint32_t bx, uint32_t by) -> uint8_t {
-        if (control_field.empty()) return QuantTable::kQuantScaleIdentity;
-        const size_t idx = static_cast<size_t>(by) * blocks_x + bx;
-        if (idx >= control_field.size()) return QuantTable::kQuantScaleIdentity;
-        return control_field[idx].quant_scale_index;
-    };
+    const std::vector<uint8_t> superblock_scales =
+        use_control_field
+            ? aggregate_superblock_scales(control_field, blocks_x, blocks_y)
+            : std::vector<uint8_t>{};
+    const bool use_v9_superblock_map =
+        use_control_field && superblock_map_is_nontrivial(superblock_scales);
 
     // The smooth-ramp gate (fix #2) still drives the chroma table
     // refinement. NOTE: a seed boost (first row/column at quant scale
@@ -611,9 +613,21 @@ static Result<TileEncodeResult> encode_lossy_tile(
                 above_left = reconstructed_y[(by0 - 1) * tw + (bx0 - 1)];
             }
 
-            const uint8_t block_scale_index =
+            // Per-block scale (seed boost only). This is what
+            // BlockData stores and what the V7/V8 per-block stream
+            // serializes — it stays sparse and cheap. The superblock
+            // scale (V9 map) is applied on top at quantize time but
+            // is NOT stored per block; the decoder reconstructs it
+            // from the map. Effective scale: per-block wins when
+            // non-identity, else the block's superblock scale.
+            const uint8_t per_block_scale_index =
                 (seed_boost_tile && (by == 0 || bx == 0))
-                    ? 2 : control_scale_for(bx, by);
+                    ? 2 : QuantTable::kQuantScaleIdentity;
+            const uint8_t sb_scale_index =
+                superblock_scale_for(superblock_scales, blocks_x, bx, by);
+            const uint8_t block_scale_index =
+                per_block_scale_index != QuantTable::kQuantScaleIdentity
+                    ? per_block_scale_index : sb_scale_index;
             const float block_scale =
                 QuantTable::kQuantScaleFactors[block_scale_index];
             auto rd = select_best_mode(original_block,
@@ -639,13 +653,12 @@ static Result<TileEncodeResult> encode_lossy_tile(
 
             auto& bd = y_blocks[by * blocks_x + bx];
             bd.mode = rd.mode;
-            bd.quant_scale_index = block_scale_index;
-            const float y_scale = QuantTable::kQuantScaleFactors[bd.quant_scale_index];
-            quant_y.quantize_scaled(dct_coeffs, bd.quantized, y_scale);
+            bd.quant_scale_index = per_block_scale_index;
+            quant_y.quantize_scaled(dct_coeffs, bd.quantized, block_scale);
             clamp_quantized_to_stream_range(bd.quantized, bit_depth);
 
             DctBlock recon_dct;
-            quant_y.dequantize_scaled(bd.quantized, recon_dct, y_scale);
+            quant_y.dequantize_scaled(bd.quantized, recon_dct, block_scale);
             dct_2d_inverse(recon_dct);
 
             for (int r = 0; r < 8; ++r) {
@@ -756,7 +769,8 @@ static Result<TileEncodeResult> encode_lossy_tile(
                                        BlockData& block_data,
                                        std::vector<int16_t>& reconstructed_plane,
                                        uint32_t bx0,
-                                       uint32_t by0) {
+                                       uint32_t by0,
+                                       float quant_scale) {
         int16_t residual_block[64];
         for (int i = 0; i < 64; ++i) {
             residual_block[i] = original_block[i] - prediction[i];
@@ -767,12 +781,14 @@ static Result<TileEncodeResult> encode_lossy_tile(
             dct_coeffs[i] = static_cast<float>(residual_block[i]);
         }
         dct_2d_forward(dct_coeffs);
-        const float c_scale = QuantTable::kQuantScaleFactors[block_data.quant_scale_index];
-        quant_c.quantize_scaled(dct_coeffs, block_data.quantized, c_scale);
+        // quant_scale is the EFFECTIVE scale (per-block or superblock);
+        // block_data.quant_scale_index stores only the per-block part
+        // for the V7/V8 stream, so it is not read here.
+        quant_c.quantize_scaled(dct_coeffs, block_data.quantized, quant_scale);
         clamp_quantized_to_stream_range(block_data.quantized, bit_depth);
 
         DctBlock recon_dct;
-        quant_c.dequantize_scaled(block_data.quantized, recon_dct, c_scale);
+        quant_c.dequantize_scaled(block_data.quantized, recon_dct, quant_scale);
         dct_2d_inverse(recon_dct);
 
         for (int r = 0; r < 8; ++r) {
@@ -846,9 +862,16 @@ static Result<TileEncodeResult> encode_lossy_tile(
                 subsampling == ChromaSubsampling::YUV420 ? bx * 2 : bx;
             const uint32_t luma_by =
                 subsampling == ChromaSubsampling::YUV420 ? by * 2 : by;
-            const uint8_t c_block_scale_index =
+            // Per-block scale (seed boost only) for the stream; the
+            // effective scale (per-block or superblock) for quantize.
+            const uint8_t c_per_block_scale_index =
                 (seed_boost_tile && (by == 0 || bx == 0))
-                    ? 2 : control_scale_for(luma_bx, luma_by);
+                    ? 2 : QuantTable::kQuantScaleIdentity;
+            const uint8_t c_sb_scale_index =
+                superblock_scale_for(superblock_scales, blocks_x, luma_bx, luma_by);
+            const uint8_t c_block_scale_index =
+                c_per_block_scale_index != QuantTable::kQuantScaleIdentity
+                    ? c_per_block_scale_index : c_sb_scale_index;
             const float c_block_scale =
                 QuantTable::kQuantScaleFactors[c_block_scale_index];
             const PredMode chroma_mode = select_joint_chroma_mode(
@@ -873,11 +896,11 @@ static Result<TileEncodeResult> encode_lossy_tile(
             auto& cr_block = cr_blocks[by * chroma_blocks_x + bx];
             cb_block.mode = chroma_mode;
             cr_block.mode = chroma_mode;
-            cb_block.quant_scale_index = c_block_scale_index;
-            cr_block.quant_scale_index = c_block_scale_index;
+            cb_block.quant_scale_index = c_per_block_scale_index;
+            cr_block.quant_scale_index = c_per_block_scale_index;
 
-            encode_chroma_component(original_cb_block, cb_prediction, cb_block, reconstructed_cb, bx0, by0);
-            encode_chroma_component(original_cr_block, cr_prediction, cr_block, reconstructed_cr, bx0, by0);
+            encode_chroma_component(original_cb_block, cb_prediction, cb_block, reconstructed_cb, bx0, by0, c_block_scale);
+            encode_chroma_component(original_cr_block, cr_prediction, cr_block, reconstructed_cr, bx0, by0, c_block_scale);
         }
     }
 
@@ -1551,7 +1574,11 @@ static Result<TileEncodeResult> encode_lossy_tile(
     const size_t rans_mode_span_bytes = *rans_y_mode_bytes + *rans_chroma_mode_bytes +
                                         rans_alpha_mode_bytes + *rans_y_span_bytes +
                                         *rans_chroma_span_bytes + rans_alpha_span_bytes;
+    // V9 implies rANS modes/spans (it is V8 plus the superblock map),
+    // so a tile that uses the superblock map always takes the rANS
+    // path even when packed would have been marginally smaller.
     const bool use_rans_modes_spans =
+        use_v9_superblock_map ||
         rans_mode_span_bytes < packed_mode_bytes + current_span_bytes;
 
     uint8_t syntax_flags = 0;
@@ -1584,7 +1611,24 @@ static Result<TileEncodeResult> encode_lossy_tile(
     // V7 scale streams, measured as writer-size deltas.
     size_t layout_bytes = 0;
     size_t v7_scale_bytes = 0;
-    if (use_rans_modes_spans) {
+    if (use_v9_superblock_map) {
+        // Layout V9: like V8 (flags byte + scale streams + rANS modes
+        // and spans), plus the superblock quant map after the scale
+        // streams. The map is sparse and tiny (one entry per
+        // non-identity superblock); the per-block streams stay sparse
+        // because they only carry the seed boost, never the
+        // superblock-driven scales.
+        tile_writer.write_u32(kLossyTileLayoutTagV9);
+        tile_writer.write_u8(syntax_flags);
+        layout_bytes = block_dims_bytes + mark_bytes();
+        write_quant_scale_stream(tile_writer, y_blocks);
+        write_quant_scale_stream(tile_writer, cb_blocks);
+        v7_scale_bytes = mark_bytes();
+        auto map_result = write_superblock_quant_map(tile_writer, superblock_scales);
+        if (!map_result) {
+            return std::unexpected(map_result.error());
+        }
+    } else if (use_rans_modes_spans) {
         // Layout V8: like V7 (flags byte + scale streams), but modes and
         // spans are rANS-coded. The scale streams are written even when
         // use_v7 is false; they are empty (count 0) then.
