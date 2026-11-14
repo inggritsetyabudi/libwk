@@ -177,6 +177,18 @@ namespace wk
         // bound from the per-block optimal fit). Set false to disable
         // CCLM (the encoder then never emits layout V10).
         bool use_cclm = true;
+        // Adaptive chroma subsampling (V11): when true and subsampling
+        // is YUV444, each tile is encoded YUV420 or YUV444 from its
+        // source chroma Laplacian (see adaptive_chroma.h). A tile whose
+        // chroma is subsampled is written with layout V11 and flagged
+        // in the tile header. Default off.
+        bool adaptive_chroma_subsampling = false;
+        // Laplacian threshold for the adaptive decision above: a tile
+        // with c_lap below this is subsampled. Measured 2026-11-14:
+        // 2.1 selects exactly the oracle tile set at 1024px tiles
+        // (2.0 on the float reference; 2.1 compensates the small
+        // positive bias of the encoder's int16 measurement).
+        float adaptive_chroma_laplacian_threshold = 2.1f;
         // Reserved: accepted but currently ignored -- no
         // SSIMULACRA2-targeted mode exists yet (the wkenc flag was
         // removed rather than advertise a no-op).

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #include "common.h"
+#include "adaptive_chroma.h"
 #include "coeff_span_stream.h"
 #include "container.h"
 #include "cclm.h"
@@ -46,6 +47,8 @@ struct TileEncodeResult {
     std::vector<uint8_t> compressed;
     float    quality_score;
     TileStats stats;  // filled only when the caller passes a stats sink
+    ChromaSubsampling subsampling = ChromaSubsampling::YUV444;
+    bool is_v11 = false;  // written with the V11 layout tag (see below)
 };
 
 struct BlockData {
@@ -438,6 +441,7 @@ static Result<TileEncodeResult> encode_lossy_tile(
     ChromaSubsampling subsampling,
     bool use_control_field,
     bool use_cclm,
+    bool adaptive_chroma_subsampling,
     TileStats* stats = nullptr) {
 
     if (has_alpha && alpha_plane == nullptr) {
@@ -1629,13 +1633,23 @@ static Result<TileEncodeResult> encode_lossy_tile(
     const size_t rans_mode_span_bytes = *rans_y_mode_bytes + *rans_chroma_mode_bytes +
                                         rans_alpha_mode_bytes + *rans_y_span_bytes +
                                         *rans_chroma_span_bytes + rans_alpha_span_bytes;
+    // V11: a tile whose chroma is subsampled, or whose chroma block
+    // dimensions are ambiguous (tw and th both <= 8px, where the 444
+    // and 420 block counts coincide), is written with the V11 layout
+    // tag, so the decoder reads the subsampling from the tile header
+    // flag instead of inferring it from the block counts. V11 is V10
+    // in every other respect, so it takes the V10 branch below.
+    const bool write_v11 = adaptive_chroma_subsampling &&
+        (subsampling == ChromaSubsampling::YUV420 || (tw <= 8 && th <= 8));
     // V9 implies rANS modes/spans (it is V8 plus the superblock map),
     // so a tile that uses the superblock map always takes the rANS
     // path even when packed would have been marginally smaller.
     // V10 (CCLM) likewise implies rANS, because the mode alphabet
     // grows to 15 (mode 14 = CCLM) and the rANS stream carries it.
+    // V11 likewise implies rANS, because it is V10 plus the header
+    // subsampling flag.
     const bool use_rans_modes_spans =
-        use_v9_superblock_map || uses_cclm ||
+        use_v9_superblock_map || uses_cclm || write_v11 ||
         rans_mode_span_bytes < packed_mode_bytes + current_span_bytes;
 
     uint8_t syntax_flags = 0;
@@ -1668,13 +1682,15 @@ static Result<TileEncodeResult> encode_lossy_tile(
     // V7 scale streams, measured as writer-size deltas.
     size_t layout_bytes = 0;
     size_t v7_scale_bytes = 0;
-    if (uses_cclm) {
-        // Layout V10: like V9 (flags byte + scale streams + superblock
-        // map + rANS modes and spans), plus the chroma mode stream may
-        // contain mode 14 (CCLM). The superblock map section is always
-        // written (it may be empty, count 0) so the decoder always
-        // reads it in V10, keeping the layout fixed.
-        tile_writer.write_u32(kLossyTileLayoutTagV10);
+    if (write_v11 || uses_cclm) {
+        // Layout V11: like V10 (flags byte + scale streams + superblock
+        // map + rANS modes and spans), plus the tile's chroma
+        // subsampling is signalled by the TILE_CHROMA_420 bit in the
+        // tile header. Layout V10: like V9, plus the chroma mode stream
+        // may contain mode 14 (CCLM). The superblock map section is
+        // always written (it may be empty, count 0) so the decoder
+        // always reads it in V10/V11, keeping the layout fixed.
+        tile_writer.write_u32(write_v11 ? kLossyTileLayoutTagV11 : kLossyTileLayoutTagV10);
         tile_writer.write_u8(syntax_flags);
         layout_bytes = block_dims_bytes + mark_bytes();
         write_quant_scale_stream(tile_writer, y_blocks);
@@ -1810,6 +1826,8 @@ static Result<TileEncodeResult> encode_lossy_tile(
     TileEncodeResult result;
     result.tile_x = static_cast<uint16_t>(tile_x);
     result.tile_y = static_cast<uint16_t>(tile_y);
+    result.subsampling = subsampling;
+    result.is_v11 = write_v11;
     result.compressed = tile_writer.finish();
     result.quality_score = score;
     if (stats != nullptr) {
@@ -2008,13 +2026,27 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
         const bool use_yuv420 =
             config.subsampling == Subsampling::YUV420 && (width > 8 || height > 8);
 
-        if (use_yuv420) {
+        // Adaptive subsampling applies only when the image is not
+        // already image-wide 420 (then every tile is 420 by definition).
+        const bool use_adaptive_chroma =
+            config.adaptive_chroma_subsampling && config.subsampling == Subsampling::YUV444;
+
+        // The 420 planes are built image-wide (identical to the
+        // image-wide 420 path) so a 420 tile's chroma matches what
+        // --yuv420 would have written for that region.
+        std::vector<int16_t> cb_plane_420, cr_plane_420;
+        if (use_yuv420 || use_adaptive_chroma) {
             const uint32_t chroma_w = (width + 1) / 2;
             const uint32_t chroma_h = (height + 1) / 2;
-            cb_plane.resize(chroma_w * chroma_h);
-            cr_plane.resize(chroma_w * chroma_h);
-            subsample_420(cb_plane_full.data(), cb_plane.data(), width, height);
-            subsample_420(cr_plane_full.data(), cr_plane.data(), width, height);
+            cb_plane_420.resize(chroma_w * chroma_h);
+            cr_plane_420.resize(chroma_w * chroma_h);
+            subsample_420(cb_plane_full.data(), cb_plane_420.data(), width, height);
+            subsample_420(cr_plane_full.data(), cr_plane_420.data(), width, height);
+        }
+
+        if (use_yuv420) {
+            cb_plane = std::move(cb_plane_420);
+            cr_plane = std::move(cr_plane_420);
         } else {
             cb_plane = std::move(cb_plane_full);
             cr_plane = std::move(cr_plane_full);
@@ -2034,16 +2066,38 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
                     // them; otherwise encode_lossy_tile skips the work.
                     TileStats tile_stats{};
                     TileStats* tile_stats_ptr = (stats != nullptr) ? &tile_stats : nullptr;
+                    ChromaSubsampling tile_subsampling =
+                        use_yuv420 ? ChromaSubsampling::YUV420 : ChromaSubsampling::YUV444;
+                    const int16_t* tile_cb = cb_plane.data();
+                    const int16_t* tile_cr = cr_plane.data();
+                    if (use_adaptive_chroma) {
+                        // Per-tile decision from the source chroma
+                        // (cb_plane is full-resolution here, since the
+                        // image is not image-wide 420).
+                        const uint32_t x0 = tx * tile_size;
+                        const uint32_t y0 = ty * tile_size;
+                        const uint32_t tw = std::min(tile_size, width - x0);
+                        const uint32_t th = std::min(tile_size, height - y0);
+                        tile_subsampling = should_subsample_chroma_420(
+                            cb_plane.data(), cr_plane.data(), width, height,
+                            x0, y0, tw, th,
+                            static_cast<double>(config.adaptive_chroma_laplacian_threshold))
+                            ? ChromaSubsampling::YUV420 : ChromaSubsampling::YUV444;
+                        if (tile_subsampling == ChromaSubsampling::YUV420) {
+                            tile_cb = cb_plane_420.data();
+                            tile_cr = cr_plane_420.data();
+                        }
+                    }
                     return encode_lossy_tile(
-                        y_plane.data(), cb_plane.data(), cr_plane.data(),
+                        y_plane.data(), tile_cb, tile_cr,
                         alpha_plane.empty() ? nullptr : alpha_plane.data(),
                         width, height, tx, ty, tile_size,
                         config.quality, fhdr.bit_depth,
                         source_has_alpha,
-                        use_yuv420 ? ChromaSubsampling::YUV420
-                                   : ChromaSubsampling::YUV444,
+                        tile_subsampling,
                         config.use_control_field,
                         config.use_cclm,
+                        use_adaptive_chroma,
                         tile_stats_ptr);
                 });
                 futures.push_back(std::move(future));
@@ -2067,7 +2121,11 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
             TileHeader th;
             th.tile_x = result->tile_x;
             th.tile_y = result->tile_y;
-            th.layer_flags = static_cast<uint8_t>(TILE_HAS_BASE | (source_has_alpha ? TILE_HAS_ALPHA : 0));
+            th.layer_flags = static_cast<uint8_t>(
+                TILE_HAS_BASE | (source_has_alpha ? TILE_HAS_ALPHA : 0) |
+                ((result->is_v11 && result->subsampling == ChromaSubsampling::YUV420)
+                     ? TILE_CHROMA_420
+                     : 0));
             th.compressed_size = static_cast<uint32_t>(result->compressed.size());
 
             ByteWriter tw;
@@ -2168,6 +2226,8 @@ void wk_encoder_config_init(wk_encoder_config_t* config) {
     config->target_ssimulacra2 = 0.0f;
     config->chroma_subsampling = 0;
     config->full_range = 1;
+    config->adaptive_chroma_subsampling = 0;
+    config->adaptive_chroma_laplacian_threshold = 2.1f;
 }
 
 wk_error_t wk_encode(
@@ -2246,6 +2306,8 @@ wk_error_t wk_encode(
     enc_config.tile_size_log2 = config->tile_size_log2;
     enc_config.threads = config->threads;
     enc_config.target_ssimulacra2 = config->target_ssimulacra2;
+    enc_config.adaptive_chroma_subsampling = config->adaptive_chroma_subsampling != 0;
+    enc_config.adaptive_chroma_laplacian_threshold = config->adaptive_chroma_laplacian_threshold;
 
     auto result = wk::encode(*image, enc_config);
     if (!result) {

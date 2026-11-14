@@ -186,7 +186,7 @@ Result<LossyTileSyntaxInfo> parse_lossy_tile_syntax(std::span<const uint8_t> pay
     info.stream_offset = kLossySyntaxBaseOffset + kLayoutTagBytes;
     if (info.layout_tag == kLossyTileLayoutTagV6 || info.layout_tag == kLossyTileLayoutTagV7 ||
         info.layout_tag == kLossyTileLayoutTagV8 || info.layout_tag == kLossyTileLayoutTagV9 ||
-        info.layout_tag == kLossyTileLayoutTagV10) {
+        info.layout_tag == kLossyTileLayoutTagV10 || info.layout_tag == kLossyTileLayoutTagV11) {
         if (payload.size() <= info.stream_offset) {
             return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload is missing syntax flags"});
         }
@@ -208,8 +208,9 @@ Result<LossyTileSyntaxInfo> parse_lossy_tile_syntax(std::span<const uint8_t> pay
         info.adaptive_coefficient_signs =
             (info.syntax_flags & kLossyTileSyntaxFlagAdaptiveCoefficientSigns) != 0;
         if (info.layout_tag == kLossyTileLayoutTagV7 || info.layout_tag == kLossyTileLayoutTagV8 ||
-            info.layout_tag == kLossyTileLayoutTagV9 || info.layout_tag == kLossyTileLayoutTagV10) {
-            // V7/V8/V9/V10 carry two sparse quant-scale streams (luma,
+            info.layout_tag == kLossyTileLayoutTagV9 || info.layout_tag == kLossyTileLayoutTagV10 ||
+            info.layout_tag == kLossyTileLayoutTagV11) {
+            // V7/V8/V9/V10/V11 carry two sparse quant-scale streams (luma,
             // then chroma) after the flags byte: count u16, then count
             // entries of (block_index u16, scale_index u8). Skip both
             // so stream_offset lands on the mode streams.
@@ -223,12 +224,13 @@ Result<LossyTileSyntaxInfo> parse_lossy_tile_syntax(std::span<const uint8_t> pay
                     return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload has a truncated V7/V8 scale stream"});
                 }
             }
-            if (info.layout_tag == kLossyTileLayoutTagV9 || info.layout_tag == kLossyTileLayoutTagV10) {
-                // V9/V10 carry the superblock quant map after the
+            if (info.layout_tag == kLossyTileLayoutTagV9 || info.layout_tag == kLossyTileLayoutTagV10 ||
+                info.layout_tag == kLossyTileLayoutTagV11) {
+                // V9/V10/V11 carry the superblock quant map after the
                 // scale streams: count u16, then count entries of
                 // (superblock_index u16, scale_index u8). Skip it so
                 // stream_offset lands on the mode streams. The map may
-                // be empty (count 0) in V10.
+                // be empty (count 0) in V10/V11.
                 if (payload.size() - info.stream_offset < sizeof(uint16_t)) {
                     return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload is missing a V9/V10 superblock map"});
                 }
@@ -2271,4 +2273,203 @@ TEST(RoundtripTest, ControlFieldSuperblockMapRoundtrips) {
         << "field-on file (" << encoded_on->size() << " B) should equal the "
         << "field-off file (" << encoded_off->size() << " B) on a textured image "
         << "now that the textured coarser step is disabled";
+}
+
+// Two-tile image for adaptive-chroma tests: tile 0 is a smooth
+// chroma gradient (linear, so c_lap 0 -> 420 under adaptive
+// subsampling) and tile 1 is a 1px red/blue checkerboard (busy
+// chroma, c_lap >> 2 -> 444).
+Image make_mixed_chroma_tiles(uint32_t tile_size) {
+    const uint32_t width = tile_size * 2;
+    const uint32_t height = tile_size;
+    Image image(width, height, BitDepth::Bits8, false);
+    for (uint32_t y = 0; y < height; ++y) {
+        uint8_t* row = image.row(y);
+        for (uint32_t x = 0; x < width; ++x) {
+            if (x < tile_size) {
+                // Linear ramp: chroma varies smoothly, so the
+                // Laplacian is zero and the tile subsamples, but the
+                // chroma carries real content (unlike a solid tile),
+                // so 420 must actually save bytes.
+                row[x * 3 + 0] = static_cast<uint8_t>(x * 4);
+                row[x * 3 + 1] = 128;
+                row[x * 3 + 2] = static_cast<uint8_t>(255 - x * 4);
+            } else {
+                const bool red = ((x + y) % 2) == 0;
+                row[x * 3 + 0] = red ? 255 : 0;
+                row[x * 3 + 1] = 0;
+                row[x * 3 + 2] = red ? 0 : 255;
+            }
+        }
+    }
+    return image;
+}
+
+// Every tile is a 1px red/blue checkerboard: c_lap is huge
+// everywhere, so adaptive subsampling switches nothing.
+Image make_busy_chroma_image(uint32_t width, uint32_t height) {
+    Image image(width, height, BitDepth::Bits8, false);
+    for (uint32_t y = 0; y < height; ++y) {
+        uint8_t* row = image.row(y);
+        for (uint32_t x = 0; x < width; ++x) {
+            const bool red = ((x + y) % 2) == 0;
+            row[x * 3 + 0] = red ? 255 : 0;
+            row[x * 3 + 1] = 0;
+            row[x * 3 + 2] = red ? 0 : 255;
+        }
+    }
+    return image;
+}
+
+TEST(RoundtripTest, AdaptiveChromaSubsamplingMixedRoundtrip) {
+    Image image = make_mixed_chroma_tiles(64);
+    EncoderConfig config;
+    config.quality = 75.0f;
+    config.tile_size_log2 = 6;
+    config.adaptive_chroma_subsampling = true;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    ASSERT_EQ(file->tile_chunks.size(), 2u);
+
+    // Tile 0 (flat chroma) must be V11 with the 420 flag; tile 1
+    // (busy chroma) must stay a legacy layout (444).
+    int v11_count = 0;
+    for (const auto& chunk : file->tile_chunks) {
+        const uint16_t tile_x = read_le16(chunk.payload.data());
+        auto syntax = parse_lossy_tile_syntax(chunk.payload);
+        ASSERT_TRUE(syntax.has_value()) << syntax.error().message;
+        const uint8_t layer_flags = chunk.payload[4];
+        if (syntax->layout_tag == kLossyTileLayoutTagV11) {
+            ++v11_count;
+            EXPECT_EQ(tile_x, 0u) << "only the flat-chroma tile may be V11";
+            EXPECT_NE(layer_flags & TILE_CHROMA_420, 0u) << "V11 420 tile must carry the flag";
+        } else {
+            EXPECT_EQ(tile_x, 1u) << "the busy-chroma tile must stay legacy";
+            EXPECT_EQ(layer_flags & TILE_CHROMA_420, 0u);
+        }
+    }
+    EXPECT_EQ(v11_count, 1);
+
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+
+    // The gradient tile's chroma is linear, so subsampling it is
+    // near-lossless: the mixed decode must be close to the all-444
+    // decode. (Compression is measured on the benchmark photos, not
+    // on this tiny synthetic image: a perfectly linear ramp is
+    // already near-free in 444, so 420 saves nothing here.)
+    EncoderConfig config444 = config;
+    config444.adaptive_chroma_subsampling = false;
+    auto encoded444 = encode(image, config444);
+    ASSERT_TRUE(encoded444.has_value()) << encoded444.error().message;
+    auto decoded444 = decode(*encoded444);
+    ASSERT_TRUE(decoded444.has_value()) << decoded444.error().message;
+    auto metrics = wk::metrics::compare_images(*decoded444, *decoded);
+    ASSERT_TRUE(metrics.has_value()) << "metrics compare failed: " << metrics.error().message;
+    EXPECT_GT(metrics->psnr, 45.0) << "mixed decode diverged from 444 decode: PSNR " << metrics->psnr;
+}
+
+TEST(RoundtripTest, AdaptiveChromaSubsamplingAll444StaysLegacy) {
+    // No tile switches, so the file must be byte-identical to the
+    // plain encode: no V11 tile at all.
+    Image image = make_busy_chroma_image(128, 64);
+    EncoderConfig config;
+    config.quality = 75.0f;
+    config.tile_size_log2 = 6;
+    config.adaptive_chroma_subsampling = true;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    EncoderConfig plain = config;
+    plain.adaptive_chroma_subsampling = false;
+    auto encoded_plain = encode(image, plain);
+    ASSERT_TRUE(encoded_plain.has_value()) << encoded_plain.error().message;
+    EXPECT_EQ(*encoded, *encoded_plain) << "adaptive-on with no switch must not change the file";
+
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    for (const auto& chunk : file->tile_chunks) {
+        auto syntax = parse_lossy_tile_syntax(chunk.payload);
+        ASSERT_TRUE(syntax.has_value()) << syntax.error().message;
+        EXPECT_NE(syntax->layout_tag, kLossyTileLayoutTagV11) << "no tile may be V11";
+    }
+}
+
+TEST(RoundtripTest, AdaptiveChromaSubsamplingImageWide420Unaffected) {
+    // Image-wide 420 ignores the adaptive flag entirely.
+    Image image = make_mixed_chroma_tiles(64);
+    EncoderConfig config;
+    config.quality = 75.0f;
+    config.tile_size_log2 = 6;
+    config.subsampling = Subsampling::YUV420;
+    config.adaptive_chroma_subsampling = true;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    EncoderConfig plain = config;
+    plain.adaptive_chroma_subsampling = false;
+    auto encoded_plain = encode(image, plain);
+    ASSERT_TRUE(encoded_plain.has_value()) << encoded_plain.error().message;
+    EXPECT_EQ(*encoded, *encoded_plain) << "adaptive must not change an image-wide 420 encode";
+}
+
+TEST(RoundtripTest, V11FlagMismatchRejected) {
+    // Clear the TILE_CHROMA_420 flag on a V11 420 tile: the flag then
+    // says 444 while the block counts say 420. The decoder must
+    // reject the tile instead of guessing.
+    Image image = make_mixed_chroma_tiles(64);
+    EncoderConfig config;
+    config.quality = 75.0f;
+    config.tile_size_log2 = 6;
+    config.adaptive_chroma_subsampling = true;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+
+    bool cleared = false;
+    for (auto& chunk : file->tile_chunks) {
+        auto syntax = parse_lossy_tile_syntax(chunk.payload);
+        ASSERT_TRUE(syntax.has_value()) << syntax.error().message;
+        if (syntax->layout_tag == kLossyTileLayoutTagV11) {
+            chunk.payload[4] &= static_cast<uint8_t>(~TILE_CHROMA_420);
+            cleared = true;
+        }
+    }
+    ASSERT_TRUE(cleared) << "test image must contain a V11 tile";
+    auto broken = write_container(*file);
+    auto decoded = decode(*broken);
+    EXPECT_FALSE(decoded.has_value()) << "V11 flag/block-count mismatch must be rejected";
+}
+
+TEST(RoundtripTest, UnknownLossyLayoutTagRejected) {
+    // Overwrite a tile's layout tag with an unknown value: the
+    // decoder must reject it (this is the path that protects old
+    // decoders from V11 files).
+    Image image = make_rgb_gradient(64, 64);
+    EncoderConfig config;
+    config.quality = 75.0f;
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+
+    auto& payload = file->tile_chunks[0].payload;
+    ASSERT_GE(payload.size(), kLossySyntaxBaseOffset + kLayoutTagBytes);
+    // 0x3c4d4843 in little-endian.
+    payload[kLossySyntaxBaseOffset + 0] = 0x43;
+    payload[kLossySyntaxBaseOffset + 1] = 0x48;
+    payload[kLossySyntaxBaseOffset + 2] = 0x4d;
+    payload[kLossySyntaxBaseOffset + 3] = 0x3c;
+
+    auto broken = write_container(*file);
+    auto decoded = decode(*broken);
+    EXPECT_FALSE(decoded.has_value()) << "unknown layout tag must be rejected";
 }

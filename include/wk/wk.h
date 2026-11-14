@@ -73,6 +73,8 @@ extern "C"
         float target_ssimulacra2;  // Reserved: accepted but currently ignored.
         uint8_t chroma_subsampling;
         uint8_t full_range;
+        uint8_t adaptive_chroma_subsampling;
+        float adaptive_chroma_laplacian_threshold;
     } wk_encoder_config_t;
 
     void wk_encoder_config_init(wk_encoder_config_t *config);

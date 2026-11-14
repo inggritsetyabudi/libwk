@@ -130,6 +130,12 @@ void print_usage() {
         << "  --no-control-field      Disable the perceptual control field\n"
         << "  --cclm                  Enable CCLM chroma prediction (on by default)\n"
         << "  --no-cclm               Disable CCLM chroma prediction\n"
+        << "  --adaptive-chroma-subsampling\n"
+        << "                          Per-tile 4:2:0/4:4:4 from the source chroma Laplacian (V11)\n"
+        << "  --no-adaptive-chroma-subsampling\n"
+        << "                          Disable adaptive chroma subsampling (default)\n"
+        << "  --chroma-lap-threshold F\n"
+        << "                          Laplacian threshold for adaptive subsampling (default: 2.1)\n"
         << "  --import-exif FILE      Import EXIF from JPEG/TIFF donor file\n"
         << "  --version               Print version\n"
         << "  -h, --help              Show this help\n\n"
@@ -270,6 +276,21 @@ int main(int argc, char* argv[]) {
             config.use_cclm = true;
         } else if (arg == "--no-cclm") {
             config.use_cclm = false;
+        } else if (arg == "--adaptive-chroma-subsampling") {
+            config.adaptive_chroma_subsampling = true;
+        } else if (arg == "--no-adaptive-chroma-subsampling") {
+            config.adaptive_chroma_subsampling = false;
+        } else if (arg == "--chroma-lap-threshold") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --chroma-lap-threshold requires a value\n";
+                return 1;
+            }
+            try {
+                config.adaptive_chroma_laplacian_threshold = std::stof(argv[++i]);
+            } catch (...) {
+                std::cerr << "Error: invalid Laplacian threshold\n";
+                return 1;
+            }
         } else if (arg == "--import-exif") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --import-exif requires a donor file\n";
