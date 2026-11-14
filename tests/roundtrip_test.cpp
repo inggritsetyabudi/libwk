@@ -29,6 +29,7 @@
 #include "../src/coeff_table_stream.h"
 #include "../src/image_io.h"
 #include "../src/metrics.h"
+#include "../src/mode_span_rans.h"
 #include "../src/mode_stream.h"
 #include "../src/rans.h"
 #include <cmath>
@@ -182,7 +183,8 @@ Result<LossyTileSyntaxInfo> parse_lossy_tile_syntax(std::span<const uint8_t> pay
     LossyTileSyntaxInfo info;
     info.layout_tag = read_le32(payload.data() + kLossySyntaxBaseOffset);
     info.stream_offset = kLossySyntaxBaseOffset + kLayoutTagBytes;
-    if (info.layout_tag == kLossyTileLayoutTagV6 || info.layout_tag == kLossyTileLayoutTagV7) {
+    if (info.layout_tag == kLossyTileLayoutTagV6 || info.layout_tag == kLossyTileLayoutTagV7 ||
+        info.layout_tag == kLossyTileLayoutTagV8) {
         if (payload.size() <= info.stream_offset) {
             return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload is missing syntax flags"});
         }
@@ -203,19 +205,19 @@ Result<LossyTileSyntaxInfo> parse_lossy_tile_syntax(std::span<const uint8_t> pay
             (info.syntax_flags & kLossyTileSyntaxFlagCoefficientSignificanceMaps) != 0;
         info.adaptive_coefficient_signs =
             (info.syntax_flags & kLossyTileSyntaxFlagAdaptiveCoefficientSigns) != 0;
-        if (info.layout_tag == kLossyTileLayoutTagV7) {
-            // V7 carries two sparse quant-scale streams (luma, then
+        if (info.layout_tag == kLossyTileLayoutTagV7 || info.layout_tag == kLossyTileLayoutTagV8) {
+            // V7/V8 carry two sparse quant-scale streams (luma, then
             // chroma) after the flags byte: count u16, then count
             // entries of (block_index u16, scale_index u8). Skip both
             // so stream_offset lands on the mode streams.
             for (int stream = 0; stream < 2; ++stream) {
                 if (payload.size() - info.stream_offset < sizeof(uint16_t)) {
-                    return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload is missing a V7 scale stream"});
+                    return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload is missing a V7/V8 scale stream"});
                 }
                 const uint16_t count = read_le16(payload.data() + info.stream_offset);
                 info.stream_offset += sizeof(uint16_t) + static_cast<size_t>(count) * 3;
                 if (info.stream_offset > payload.size()) {
-                    return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload has a truncated V7 scale stream"});
+                    return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload has a truncated V7/V8 scale stream"});
                 }
             }
         }
@@ -642,7 +644,10 @@ TEST(RoundtripTest, SeedBoostFixesRampAtQ50) {
                          (static_cast<uint32_t>(payload[274]) << 8) |
                          (static_cast<uint32_t>(payload[275]) << 16) |
                          (static_cast<uint32_t>(payload[276]) << 24);
-    EXPECT_EQ(tag, kLossyTileLayoutTagV7) << "seed boost must emit V7";
+    // Seed boost is a scale-stream feature: V7 or V8 (V8 is V7 plus
+    // rANS modes/spans). Either tag proves the scale streams are there.
+    EXPECT_TRUE(tag == kLossyTileLayoutTagV7 || tag == kLossyTileLayoutTagV8)
+        << "seed boost must emit V7 or V8 (tag=" << tag << ")";
 
     const uint8_t* drow = decoded->row(128);
     bool seen[256] = {};
@@ -1876,14 +1881,55 @@ TEST(RoundtripTest, V7OnlyWhenPlanarOrScaleUsed) {
                (static_cast<uint32_t>(payload[276]) << 24);
     };
 
-    EXPECT_EQ(layout_tag_of(make_solid_image(64, 64, 128), config),
-              kLossyTileLayoutTagV6)
-        << "solid image must stay on V6";
-    EXPECT_EQ(layout_tag_of(make_checkerboard(64, 64, 8), config),
-              kLossyTileLayoutTagV6)
-        << "checkerboard must stay on V6";
+    // A solid block and a checkerboard have no planar win and no
+    // non-identity scales, so their scale streams must be empty. They
+    // may be V6 (packed modes/spans) or V8 (rANS modes/spans with empty
+    // scale lists); the layout tag alone no longer proves the scales
+    // are absent, so check the scale-stream counts directly.
+    auto scale_counts_of = [](const Image& image, const EncoderConfig& cfg) {
+        auto encoded = encode(image, cfg);
+        EXPECT_TRUE(encoded.has_value()) << encoded.error().message;
+        if (!encoded.has_value()) {
+            return std::pair<int, int>{-1, -1};
+        }
+        auto parsed = parse_container(*encoded);
+        EXPECT_TRUE(parsed.has_value()) << parsed.error().message;
+        if (!parsed.has_value() || parsed->tile_chunks.empty()) {
+            return std::pair<int, int>{-1, -1};
+        }
+        const auto& payload = parsed->tile_chunks[0].payload;
+        if (payload.size() < 278u) {
+            return std::pair<int, int>{-1, -1};
+        }
+        const uint32_t tag = static_cast<uint32_t>(payload[273]) |
+                             (static_cast<uint32_t>(payload[274]) << 8) |
+                             (static_cast<uint32_t>(payload[275]) << 16) |
+                             (static_cast<uint32_t>(payload[276]) << 24);
+        if (tag == kLossyTileLayoutTagV6) {
+            return std::pair<int, int>{0, 0};
+        }
+        if (tag != kLossyTileLayoutTagV7 && tag != kLossyTileLayoutTagV8) {
+            return std::pair<int, int>{-1, -1};
+        }
+        // V7/V8 scale streams at offset 278: u16 count, then entries.
+        const uint16_t y_count = read_le16(payload.data() + 278);
+        size_t off = 278 + 2 + static_cast<size_t>(y_count) * 3;
+        if (off + 2 > payload.size()) {
+            return std::pair<int, int>{-1, -1};
+        }
+        const uint16_t c_count = read_le16(payload.data() + off);
+        return std::pair<int, int>{y_count, c_count};
+    };
+    {
+        auto solid_scales = scale_counts_of(make_solid_image(64, 64, 128), config);
+        EXPECT_EQ(solid_scales.first, 0) << "solid image must have empty luma scale stream";
+        EXPECT_EQ(solid_scales.second, 0) << "solid image must have empty chroma scale stream";
+        auto checker_scales = scale_counts_of(make_checkerboard(64, 64, 8), config);
+        EXPECT_EQ(checker_scales.first, 0) << "checkerboard must have empty luma scale stream";
+        EXPECT_EQ(checker_scales.second, 0) << "checkerboard must have empty chroma scale stream";
+    }
 
-    // A smooth gradient uses planar and must be V7 -- and the V7 tag
+    // A smooth gradient uses planar and must be V7 or V8 -- and the tag
     // must be truthful: a planar mode is actually in the mode stream.
     Image gradient = make_rgb_gradient(64, 64);
     auto encoded = encode(gradient, config);
@@ -1897,14 +1943,19 @@ TEST(RoundtripTest, V7OnlyWhenPlanarOrScaleUsed) {
                          (static_cast<uint32_t>(payload[274]) << 8) |
                          (static_cast<uint32_t>(payload[275]) << 16) |
                          (static_cast<uint32_t>(payload[276]) << 24);
-    ASSERT_EQ(tag, kLossyTileLayoutTagV7) << "gradient must use V7";
+    ASSERT_TRUE(tag == kLossyTileLayoutTagV7 || tag == kLossyTileLayoutTagV8)
+        << "gradient must use V7 or V8";
     auto syntax = parse_lossy_tile_syntax(payload);
     ASSERT_TRUE(syntax.has_value()) << syntax.error().message;
     ByteReader reader(std::span<const uint8_t>(payload.data() + syntax->stream_offset,
                                                payload.size() - syntax->stream_offset));
-    auto y_modes = read_packed_prediction_modes(reader, 64, "luma");
+    auto y_modes = tag == kLossyTileLayoutTagV8
+        ? read_rans_prediction_modes(reader, 64, "luma")
+        : read_packed_prediction_modes(reader, 64, "luma");
     ASSERT_TRUE(y_modes.has_value()) << y_modes.error().message;
-    auto chroma_modes = read_packed_prediction_modes(reader, 64, "chroma");
+    auto chroma_modes = tag == kLossyTileLayoutTagV8
+        ? read_rans_prediction_modes(reader, 64, "chroma")
+        : read_packed_prediction_modes(reader, 64, "chroma");
     ASSERT_TRUE(chroma_modes.has_value()) << chroma_modes.error().message;
     const bool any_planar =
         std::any_of(y_modes->begin(), y_modes->end(),
@@ -1912,18 +1963,19 @@ TEST(RoundtripTest, V7OnlyWhenPlanarOrScaleUsed) {
         std::any_of(chroma_modes->begin(), chroma_modes->end(),
                     [](PredMode m) { return m == PredMode::PLANAR; });
     EXPECT_TRUE(any_planar)
-        << "V7 tag must mean a planar mode is actually used";
+        << "V7/V8 tag must mean a planar mode is actually used";
 }
 
 // Layout V7 decoder path, exercised by byte surgery: take a V6 file,
 // insert sparse quant-scale streams after the syntax-flags byte and
 // retag it V7. The scale streams sit at tile-payload offset 278
 // (9-byte tile header + 256 quant-table bytes + 8 block-dim bytes
-// + 4 layout-tag bytes + 1 flags byte). The fixture is a checkerboard:
-// it stays V6 (V predicts it exactly, so planar never wins) while
-// still carrying real coefficients.
+// + 4 layout-tag bytes + 1 flags byte). The fixture is a small
+// checkerboard: it stays V6 (V predicts it exactly, so planar never
+// wins, and with only 4 blocks the rANS mode/span tables cost more
+// than packing) while still carrying real coefficients.
 TEST(RoundtripTest, V7EmptyScaleListsDecodeIdenticalToV6) {
-    Image image = make_checkerboard(64, 64, 8);
+    Image image = make_checkerboard(16, 16, 2);
 
     EncoderConfig config;
     config.quality = 75.0f;

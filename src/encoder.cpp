@@ -18,6 +18,7 @@
 #include "container.h"
 #include "dct.h"
 #include "lossy_coeff_stream.h"
+#include "mode_span_rans.h"
 #include "mode_stream.h"
 #include "quantize.h"
 #include "predict.h"
@@ -41,6 +42,7 @@ struct TileEncodeResult {
     uint16_t tile_y;
     std::vector<uint8_t> compressed;
     float    quality_score;
+    TileStats stats;  // filled only when the caller passes a stats sink
 };
 
 struct BlockData {
@@ -430,7 +432,8 @@ static Result<TileEncodeResult> encode_lossy_tile(
     uint32_t image_width, uint32_t image_height,
     uint32_t tile_x, uint32_t tile_y, uint32_t tile_size,
     float quality, uint8_t bit_depth, bool has_alpha,
-    ChromaSubsampling subsampling) {
+    ChromaSubsampling subsampling,
+    TileStats* stats = nullptr) {
 
     if (has_alpha && alpha_plane == nullptr) {
         return std::unexpected(Error{ErrorCode::InvalidParameter, "alpha plane missing"});
@@ -956,13 +959,25 @@ static Result<TileEncodeResult> encode_lossy_tile(
 
     ByteWriter tile_writer;
 
+    // TileStats checkpoints (Phase 1 diagnostic): record the writer size
+    // at each section boundary, so the breakdown is exact.
+    size_t mark = 0;
+    auto mark_bytes = [&]() {
+        const size_t now = tile_writer.size();
+        const size_t delta = now - mark;
+        mark = now;
+        return delta;
+    };
+
     for (int i = 0; i < 64; ++i) tile_writer.write_u16(quant_y.step(i));
     for (int i = 0; i < 64; ++i) tile_writer.write_u16(quant_c.step(i));
+    const size_t quant_table_bytes = mark_bytes();
 
     tile_writer.write_u16(static_cast<uint16_t>(blocks_x));
     tile_writer.write_u16(static_cast<uint16_t>(blocks_y));
     tile_writer.write_u16(static_cast<uint16_t>(chroma_blocks_x));
     tile_writer.write_u16(static_cast<uint16_t>(chroma_blocks_y));
+    const size_t block_dims_bytes = mark_bytes();
 
     std::vector<uint8_t> y_spans;
     y_spans.reserve(y_blocks.size());
@@ -1433,6 +1448,88 @@ static Result<TileEncodeResult> encode_lossy_tile(
                         uses_planar_mode(cr_blocks) ||
                         (has_alpha && uses_planar_mode(a_blocks));
 
+    // Layout V8 (Phase 1): rANS-coded modes and spans. Encode both the
+    // packed and the rANS variants into temp buffers and keep the smaller
+    // one. The rANS table overhead is included in the rANS size, so the
+    // race is honest. Modes and spans are decided together because they
+    // share the layout tag.
+    auto collect_modes = [](const std::vector<BlockData>& blocks) {
+        std::vector<PredMode> modes;
+        modes.reserve(blocks.size());
+        for (const auto& block : blocks) {
+            modes.push_back(block.mode);
+        }
+        return modes;
+    };
+    const auto y_modes = collect_modes(y_blocks);
+    const auto chroma_modes = collect_modes(cb_blocks);
+    const auto alpha_modes = has_alpha ? collect_modes(a_blocks) : std::vector<PredMode>{};
+
+    auto rans_stream_bytes = [](auto&& write_fn) -> Result<size_t> {
+        ByteWriter w;
+        auto r = write_fn(w);
+        if (!r) {
+            return std::unexpected(r.error());
+        }
+        return w.finish().size();
+    };
+    // Packed mode bytes: u16 length + packed nibbles (see
+    // write_packed_prediction_modes).
+    const size_t packed_mode_bytes =
+        (sizeof(uint16_t) + packed_prediction_mode_bytes(y_modes.size())) +
+        (sizeof(uint16_t) + packed_prediction_mode_bytes(chroma_modes.size())) +
+        (has_alpha ? sizeof(uint16_t) + packed_prediction_mode_bytes(alpha_modes.size()) : 0u);
+    auto rans_y_mode_bytes = rans_stream_bytes(
+        [&](ByteWriter& w) { return write_rans_prediction_modes(w, y_modes); });
+    if (!rans_y_mode_bytes) {
+        return std::unexpected(rans_y_mode_bytes.error());
+    }
+    auto rans_chroma_mode_bytes = rans_stream_bytes(
+        [&](ByteWriter& w) { return write_rans_prediction_modes(w, chroma_modes); });
+    if (!rans_chroma_mode_bytes) {
+        return std::unexpected(rans_chroma_mode_bytes.error());
+    }
+    size_t rans_alpha_mode_bytes = 0;
+    if (has_alpha) {
+        auto r = rans_stream_bytes(
+            [&](ByteWriter& w) { return write_rans_prediction_modes(w, alpha_modes); });
+        if (!r) {
+            return std::unexpected(r.error());
+        }
+        rans_alpha_mode_bytes = *r;
+    }
+    // Current span bytes (the adaptive/packed choice already made above).
+    // Adaptive: per-plane adaptive sizes. Packed: legacy_span_stream_bytes
+    // already covers Y + chroma + alpha.
+    const size_t current_span_bytes = use_adaptive_span_streams
+        ? (*adaptive_y_span_bytes + *adaptive_chroma_span_bytes +
+           (has_alpha ? adaptive_alpha_span_bytes : 0u))
+        : legacy_span_stream_bytes;
+    auto rans_y_span_bytes = rans_stream_bytes(
+        [&](ByteWriter& w) { return write_rans_coefficient_spans(w, y_spans); });
+    if (!rans_y_span_bytes) {
+        return std::unexpected(rans_y_span_bytes.error());
+    }
+    auto rans_chroma_span_bytes = rans_stream_bytes(
+        [&](ByteWriter& w) { return write_rans_coefficient_spans(w, chroma_spans); });
+    if (!rans_chroma_span_bytes) {
+        return std::unexpected(rans_chroma_span_bytes.error());
+    }
+    size_t rans_alpha_span_bytes = 0;
+    if (has_alpha) {
+        auto r = rans_stream_bytes(
+            [&](ByteWriter& w) { return write_rans_coefficient_spans(w, alpha_spans); });
+        if (!r) {
+            return std::unexpected(r.error());
+        }
+        rans_alpha_span_bytes = *r;
+    }
+    const size_t rans_mode_span_bytes = *rans_y_mode_bytes + *rans_chroma_mode_bytes +
+                                        rans_alpha_mode_bytes + *rans_y_span_bytes +
+                                        *rans_chroma_span_bytes + rans_alpha_span_bytes;
+    const bool use_rans_modes_spans =
+        rans_mode_span_bytes < packed_mode_bytes + current_span_bytes;
+
     uint8_t syntax_flags = 0;
     if (use_adaptive_span_streams) {
         syntax_flags |= kLossyTileSyntaxFlagAdaptiveSpanStreams;
@@ -1459,20 +1556,39 @@ static Result<TileEncodeResult> encode_lossy_tile(
         syntax_flags |= kLossyTileSyntaxFlagAdaptiveCoefficientSigns;
     }
 
-    if (use_v7) {
-        tile_writer.write_u32(kLossyTileLayoutTagV7);
+    // TileStats checkpoints: layout tag + flags (+ block dims) and the
+    // V7 scale streams, measured as writer-size deltas.
+    size_t layout_bytes = 0;
+    size_t v7_scale_bytes = 0;
+    if (use_rans_modes_spans) {
+        // Layout V8: like V7 (flags byte + scale streams), but modes and
+        // spans are rANS-coded. The scale streams are written even when
+        // use_v7 is false; they are empty (count 0) then.
+        tile_writer.write_u32(kLossyTileLayoutTagV8);
         tile_writer.write_u8(syntax_flags);
+        layout_bytes = block_dims_bytes + mark_bytes();
         write_quant_scale_stream(tile_writer, y_blocks);
         write_quant_scale_stream(tile_writer, cb_blocks);
+        v7_scale_bytes = mark_bytes();
+    } else if (use_v7) {
+        tile_writer.write_u32(kLossyTileLayoutTagV7);
+        tile_writer.write_u8(syntax_flags);
+        layout_bytes = block_dims_bytes + mark_bytes();
+        write_quant_scale_stream(tile_writer, y_blocks);
+        write_quant_scale_stream(tile_writer, cb_blocks);
+        v7_scale_bytes = mark_bytes();
     } else if (use_adaptive_span_streams || use_split_magnitude_signs || final_use_shared_chroma_coeff_tables ||
         use_coefficient_table_bank || use_elide_single_symbol_streams ||
         use_coefficient_significance_maps || use_adaptive_coefficient_signs) {
         tile_writer.write_u32(kLossyTileLayoutTagV6);
         tile_writer.write_u8(syntax_flags);
+        layout_bytes = block_dims_bytes + mark_bytes();
     } else if (use_plane_max_coeff_spans) {
         tile_writer.write_u32(kLossyTileLayoutTagV5);
+        layout_bytes = block_dims_bytes + mark_bytes();
     } else {
         tile_writer.write_u32(kLossyTileLayoutTagV4);
+        layout_bytes = block_dims_bytes + mark_bytes();
     }
 
     auto write_block_modes = [&](const std::vector<BlockData>& blocks) -> Result<void> {
@@ -1480,6 +1596,9 @@ static Result<TileEncodeResult> encode_lossy_tile(
         modes.reserve(blocks.size());
         for (const auto& block : blocks) {
             modes.push_back(block.mode);
+        }
+        if (use_rans_modes_spans) {
+            return write_rans_prediction_modes(tile_writer, modes);
         }
         return write_packed_prediction_modes(tile_writer, modes);
     };
@@ -1493,25 +1612,33 @@ static Result<TileEncodeResult> encode_lossy_tile(
     if (!chroma_mode_result) {
         return std::unexpected(chroma_mode_result.error());
     }
+    const size_t mode_bytes = mark_bytes();
 
-    auto y_span_result = use_adaptive_span_streams
-        ? write_adaptive_coefficient_spans(tile_writer, y_spans)
-        : write_packed_coefficient_spans(tile_writer, y_spans);
+    auto write_spans = [&](std::span<const uint8_t> spans) -> Result<void> {
+        if (use_rans_modes_spans) {
+            return write_rans_coefficient_spans(tile_writer, spans);
+        }
+        return use_adaptive_span_streams
+            ? write_adaptive_coefficient_spans(tile_writer, spans)
+            : write_packed_coefficient_spans(tile_writer, spans);
+    };
+
+    auto y_span_result = write_spans(y_spans);
     if (!y_span_result) {
         return std::unexpected(y_span_result.error());
     }
 
-    auto chroma_span_result = use_adaptive_span_streams
-        ? write_adaptive_coefficient_spans(tile_writer, chroma_spans)
-        : write_packed_coefficient_spans(tile_writer, chroma_spans);
+    auto chroma_span_result = write_spans(chroma_spans);
     if (!chroma_span_result) {
         return std::unexpected(chroma_span_result.error());
     }
+    const size_t span_bytes = mark_bytes();
 
     if (use_plane_max_coeff_spans) {
         tile_writer.write_u8(y_max_coeff_span);
         tile_writer.write_u8(chroma_max_coeff_span);
     }
+    const size_t max_span_bytes = mark_bytes();
 
     tile_writer.write_bytes(final_y_payload);
     if (final_use_shared_chroma_coeff_tables) {
@@ -1527,9 +1654,7 @@ static Result<TileEncodeResult> encode_lossy_tile(
         if (!alpha_mode_result) {
             return std::unexpected(alpha_mode_result.error());
         }
-        auto alpha_span_result = use_adaptive_span_streams
-            ? write_adaptive_coefficient_spans(tile_writer, alpha_spans)
-            : write_packed_coefficient_spans(tile_writer, alpha_spans);
+        auto alpha_span_result = write_spans(alpha_spans);
         if (!alpha_span_result) {
             return std::unexpected(alpha_span_result.error());
         }
@@ -1546,10 +1671,84 @@ static Result<TileEncodeResult> encode_lossy_tile(
     result.tile_y = static_cast<uint16_t>(tile_y);
     result.compressed = tile_writer.finish();
     result.quality_score = score;
+    if (stats != nullptr) {
+        // Coefficient-payload split (tables vs coded data): re-encode the
+        // final payloads with the winning config. Deterministic, so the
+        // re-encoded bytes match the payloads written above; the stats
+        // out-param of the encode calls reports the split. Only done
+        // when stats are requested, so normal encodes pay nothing.
+        LossyCoeffStreamConfig final_coeff_config = selected_coeff_config;
+        final_coeff_config.use_table_bank = use_coefficient_table_bank;
+        final_coeff_config.use_table_cluster_selection = use_coefficient_table_bank;
+        final_coeff_config.elide_single_symbol_streams = use_elide_single_symbol_streams;
+        final_coeff_config.use_significance_maps = use_coefficient_significance_maps;
+        final_coeff_config.use_adaptive_sign_streams = use_adaptive_coefficient_signs;
+
+        LossyCoeffPayloadStats y_stats{};
+        auto y_re = encode_lossy_plane_payload(y_quantized_blocks, y_spans, y_max_coeff_span,
+                                               final_coeff_config, &y_stats);
+        LossyCoeffPayloadStats chroma_stats{};
+        LossyCoeffPayloadStats alpha_stats{};
+        if (y_re && y_re->size() == final_y_payload.size()) {
+            if (final_use_shared_chroma_coeff_tables) {
+                auto c_re = encode_lossy_chroma_payload(cb_quantized_blocks, cr_quantized_blocks,
+                                                        chroma_spans, chroma_max_coeff_span,
+                                                        final_coeff_config, &chroma_stats);
+                if (!c_re || c_re->size() != final_shared_chroma_coeff_payload.size()) {
+                    chroma_stats = {};
+                }
+            } else {
+                LossyCoeffPayloadStats cb_stats{};
+                LossyCoeffPayloadStats cr_stats{};
+                auto cb_re = encode_lossy_plane_payload(cb_quantized_blocks, chroma_spans,
+                                                        chroma_max_coeff_span, final_coeff_config, &cb_stats);
+                auto cr_re = encode_lossy_plane_payload(cr_quantized_blocks, chroma_spans,
+                                                        chroma_max_coeff_span, final_coeff_config, &cr_stats);
+                if (cb_re && cr_re &&
+                    cb_re->size() == final_independent_cb_coeff_payload.size() &&
+                    cr_re->size() == final_independent_cr_coeff_payload.size()) {
+                    chroma_stats.flag_bytes = cb_stats.flag_bytes + cr_stats.flag_bytes;
+                    chroma_stats.table_bytes = cb_stats.table_bytes + cr_stats.table_bytes;
+                    chroma_stats.stream_bytes = cb_stats.stream_bytes + cr_stats.stream_bytes;
+                    chroma_stats.total_bytes = cb_stats.total_bytes + cr_stats.total_bytes;
+                } else {
+                    chroma_stats = {};
+                }
+            }
+            if (has_alpha) {
+                auto a_re = encode_lossy_plane_payload(a_quantized_blocks, alpha_spans,
+                                                       alpha_max_coeff_span, final_coeff_config, &alpha_stats);
+                if (!a_re || a_re->size() != final_alpha_payload.size()) {
+                    alpha_stats = {};
+                }
+            }
+        } else {
+            y_stats = {};
+        }
+
+        stats->quant_table_bytes = quant_table_bytes + (has_alpha ? 128u : 0u);
+        stats->layout_bytes = layout_bytes;
+        stats->v7_scale_bytes = v7_scale_bytes;
+        stats->mode_bytes = mode_bytes;
+        stats->span_bytes = span_bytes;
+        stats->max_span_bytes = max_span_bytes;
+        stats->y_coeff_table_bytes = y_stats.table_bytes;
+        stats->y_coeff_stream_bytes = y_stats.stream_bytes;
+        stats->y_coeff_flag_bytes = y_stats.flag_bytes;
+        stats->chroma_coeff_table_bytes = chroma_stats.table_bytes;
+        stats->chroma_coeff_stream_bytes = chroma_stats.stream_bytes;
+        stats->chroma_coeff_flag_bytes = chroma_stats.flag_bytes;
+        stats->alpha_coeff_table_bytes = alpha_stats.table_bytes;
+        stats->alpha_coeff_stream_bytes = alpha_stats.stream_bytes;
+        stats->alpha_coeff_flag_bytes = alpha_stats.flag_bytes;
+        stats->total_bytes = result.compressed.size();
+        result.stats = *stats;
+    }
     return result;
 }
 
-Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig& config) {
+Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig& config,
+                                         EncodeStats* stats = nullptr) {
     uint32_t width = image.width();
     uint32_t height = image.height();
 
@@ -1681,6 +1880,10 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
         for (uint32_t ty = 0; ty < num_ty; ty++) {
             for (uint32_t tx = 0; tx < num_tx; tx++) {
                 auto future = pool.submit([&, tx, ty]() {
+                    // Stats are collected only when the caller asked for
+                    // them; otherwise encode_lossy_tile skips the work.
+                    TileStats tile_stats{};
+                    TileStats* tile_stats_ptr = (stats != nullptr) ? &tile_stats : nullptr;
                     return encode_lossy_tile(
                         y_plane.data(), cb_plane.data(), cr_plane.data(),
                         alpha_plane.empty() ? nullptr : alpha_plane.data(),
@@ -1688,7 +1891,8 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
                         config.quality, fhdr.bit_depth,
                         source_has_alpha,
                         use_yuv420 ? ChromaSubsampling::YUV420
-                                   : ChromaSubsampling::YUV444);
+                                   : ChromaSubsampling::YUV444,
+                        tile_stats_ptr);
                 });
                 futures.push_back(std::move(future));
             }
@@ -1700,6 +1904,10 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
         for (auto& future : futures) {
             auto result = future.get();
             if (!result) return std::unexpected(result.error());
+
+            if (stats != nullptr) {
+                stats->tiles.push_back(result->stats);
+            }
 
             Chunk tile_chunk;
             std::memcpy(tile_chunk.type, CHUNK_TILE, 4);
@@ -1738,6 +1946,20 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
 Result<std::vector<uint8_t>> encode(const Image& image, const EncoderConfig& config) {
     try {
         return encode_impl(image, config);
+    } catch (const std::bad_alloc&) {
+        return std::unexpected(Error{ErrorCode::OutOfMemory, "out of memory while encoding"});
+    } catch (const std::exception& e) {
+        return std::unexpected(Error{ErrorCode::EncodeFailed, std::string("exception while encoding: ") + e.what()});
+    } catch (...) {
+        return std::unexpected(Error{ErrorCode::EncodeFailed, "unknown exception while encoding"});
+    }
+}
+
+Result<std::vector<uint8_t>> encode_with_stats(const Image& image, const EncoderConfig& config,
+                                               EncodeStats& stats) {
+    try {
+        stats.tiles.clear();
+        return encode_impl(image, config, &stats);
     } catch (const std::bad_alloc&) {
         return std::unexpected(Error{ErrorCode::OutOfMemory, "out of memory while encoding"});
     } catch (const std::exception& e) {
