@@ -125,6 +125,7 @@ void print_usage() {
         << "  --yuv444                Use 4:4:4 chroma (default)\n"
         << "  --yuv420                Use 4:2:0 chroma\n"
         << "  --tile-stats            Print a per-tile byte breakdown (tables vs coded data)\n"
+        << "  --coeff-stats           Print per-coefficient-position stream sizes\n"
         << "  --import-exif FILE      Import EXIF from JPEG/TIFF donor file\n"
         << "  --version               Print version\n"
         << "  -h, --help              Show this help\n\n"
@@ -164,6 +165,39 @@ void print_tile_stats(const wk::EncodeStats& stats) {
     }
 }
 
+// Per-coefficient-position stream sizes, aggregated across tiles, for
+// the coeff-squeezing work: shows which zigzag positions eat the bits
+// (0 = DC, 63 = highest frequency).
+void print_coeff_stats(const wk::EncodeStats& stats) {
+    std::array<size_t, 64> y{};
+    std::array<size_t, 64> c{};
+    size_t y_total = 0;
+    size_t c_total = 0;
+    for (const auto& t : stats.tiles) {
+        for (size_t i = 0; i < 64; ++i) {
+            y[i] += t.y_position_stream_bytes[i];
+            c[i] += t.chroma_position_stream_bytes[i];
+        }
+        y_total += t.y_coeff_stream_bytes;
+        c_total += t.chroma_coeff_stream_bytes;
+    }
+    const size_t total = y_total + c_total;
+    size_t sign_total = 0;
+    for (const auto& t : stats.tiles) sign_total += t.y_sign_bytes + t.chroma_sign_bytes;
+    std::cerr << "coeff position stream bytes (Y + chroma, all tiles):\n";
+    std::cerr << " sign bits total: " << sign_total << " B ("
+              << (total == 0 ? 0.0 : 100.0 * static_cast<double>(sign_total) / total)
+              << "% of coeff stream)\n";
+    std::cerr << " pos      Y B    C B  total B   share\n";
+    for (size_t i = 0; i < 64; ++i) {
+        const size_t s = y[i] + c[i];
+        if (s == 0) continue;
+        std::cerr << " " << i << "  " << y[i] << "  " << c[i] << "  " << s << "  "
+                  << (total == 0 ? 0.0 : 100.0 * static_cast<double>(s) / total) << "%\n";
+    }
+    std::cerr << " Y total " << y_total << " B, chroma total " << c_total << " B\n";
+}
+
 
 int main(int argc, char* argv[]) {
     wk::EncoderConfig config;
@@ -171,6 +205,7 @@ int main(int argc, char* argv[]) {
     std::string output_path;
     std::string exif_source_path;
     bool tile_stats = false;
+    bool coeff_stats = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -220,6 +255,9 @@ int main(int argc, char* argv[]) {
             config.subsampling = wk::Subsampling::YUV420;
         } else if (arg == "--tile-stats") {
             tile_stats = true;
+        } else if (arg == "--coeff-stats") {
+            coeff_stats = true;
+            tile_stats = true;  // coeff stats ride on the same EncodeStats
         } else if (arg == "--import-exif") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --import-exif requires a donor file\n";
@@ -270,6 +308,7 @@ int main(int argc, char* argv[]) {
         }
         output_bytes = std::move(*encoded);
         print_tile_stats(stats);
+        if (coeff_stats) print_coeff_stats(stats);
     } else {
         auto encoded = wk::encode(*image, config);
         if (!encoded) {

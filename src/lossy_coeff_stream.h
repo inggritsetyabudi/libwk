@@ -68,11 +68,17 @@ struct DecodedLossyChromaPayload {
 // syntax-efficiency work: it tells which part of the payload dominates
 // (the rANS frequency tables, the rANS-coded coefficient data, or the
 // small flag streams), so an optimization targets the biggest piece.
+// position_stream_bytes is the serialized stream size (presence map +
+// rANS data + sign bits) per coefficient position in zigzag order
+// (0 = DC, 63 = highest frequency), for the coeff-squeezing work.
+// sign_bytes is the packed sign-bit total across all positions.
 struct LossyCoeffPayloadStats {
     size_t flag_bytes = 0;   // significance / sign mode flags
     size_t table_bytes = 0;  // rANS frequency tables (or table bank)
     size_t stream_bytes = 0; // rANS-coded coefficient data
     size_t total_bytes = 0;  // whole payload (== flag + table + stream)
+    size_t sign_bytes = 0;   // packed sign bits (1 bit per nonzero coeff)
+    std::array<size_t, 64> position_stream_bytes{};
 };
 
 [[nodiscard]] Result<std::vector<uint8_t>> encode_lossy_plane_payload(
