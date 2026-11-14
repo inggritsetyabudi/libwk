@@ -16,6 +16,7 @@
 #include "common.h"
 #include "coeff_span_stream.h"
 #include "container.h"
+#include "cclm.h"
 #include "control_field.h"
 #include "superblock_quant.h"
 #include "dct.h"
@@ -436,6 +437,7 @@ static Result<TileEncodeResult> encode_lossy_tile(
     float quality, uint8_t bit_depth, bool has_alpha,
     ChromaSubsampling subsampling,
     bool use_control_field,
+    bool use_cclm,
     TileStats* stats = nullptr) {
 
     if (has_alpha && alpha_plane == nullptr) {
@@ -502,6 +504,9 @@ static Result<TileEncodeResult> encode_lossy_tile(
     }
     cb_blocks.resize(chroma_blocks_x * chroma_blocks_y);
     cr_blocks.resize(chroma_blocks_x * chroma_blocks_y);
+    // Set when any chroma block's RDO picks CCLM; drives the V10
+    // layout (the mode stream may then contain mode 14).
+    bool uses_cclm = false;
     if (has_alpha) {
         a_blocks.resize(blocks_x * blocks_y);
     }
@@ -707,7 +712,9 @@ static Result<TileEncodeResult> encode_lossy_tile(
                                         const int16_t* cr_above,
                                         const int16_t* cr_left,
                                         int16_t cr_above_left,
-                                        float quant_scale = 1.0f) {
+                                        float quant_scale = 1.0f,
+                                        const int16_t* cb_cclm_pred = nullptr,
+                                        const int16_t* cr_cclm_pred = nullptr) {
         RdResult best{PredMode::DC, 1.0e30f};
         int16_t cb_prediction[64];
         int16_t cr_prediction[64];
@@ -745,15 +752,36 @@ static Result<TileEncodeResult> encode_lossy_tile(
 
         for (int mode_index = 0; mode_index < static_cast<int>(PredMode::NUM_MODES); ++mode_index) {
             const PredMode mode = static_cast<PredMode>(mode_index);
-            predict_8x8(mode, cb_above, cb_left, cb_above_left, cb_prediction, max_val);
-            predict_8x8(mode, cr_above, cr_left, cr_above_left, cr_prediction, max_val);
+            if (mode == PredMode::CCLM) {
+                // CCLM predicts chroma from the co-located
+                // reconstructed luma, not from the chroma neighbours,
+                // so it uses the precomputed CCLM predictions.
+                if (cb_cclm_pred == nullptr || cr_cclm_pred == nullptr) continue;
+                std::memcpy(cb_prediction, cb_cclm_pred, sizeof(cb_prediction));
+                std::memcpy(cr_prediction, cr_cclm_pred, sizeof(cr_prediction));
+            } else {
+                predict_8x8(mode, cb_above, cb_left, cb_above_left, cb_prediction, max_val);
+                predict_8x8(mode, cr_above, cr_left, cr_above_left, cr_prediction, max_val);
+            }
 
             float cb_ssd = 0, cb_bits = 0, cr_ssd = 0, cr_bits = 0;
             plane_rd(cb_original, cb_prediction, cb_ssd, cb_bits);
             plane_rd(cr_original, cr_prediction, cr_ssd, cr_bits);
 
             const float distortion = cb_ssd + cr_ssd;
-            const float bits = cb_bits + cr_bits;
+            float bits = cb_bits + cr_bits;
+            if (mode == PredMode::CCLM) {
+                // The RDO above counts only coefficient bits, not the
+                // mode-stream cost. CCLM is a rarer symbol than the
+                // common intra modes, so signalling it costs more in
+                // the rANS mode stream. Charge ~6 bits so CCLM only
+                // wins when its coefficient saving exceeds the mode
+                // overhead; without this, marginal CCLM picks grew
+                // people photos (+0.6-0.8% at q85) even though the
+                // coefficient saving was real. (2 bits fixed q75 only;
+                // 4 bits fixed q85 but left mira +0.45% at q75.)
+                bits += 6.0f;
+            }
             const float cost = distortion + chroma_lambda * bits;
             if (cost < best.cost) {
                 best.mode = mode;
@@ -874,6 +902,25 @@ static Result<TileEncodeResult> encode_lossy_tile(
                     ? c_per_block_scale_index : c_sb_scale_index;
             const float c_block_scale =
                 QuantTable::kQuantScaleFactors[c_block_scale_index];
+            // CCLM predictions for this chroma block (from the
+            // co-located reconstructed luma). Computed here so the
+            // RDO can try CCLM alongside the intra modes. Only when
+            // CCLM is enabled; otherwise the RDO never sees it and
+            // the encoder never emits layout V10.
+            int16_t cb_cclm_pred[64];
+            int16_t cr_cclm_pred[64];
+            const int16_t* cb_cclm_ptr = nullptr;
+            const int16_t* cr_cclm_ptr = nullptr;
+            if (use_cclm) {
+                predict_chroma_block_cclm(reconstructed_y.data(), tw, th,
+                                          reconstructed_cb.data(), chroma_tw, chroma_th,
+                                          bx, by, subsampling, cb_cclm_pred, max_val);
+                predict_chroma_block_cclm(reconstructed_y.data(), tw, th,
+                                          reconstructed_cr.data(), chroma_tw, chroma_th,
+                                          bx, by, subsampling, cr_cclm_pred, max_val);
+                cb_cclm_ptr = cb_cclm_pred;
+                cr_cclm_ptr = cr_cclm_pred;
+            }
             const PredMode chroma_mode = select_joint_chroma_mode(
                 original_cb_block,
                 has_above ? cb_above : nullptr,
@@ -883,19 +930,27 @@ static Result<TileEncodeResult> encode_lossy_tile(
                 has_above ? cr_above : nullptr,
                 has_left ? cr_left : nullptr,
                 cr_above_left,
-                c_block_scale);
+                c_block_scale,
+                cb_cclm_ptr,
+                cr_cclm_ptr);
 
             int16_t cb_prediction[64];
             int16_t cr_prediction[64];
-            predict_8x8(chroma_mode, has_above ? cb_above : nullptr,
-                        has_left ? cb_left : nullptr, cb_above_left, cb_prediction, max_val);
-            predict_8x8(chroma_mode, has_above ? cr_above : nullptr,
-                        has_left ? cr_left : nullptr, cr_above_left, cr_prediction, max_val);
+            if (chroma_mode == PredMode::CCLM) {
+                std::memcpy(cb_prediction, cb_cclm_pred, sizeof(cb_prediction));
+                std::memcpy(cr_prediction, cr_cclm_pred, sizeof(cr_prediction));
+            } else {
+                predict_8x8(chroma_mode, has_above ? cb_above : nullptr,
+                            has_left ? cb_left : nullptr, cb_above_left, cb_prediction, max_val);
+                predict_8x8(chroma_mode, has_above ? cr_above : nullptr,
+                            has_left ? cr_left : nullptr, cr_above_left, cr_prediction, max_val);
+            }
 
             auto& cb_block = cb_blocks[by * chroma_blocks_x + bx];
             auto& cr_block = cr_blocks[by * chroma_blocks_x + bx];
             cb_block.mode = chroma_mode;
             cr_block.mode = chroma_mode;
+            if (chroma_mode == PredMode::CCLM) uses_cclm = true;
             cb_block.quant_scale_index = c_per_block_scale_index;
             cr_block.quant_scale_index = c_per_block_scale_index;
 
@@ -1577,8 +1632,10 @@ static Result<TileEncodeResult> encode_lossy_tile(
     // V9 implies rANS modes/spans (it is V8 plus the superblock map),
     // so a tile that uses the superblock map always takes the rANS
     // path even when packed would have been marginally smaller.
+    // V10 (CCLM) likewise implies rANS, because the mode alphabet
+    // grows to 15 (mode 14 = CCLM) and the rANS stream carries it.
     const bool use_rans_modes_spans =
-        use_v9_superblock_map ||
+        use_v9_superblock_map || uses_cclm ||
         rans_mode_span_bytes < packed_mode_bytes + current_span_bytes;
 
     uint8_t syntax_flags = 0;
@@ -1611,7 +1668,23 @@ static Result<TileEncodeResult> encode_lossy_tile(
     // V7 scale streams, measured as writer-size deltas.
     size_t layout_bytes = 0;
     size_t v7_scale_bytes = 0;
-    if (use_v9_superblock_map) {
+    if (uses_cclm) {
+        // Layout V10: like V9 (flags byte + scale streams + superblock
+        // map + rANS modes and spans), plus the chroma mode stream may
+        // contain mode 14 (CCLM). The superblock map section is always
+        // written (it may be empty, count 0) so the decoder always
+        // reads it in V10, keeping the layout fixed.
+        tile_writer.write_u32(kLossyTileLayoutTagV10);
+        tile_writer.write_u8(syntax_flags);
+        layout_bytes = block_dims_bytes + mark_bytes();
+        write_quant_scale_stream(tile_writer, y_blocks);
+        write_quant_scale_stream(tile_writer, cb_blocks);
+        v7_scale_bytes = mark_bytes();
+        auto map_result = write_superblock_quant_map(tile_writer, superblock_scales);
+        if (!map_result) {
+            return std::unexpected(map_result.error());
+        }
+    } else if (use_v9_superblock_map) {
         // Layout V9: like V8 (flags byte + scale streams + rANS modes
         // and spans), plus the superblock quant map after the scale
         // streams. The map is sparse and tiny (one entry per
@@ -1970,6 +2043,7 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
                         use_yuv420 ? ChromaSubsampling::YUV420
                                    : ChromaSubsampling::YUV444,
                         config.use_control_field,
+                        config.use_cclm,
                         tile_stats_ptr);
                 });
                 futures.push_back(std::move(future));

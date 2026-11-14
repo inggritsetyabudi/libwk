@@ -128,6 +128,8 @@ void print_usage() {
         << "  --coeff-stats           Print per-coefficient-position stream sizes\n"
         << "  --control-field         Enable the Phase 2 perceptual control field (on by default)\n"
         << "  --no-control-field      Disable the perceptual control field\n"
+        << "  --cclm                  Enable CCLM chroma prediction (on by default)\n"
+        << "  --no-cclm               Disable CCLM chroma prediction\n"
         << "  --import-exif FILE      Import EXIF from JPEG/TIFF donor file\n"
         << "  --version               Print version\n"
         << "  -h, --help              Show this help\n\n"
@@ -264,6 +266,10 @@ int main(int argc, char* argv[]) {
             config.use_control_field = true;
         } else if (arg == "--no-control-field") {
             config.use_control_field = false;
+        } else if (arg == "--cclm") {
+            config.use_cclm = true;
+        } else if (arg == "--no-cclm") {
+            config.use_cclm = false;
         } else if (arg == "--import-exif") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --import-exif requires a donor file\n";

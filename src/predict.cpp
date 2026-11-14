@@ -443,6 +443,10 @@ namespace wk
         {
             PredMode mode = static_cast<PredMode>(m);
 
+            // CCLM is chroma-only (it predicts chroma from the
+            // co-located reconstructed luma); it is never a luma mode.
+            if (mode == PredMode::CCLM) continue;
+
             predict_8x8(mode, above, left, above_left, pred, max_val);
 
             for (int i = 0; i < 64; i++)

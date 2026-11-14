@@ -185,7 +185,8 @@ Result<LossyTileSyntaxInfo> parse_lossy_tile_syntax(std::span<const uint8_t> pay
     info.layout_tag = read_le32(payload.data() + kLossySyntaxBaseOffset);
     info.stream_offset = kLossySyntaxBaseOffset + kLayoutTagBytes;
     if (info.layout_tag == kLossyTileLayoutTagV6 || info.layout_tag == kLossyTileLayoutTagV7 ||
-        info.layout_tag == kLossyTileLayoutTagV8) {
+        info.layout_tag == kLossyTileLayoutTagV8 || info.layout_tag == kLossyTileLayoutTagV9 ||
+        info.layout_tag == kLossyTileLayoutTagV10) {
         if (payload.size() <= info.stream_offset) {
             return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload is missing syntax flags"});
         }
@@ -206,9 +207,10 @@ Result<LossyTileSyntaxInfo> parse_lossy_tile_syntax(std::span<const uint8_t> pay
             (info.syntax_flags & kLossyTileSyntaxFlagCoefficientSignificanceMaps) != 0;
         info.adaptive_coefficient_signs =
             (info.syntax_flags & kLossyTileSyntaxFlagAdaptiveCoefficientSigns) != 0;
-        if (info.layout_tag == kLossyTileLayoutTagV7 || info.layout_tag == kLossyTileLayoutTagV8) {
-            // V7/V8 carry two sparse quant-scale streams (luma, then
-            // chroma) after the flags byte: count u16, then count
+        if (info.layout_tag == kLossyTileLayoutTagV7 || info.layout_tag == kLossyTileLayoutTagV8 ||
+            info.layout_tag == kLossyTileLayoutTagV9 || info.layout_tag == kLossyTileLayoutTagV10) {
+            // V7/V8/V9/V10 carry two sparse quant-scale streams (luma,
+            // then chroma) after the flags byte: count u16, then count
             // entries of (block_index u16, scale_index u8). Skip both
             // so stream_offset lands on the mode streams.
             for (int stream = 0; stream < 2; ++stream) {
@@ -219,6 +221,21 @@ Result<LossyTileSyntaxInfo> parse_lossy_tile_syntax(std::span<const uint8_t> pay
                 info.stream_offset += sizeof(uint16_t) + static_cast<size_t>(count) * 3;
                 if (info.stream_offset > payload.size()) {
                     return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload has a truncated V7/V8 scale stream"});
+                }
+            }
+            if (info.layout_tag == kLossyTileLayoutTagV9 || info.layout_tag == kLossyTileLayoutTagV10) {
+                // V9/V10 carry the superblock quant map after the
+                // scale streams: count u16, then count entries of
+                // (superblock_index u16, scale_index u8). Skip it so
+                // stream_offset lands on the mode streams. The map may
+                // be empty (count 0) in V10.
+                if (payload.size() - info.stream_offset < sizeof(uint16_t)) {
+                    return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload is missing a V9/V10 superblock map"});
+                }
+                const uint16_t count = read_le16(payload.data() + info.stream_offset);
+                info.stream_offset += sizeof(uint16_t) + static_cast<size_t>(count) * 3;
+                if (info.stream_offset > payload.size()) {
+                    return std::unexpected(Error{ErrorCode::TruncatedInput, "lossy payload has a truncated V9/V10 superblock map"});
                 }
             }
         }
@@ -796,7 +813,11 @@ TEST(RoundtripTest, BadEntropyStreamRejected) {
     EXPECT_EQ(decoded.error().code, ErrorCode::RansError);
 }
 
-TEST(RoundtripTest, PackedModeStreamCorruptionRejected) {
+TEST(RoundtripTest, ModeStreamCorruptionRejected) {
+    // Was PackedModeStreamCorruptionRejected: the gradient now encodes
+    // as V10 (CCLM is selected for its chroma), so the mode stream is
+    // rANS-coded and a corruption there surfaces as RansError, not
+    // PredictionError. The rejection itself is what matters.
     Image image = make_rgb_gradient(24, 24);
 
     EncoderConfig config;
@@ -824,7 +845,13 @@ TEST(RoundtripTest, PackedModeStreamCorruptionRejected) {
 
     auto decoded = decode(*broken);
     EXPECT_FALSE(decoded.has_value());
-    EXPECT_EQ(decoded.error().code, ErrorCode::PredictionError);
+    // Zeroing the first rANS bytes corrupts the frequency table. The
+    // failure may surface as RansError, as TruncatedInput (the reader
+    // runs out of data), or as PredictionError (the decoded mode
+    // stream has the wrong size). Any of these rejects the file.
+    EXPECT_TRUE(decoded.error().code == ErrorCode::RansError ||
+                decoded.error().code == ErrorCode::TruncatedInput ||
+                decoded.error().code == ErrorCode::PredictionError);
 }
 
 TEST(RoundtripTest, PackedCoefficientSpanCorruptionRejected) {
@@ -846,9 +873,22 @@ TEST(RoundtripTest, PackedCoefficientSpanCorruptionRejected) {
     ASSERT_TRUE(syntax.has_value()) << syntax.error().message;
     const size_t y_blocks = 9;
     const size_t chroma_blocks = 9;
-    const size_t y_mode_stream_bytes = sizeof(uint16_t) + packed_prediction_mode_bytes(y_blocks);
-    const size_t chroma_mode_stream_bytes = sizeof(uint16_t) + packed_prediction_mode_bytes(chroma_blocks);
-    const size_t span_size_offset = syntax->stream_offset + y_mode_stream_bytes + chroma_mode_stream_bytes;
+    // Walk past the mode streams with the library's own readers, so
+    // the span offset is correct whether the modes are packed (V7)
+    // or rANS-coded (V8/V9/V10). The gradient now encodes as V10
+    // (CCLM), so the packed-mode size arithmetic no longer applies.
+    const uint32_t tag = syntax->layout_tag;
+    const bool rans_modes = tag == kLossyTileLayoutTagV8 || tag == kLossyTileLayoutTagV9 ||
+                            tag == kLossyTileLayoutTagV10;
+    ByteReader reader(std::span<const uint8_t>(payload.data() + syntax->stream_offset,
+                                               payload.size() - syntax->stream_offset));
+    auto y_modes = rans_modes ? read_rans_prediction_modes(reader, y_blocks, "luma")
+                              : read_packed_prediction_modes(reader, y_blocks, "luma");
+    ASSERT_TRUE(y_modes.has_value()) << y_modes.error().message;
+    auto c_modes = rans_modes ? read_rans_prediction_modes(reader, chroma_blocks, "chroma")
+                              : read_packed_prediction_modes(reader, chroma_blocks, "chroma");
+    ASSERT_TRUE(c_modes.has_value()) << c_modes.error().message;
+    const size_t span_size_offset = syntax->stream_offset + reader.position();
 
     ASSERT_GT(payload.size(), span_size_offset + sizeof(uint16_t) - 1);
     payload[span_size_offset + 0] = 0;
@@ -859,7 +899,13 @@ TEST(RoundtripTest, PackedCoefficientSpanCorruptionRejected) {
 
     auto decoded = decode(*broken);
     EXPECT_FALSE(decoded.has_value());
-    EXPECT_EQ(decoded.error().code, ErrorCode::DecodeFailed);
+    // V10/rANS: the corrupted span stream fails the rANS decode
+    // (RansError) or corrupts the stream length so the reader runs
+    // out of data (TruncatedInput). Packed layouts: the span count
+    // is out of range (DecodeFailed). Any of these rejects the file.
+    EXPECT_TRUE(decoded.error().code == ErrorCode::RansError ||
+                decoded.error().code == ErrorCode::DecodeFailed ||
+                decoded.error().code == ErrorCode::TruncatedInput);
 }
 
 TEST(RoundtripTest, CoefficientSignCorruptionRejected) {
@@ -1056,28 +1102,49 @@ TEST(RoundtripTest, CoefficientSignModeCorruptionRejected) {
 
     const size_t y_blocks = 9;
     const size_t chroma_blocks = 9;
-    const size_t y_mode_stream_bytes = sizeof(uint16_t) + packed_prediction_mode_bytes(y_blocks);
-    const size_t chroma_mode_stream_bytes = sizeof(uint16_t) + packed_prediction_mode_bytes(chroma_blocks);
-    const size_t y_span_stream_bytes = encoded_coefficient_span_stream_bytes(
-        payload, syntax->stream_offset + y_mode_stream_bytes + chroma_mode_stream_bytes,
-        syntax->adaptive_spans, y_blocks);
-    const size_t chroma_span_stream_bytes = encoded_coefficient_span_stream_bytes(
-        payload, syntax->stream_offset + y_mode_stream_bytes + chroma_mode_stream_bytes + y_span_stream_bytes,
-        syntax->adaptive_spans, chroma_blocks);
-    const size_t plane_extent_bytes = syntax->plane_extents ? 2u : 0u;
+    // Walk past the mode and span streams with the library's own
+    // readers, so the sign-mode offset is correct whether the streams
+    // are packed (V7) or rANS-coded (V8/V9/V10). The gradient now
+    // encodes as V10 (CCLM), so the packed-mode size arithmetic no
+    // longer applies.
+    const uint32_t tag = syntax->layout_tag;
+    const bool rans_streams = tag == kLossyTileLayoutTagV8 || tag == kLossyTileLayoutTagV9 ||
+                              tag == kLossyTileLayoutTagV10;
+    ByteReader reader(std::span<const uint8_t>(payload.data() + syntax->stream_offset,
+                                               payload.size() - syntax->stream_offset));
+    auto y_modes = rans_streams ? read_rans_prediction_modes(reader, y_blocks, "luma")
+                                : read_packed_prediction_modes(reader, y_blocks, "luma");
+    ASSERT_TRUE(y_modes.has_value()) << y_modes.error().message;
+    auto c_modes = rans_streams ? read_rans_prediction_modes(reader, chroma_blocks, "chroma")
+                                : read_packed_prediction_modes(reader, chroma_blocks, "chroma");
+    ASSERT_TRUE(c_modes.has_value()) << c_modes.error().message;
+    auto y_spans = rans_streams ? read_rans_coefficient_spans(reader, y_blocks, "luma")
+                                : (syntax->adaptive_spans
+                                       ? read_adaptive_coefficient_spans(reader, y_blocks, "luma")
+                                       : read_packed_coefficient_spans(reader, y_blocks, "luma"));
+    ASSERT_TRUE(y_spans.has_value()) << y_spans.error().message;
+    auto c_spans = rans_streams ? read_rans_coefficient_spans(reader, chroma_blocks, "chroma")
+                                : (syntax->adaptive_spans
+                                       ? read_adaptive_coefficient_spans(reader, chroma_blocks, "chroma")
+                                       : read_packed_coefficient_spans(reader, chroma_blocks, "chroma"));
+    ASSERT_TRUE(c_spans.has_value()) << c_spans.error().message;
     size_t y_extent = 64;
     if (syntax->plane_extents) {
-        const size_t y_extent_offset = syntax->stream_offset + y_mode_stream_bytes + chroma_mode_stream_bytes +
-                                       y_span_stream_bytes + chroma_span_stream_bytes;
-        ASSERT_GT(payload.size(), y_extent_offset);
-        y_extent = payload[y_extent_offset];
+        auto ext = reader.read_u8();
+        ASSERT_TRUE(ext.has_value()) << ext.error().message;
+        y_extent = *ext;
+        // The second plane-extent byte (chroma).
+        auto ext2 = reader.read_u8();
+        ASSERT_TRUE(ext2.has_value()) << ext2.error().message;
     }
-    const size_t significance_flag_bytes = syntax->coefficient_significance_maps
-        ? packed_coefficient_presence_bytes(y_extent)
-        : 0u;
-    const size_t sign_mode_offset = syntax->stream_offset + y_mode_stream_bytes + chroma_mode_stream_bytes +
-                                    y_span_stream_bytes + chroma_span_stream_bytes + plane_extent_bytes +
-                                    significance_flag_bytes;
+    if (syntax->coefficient_significance_maps) {
+        const size_t sig_bytes = packed_coefficient_presence_bytes(y_extent);
+        for (size_t i = 0; i < sig_bytes; ++i) {
+            auto b = reader.read_u8();
+            ASSERT_TRUE(b.has_value()) << b.error().message;
+        }
+    }
+    const size_t sign_mode_offset = syntax->stream_offset + reader.position();
 
     ASSERT_GT(payload.size(), sign_mode_offset);
     payload[sign_mode_offset] = 0xFF;
@@ -1909,7 +1976,8 @@ TEST(RoundtripTest, V7OnlyWhenPlanarOrScaleUsed) {
         if (tag == kLossyTileLayoutTagV6) {
             return std::pair<int, int>{0, 0};
         }
-        if (tag != kLossyTileLayoutTagV7 && tag != kLossyTileLayoutTagV8) {
+        if (tag != kLossyTileLayoutTagV7 && tag != kLossyTileLayoutTagV8 &&
+            tag != kLossyTileLayoutTagV9 && tag != kLossyTileLayoutTagV10) {
             return std::pair<int, int>{-1, -1};
         }
         // V7/V8 scale streams at offset 278: u16 count, then entries.
@@ -1932,6 +2000,8 @@ TEST(RoundtripTest, V7OnlyWhenPlanarOrScaleUsed) {
 
     // A smooth gradient uses planar and must be V7 or V8 -- and the tag
     // must be truthful: a planar mode is actually in the mode stream.
+    // (V9/V10 are also accepted: V9 when the superblock map is
+    // nontrivial, V10 when CCLM is selected for the chroma.)
     Image gradient = make_rgb_gradient(64, 64);
     auto encoded = encode(gradient, config);
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
@@ -1944,17 +2014,20 @@ TEST(RoundtripTest, V7OnlyWhenPlanarOrScaleUsed) {
                          (static_cast<uint32_t>(payload[274]) << 8) |
                          (static_cast<uint32_t>(payload[275]) << 16) |
                          (static_cast<uint32_t>(payload[276]) << 24);
-    ASSERT_TRUE(tag == kLossyTileLayoutTagV7 || tag == kLossyTileLayoutTagV8)
-        << "gradient must use V7 or V8";
+    ASSERT_TRUE(tag == kLossyTileLayoutTagV7 || tag == kLossyTileLayoutTagV8 ||
+                tag == kLossyTileLayoutTagV9 || tag == kLossyTileLayoutTagV10)
+        << "gradient must use V7, V8, V9 or V10";
     auto syntax = parse_lossy_tile_syntax(payload);
     ASSERT_TRUE(syntax.has_value()) << syntax.error().message;
     ByteReader reader(std::span<const uint8_t>(payload.data() + syntax->stream_offset,
                                                payload.size() - syntax->stream_offset));
-    auto y_modes = tag == kLossyTileLayoutTagV8
+    const bool rans_modes = tag == kLossyTileLayoutTagV8 || tag == kLossyTileLayoutTagV9 ||
+                            tag == kLossyTileLayoutTagV10;
+    auto y_modes = rans_modes
         ? read_rans_prediction_modes(reader, 64, "luma")
         : read_packed_prediction_modes(reader, 64, "luma");
     ASSERT_TRUE(y_modes.has_value()) << y_modes.error().message;
-    auto chroma_modes = tag == kLossyTileLayoutTagV8
+    auto chroma_modes = rans_modes
         ? read_rans_prediction_modes(reader, 64, "chroma")
         : read_packed_prediction_modes(reader, 64, "chroma");
     ASSERT_TRUE(chroma_modes.has_value()) << chroma_modes.error().message;

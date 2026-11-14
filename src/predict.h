@@ -41,7 +41,14 @@ enum class PredMode : uint8_t {
     D207     = 11,
     D63      = 12,
     PLANAR   = 13,
-    NUM_MODES = 14,
+    // Cross-component linear model (chroma only): predict chroma from
+    // the co-located reconstructed luma as a*luma + b, with (a, b)
+    // derived from the neighbouring reconstructed luma/chroma
+    // (see cclm.h). Only valid for chroma blocks in layout V10+; a
+    // decoder MUST reject CCLM in a luma mode stream or in a layout
+    // below V10. The mode stream alphabet grows to 15 (0-14).
+    CCLM     = 14,
+    NUM_MODES = 15,
 };
 
 
