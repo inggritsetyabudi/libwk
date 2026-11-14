@@ -2136,3 +2136,54 @@ TEST(RoundtripTest, LosslessLegacyRawTablesStillDecode) {
                            decoded->pixels().begin()))
         << "legacy raw-table lossless file must decode pixel-identical";
 }
+
+TEST(RoundtripTest, ControlFieldSuperblockMapRoundtrips) {
+    // Phase 3 (V9): a deterministic high-variance texture so the
+    // control field marks superblocks Textured and the encoder writes
+    // a V9 superblock quant map. The file must decode cleanly, the
+    // PSNR must stay sane, and the map must actually engage (the V9
+    // file is smaller than the same image encoded with the field off,
+    // because textured superblocks take the coarser step).
+    Image image(128, 128, BitDepth::Bits8, true);
+    uint32_t seed = 0x12345678u;
+    for (uint32_t y = 0; y < 128; ++y) {
+        uint8_t* row = image.row(y);
+        for (uint32_t x = 0; x < 128; ++x) {
+            for (int c = 0; c < 3; ++c) {
+                // xorshift32: deterministic, high-variance texture.
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                row[x * 4 + c] = static_cast<uint8_t>(seed & 0xff);
+            }
+            row[x * 4 + 3] = 255;
+        }
+    }
+
+    EncoderConfig on;
+    on.quality = 75.0f;
+    on.tile_size_log2 = 7;
+    on.use_control_field = true;
+    auto encoded_on = encode(image, on);
+    ASSERT_TRUE(encoded_on.has_value()) << encoded_on.error().message;
+
+    EncoderConfig off;
+    off.quality = 75.0f;
+    off.tile_size_log2 = 7;
+    auto encoded_off = encode(image, off);
+    ASSERT_TRUE(encoded_off.has_value()) << encoded_off.error().message;
+
+    auto decoded = decode(*encoded_on);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    EXPECT_EQ(decoded->width(), 128u);
+    EXPECT_EQ(decoded->height(), 128u);
+
+    auto metrics = wk::metrics::compare_images(image, *decoded);
+    ASSERT_TRUE(metrics.has_value()) << "metrics compare failed: " << metrics.error().message;
+    EXPECT_GT(metrics->psnr, 20.0) << "V9 PSNR too low: " << metrics->psnr;
+    // The textured superblocks take the coarser step, so the V9 file
+    // must be smaller than the field-off file of the same image.
+    EXPECT_LT(encoded_on->size(), encoded_off->size())
+        << "V9 file (" << encoded_on->size() << " B) should be smaller than "
+        << "field-off file (" << encoded_off->size() << " B) on a textured image";
+}
