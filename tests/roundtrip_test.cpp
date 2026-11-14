@@ -1981,6 +1981,9 @@ TEST(RoundtripTest, V7EmptyScaleListsDecodeIdenticalToV6) {
     EncoderConfig config;
     config.quality = 75.0f;
     config.subsampling = Subsampling::YUV444;
+    // The control field is on by default; this fixture needs a plain
+    // V6 tile, so turn it off explicitly.
+    config.use_control_field = false;
 
     auto encoded = encode(image, config);
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
@@ -2170,6 +2173,7 @@ TEST(RoundtripTest, ControlFieldSuperblockMapRoundtrips) {
     EncoderConfig off;
     off.quality = 75.0f;
     off.tile_size_log2 = 7;
+    off.use_control_field = false;
     auto encoded_off = encode(image, off);
     ASSERT_TRUE(encoded_off.has_value()) << encoded_off.error().message;
 
