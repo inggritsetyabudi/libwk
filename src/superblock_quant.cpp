@@ -6,47 +6,52 @@
 namespace wk {
 namespace {
 
-// Quant scale indices into QuantTable::kQuantScaleFactors.
+// Quant scale index for identity (1.0). The textured-superblock
+// coarser step (scale index 5 = 1.25) is DISABLED by measurement
+// (2026-11-14, option (d) policy review) and must not be re-enabled
+// by only changing this constant — see aggregate_superblock_scales.
+//
+// What was measured (6 benchmark photos, q75/q85, V10 default):
+//   * threshold 0.75 (the old policy): total -0.48% q75 / -0.44% q85,
+//     but meadow PSNR -0.97 dB q75 (40.45 -> 39.48 dB, SSIM -0.002)
+//     and -0.61 dB q85. The saving came almost entirely from meadow
+//     itself (4,124 of 5,794 B saved at q75), i.e. the policy bought
+//     size by hurting exactly the photo it hurt most.
+//   * thresholds 0.85 / 0.90 / 1.0 (only 100%-textured superblocks):
+//     meadow recovered only to 39.59 / 39.62 / 39.91 dB at q75 —
+//     still -0.54 dB at 1.0 — because meadow grass is uniformly
+//     textured at the superblock level (19 of 90 superblocks are
+//     >=75% textured, mean textured fraction 0.97).
+//   * no activity/edge gate separates the cases either: hit
+//     superblocks in meadow have mean activity 0.99, in ember and
+//     noctis 0.91 — a saturated, razor-thin gap — and edge fraction
+//     is ~0 everywhere. The maximum "safe" saving (ember + noctis
+//     only) is ~0.14% of total size at q75: not worth any policy.
+//   * conclusion: with the current Textured classifier the "busy
+//     blocks mask coarser quant" assumption does not hold — the
+//     texture here is real detail, not masking-friendly noise, and
+//     the luma-prediction investigation the same day found the same
+//     thing (residual dominated by unpredictable texture). So the
+//     quant bias is off; the control field stays computed (it may
+//     guide transform/filter choices later, roadmap Phase 2) and the
+//     superblock map format is unchanged (old V9/V10 files with a
+//     non-trivial map still decode; the encoder just never emits one
+//     from the field now).
 constexpr uint8_t kScaleIdentity = 4;
-constexpr uint8_t kScaleCoarser = 5;  // 1.25 — textured superblocks
-
-// A superblock goes coarser when at least this fraction of its blocks
-// are Textured. 0.75 is conservative: the superblock must be clearly
-// dominated by texture for the coarser step to be safe. 0.5 was tried
-// and rejected (2026-11-14): meadow (grass detail) lost 1.27 dB PSNR
-// at q75 for only 3.6% saving, because its texture is real detail,
-// not masking-friendly noise — a majority-textured superblock is not
-// textured enough.
-constexpr float kTexturedFractionMin = 0.75f;
 
 }  // namespace
 
 std::vector<uint8_t> aggregate_superblock_scales(
     const std::vector<BlockControl>& field, uint32_t blocks_x, uint32_t blocks_y) {
+    // The textured-superblock coarser step is disabled (see above):
+    // every superblock stays at identity regardless of content.
+    // `field` is kept in the signature so the encoder's call site and
+    // any future policy do not need to change; it is intentionally
+    // unused here.
+    (void)field;
     const uint32_t sbx_count = superblocks_x(blocks_x);
     const uint32_t sby_count = superblocks_y(blocks_y);
-    std::vector<uint8_t> scales(sbx_count * sby_count, kScaleIdentity);
-    for (uint32_t sby = 0; sby < sby_count; ++sby) {
-        for (uint32_t sbx = 0; sbx < sbx_count; ++sbx) {
-            size_t textured = 0;
-            size_t total = 0;
-            for (uint32_t by = sby * kSuperblockBlocks;
-                 by < std::min((sby + 1) * kSuperblockBlocks, blocks_y); ++by) {
-                for (uint32_t bx = sbx * kSuperblockBlocks;
-                     bx < std::min((sbx + 1) * kSuperblockBlocks, blocks_x); ++bx) {
-                    const size_t idx = static_cast<size_t>(by) * blocks_x + bx;
-                    if (idx >= field.size()) continue;
-                    ++total;
-                    if (field[idx].content == BlockContent::Textured) ++textured;
-                }
-            }
-            if (total > 0 &&
-                static_cast<float>(textured) / static_cast<float>(total) >= kTexturedFractionMin) {
-                scales[sby * sbx_count + sbx] = kScaleCoarser;
-            }
-        }
-    }
-    return scales;
+    return std::vector<uint8_t>(sbx_count * sby_count, kScaleIdentity);
 }
 
 bool superblock_map_is_nontrivial(const std::vector<uint8_t>& scales) {

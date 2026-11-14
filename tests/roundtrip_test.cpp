@@ -2215,11 +2215,17 @@ TEST(RoundtripTest, LosslessLegacyRawTablesStillDecode) {
 
 TEST(RoundtripTest, ControlFieldSuperblockMapRoundtrips) {
     // Phase 3 (V9): a deterministic high-variance texture so the
-    // control field marks superblocks Textured and the encoder writes
-    // a V9 superblock quant map. The file must decode cleanly, the
-    // PSNR must stay sane, and the map must actually engage (the V9
-    // file is smaller than the same image encoded with the field off,
-    // because textured superblocks take the coarser step).
+    // control field marks superblocks Textured. The file must decode
+    // cleanly and the PSNR must stay sane. Since 2026-11-14
+    // (option (d)) the textured-superblock coarser step is DISABLED
+    // by measurement — coarsening real texture bought size with
+    // disproportionate PSNR loss (meadow -0.97 dB at q75) — so the
+    // field-on file must be the SAME size as the field-off file of
+    // the same image (the field changes nothing now), not smaller.
+    // The map machinery itself (write/read of a non-trivial map) is
+    // covered by the SuperblockQuantTest unit tests, and old V9/V10
+    // files with a non-trivial map still decode via the 12-file
+    // backward-compat gate.
     Image image(128, 128, BitDepth::Bits8, true);
     uint32_t seed = 0x12345678u;
     for (uint32_t y = 0; y < 128; ++y) {
@@ -2258,9 +2264,11 @@ TEST(RoundtripTest, ControlFieldSuperblockMapRoundtrips) {
     auto metrics = wk::metrics::compare_images(image, *decoded);
     ASSERT_TRUE(metrics.has_value()) << "metrics compare failed: " << metrics.error().message;
     EXPECT_GT(metrics->psnr, 20.0) << "V9 PSNR too low: " << metrics->psnr;
-    // The textured superblocks take the coarser step, so the V9 file
-    // must be smaller than the field-off file of the same image.
-    EXPECT_LT(encoded_on->size(), encoded_off->size())
-        << "V9 file (" << encoded_on->size() << " B) should be smaller than "
-        << "field-off file (" << encoded_off->size() << " B) on a textured image";
+    // The textured coarser step is disabled (see above), so the V9
+    // file must be the same size as the field-off file of the same
+    // image — the field no longer changes the quant.
+    EXPECT_EQ(encoded_on->size(), encoded_off->size())
+        << "field-on file (" << encoded_on->size() << " B) should equal the "
+        << "field-off file (" << encoded_off->size() << " B) on a textured image "
+        << "now that the textured coarser step is disabled";
 }
