@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #include "lossless.h"
+#include "coeff_table_stream.h"
 #include <unordered_map>
 #include <algorithm>
 #include <cmath>
@@ -282,7 +283,12 @@ Result<std::vector<uint8_t>> lossless_encode(
 
 
     ByteWriter header;
-    header.write_u8(static_cast<uint8_t>(use_palette ? 1 : 0));
+    // Adaptive frequency tables (bit 1) apply to the non-palette path
+    // only; the palette path carries no frequency tables.
+    const uint8_t flags = static_cast<uint8_t>(
+        (use_palette ? kLosslessTransformFlagPalette : 0) |
+        (use_palette ? 0 : kLosslessTransformFlagAdaptiveTables));
+    header.write_u8(flags);
     header.write_u8(static_cast<uint8_t>(pred_mode));
 
     if (use_palette) {
@@ -341,10 +347,11 @@ Result<std::vector<uint8_t>> lossless_encode(
             RansTable<RANS_PRECISION_BITS> table;
             table.build_from_counts(counts, 256);
 
-
-            for (int i = 0; i < 256; i++) {
-                header.write_u16(table.symbol(i).freq);
-            }
+            // Adaptive table encoding (Slice 3): picks the smallest of
+            // single-symbol / sparse / dense forms instead of raw
+            // 256 x uint16. Never more than ~5 B worse per channel.
+            auto table_r = write_coefficient_table(header, table, 256, nullptr);
+            if (!table_r) return std::unexpected(table_r.error());
 
 
             RansEncoder<RANS_PRECISION_BITS> enc;
@@ -377,9 +384,23 @@ Result<std::vector<uint8_t>> lossless_decode(
     ByteReader reader(data);
     size_t pixel_count = static_cast<size_t>(width) * height;
 
-    auto use_palette_r = reader.read_u8();
-    if (!use_palette_r) return std::unexpected(use_palette_r.error());
-    bool use_palette = *use_palette_r != 0;
+    auto flags_r = reader.read_u8();
+    if (!flags_r) return std::unexpected(flags_r.error());
+    const uint8_t flags = *flags_r;
+    const bool use_palette = (flags & kLosslessTransformFlagPalette) != 0;
+    const bool adaptive_tables =
+        (flags & kLosslessTransformFlagAdaptiveTables) != 0;
+    // Reserved bits must be zero; the adaptive-tables bit is meaningless
+    // (and invalid) on the palette path, which carries no tables.
+    if ((flags & ~(kLosslessTransformFlagPalette |
+                   kLosslessTransformFlagAdaptiveTables)) != 0) {
+        return std::unexpected(Error{ErrorCode::LosslessError,
+            "lossless transform flags have reserved bits set"});
+    }
+    if (use_palette && adaptive_tables) {
+        return std::unexpected(Error{ErrorCode::LosslessError,
+            "lossless adaptive-tables flag set on palette path"});
+    }
 
     auto pred_mode_r = reader.read_u8();
     if (!pred_mode_r) return std::unexpected(pred_mode_r.error());
@@ -461,13 +482,20 @@ Result<std::vector<uint8_t>> lossless_decode(
         for (int ch = 0; ch < 4; ch++) {
 
             RansTable<RANS_PRECISION_BITS> table;
-            uint32_t counts[256];
-            for (int i = 0; i < 256; i++) {
-                auto f = reader.read_u16();
-                if (!f) return std::unexpected(f.error());
-                counts[i] = *f;
+            if (adaptive_tables) {
+                auto table_r = read_coefficient_table(reader, 256, "lossless");
+                if (!table_r) return std::unexpected(table_r.error());
+                table = std::move(*table_r);
+            } else {
+                // Legacy raw tables: 256 x uint16 frequencies.
+                uint32_t counts[256];
+                for (int i = 0; i < 256; i++) {
+                    auto f = reader.read_u16();
+                    if (!f) return std::unexpected(f.error());
+                    counts[i] = *f;
+                }
+                table.build_from_counts(counts, 256);
             }
-            table.build_from_counts(counts, 256);
 
 
             auto enc_size = reader.read_u32();
