@@ -2226,7 +2226,7 @@ void wk_encoder_config_init(wk_encoder_config_t* config) {
     config->target_ssimulacra2 = 0.0f;
     config->chroma_subsampling = 0;
     config->full_range = 1;
-    config->adaptive_chroma_subsampling = 0;
+    config->adaptive_chroma_subsampling = 1;
     config->adaptive_chroma_laplacian_threshold = 2.1f;
 }
 

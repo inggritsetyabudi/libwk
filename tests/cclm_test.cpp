@@ -153,6 +153,9 @@ TEST(CclmTest, RoundtripCorrelatedImageUsesV10AndDecodes) {
     EncoderConfig config;
     config.quality = 75.0f;
     config.subsampling = Subsampling::YUV444;
+    config.adaptive_chroma_subsampling = false;  // isolate CCLM: the linear
+                                                  // gradient below has c_lap ~ 0
+                                                  // and would otherwise go V11
     auto encoded = encode(image, config);
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
     auto parsed = parse_container(*encoded);
