@@ -283,22 +283,4 @@ private:
     bool ok_ = false;
 };
 
-inline uint32_t pixel_context_hash(const uint8_t* above, const uint8_t* left,
-                                    const uint8_t* above_left, int channel) {
-    uint32_t hash = 0;
-    if (above) {
-        hash ^= static_cast<uint32_t>(above[channel]) * 2654435761u;
-    }
-    if (left) {
-        hash ^= static_cast<uint32_t>(left[channel]) * 2246822519u;
-    }
-    if (above_left) {
-        hash ^= static_cast<uint32_t>(above_left[channel]) * 3266489917u;
-    }
-    return hash;
-}
-
-inline int ac_context(int zigzag_index, int plane) {
-    return plane * 64 + zigzag_index;
-}
 }
