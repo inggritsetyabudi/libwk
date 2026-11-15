@@ -99,6 +99,15 @@ Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& co
         auto tile_data = tile_payload_view(file->tile_chunks.front(), header);
         if (!tile_data) return std::unexpected(tile_data.error());
 
+        // A lossless image is one tile holding the whole frame, so its
+        // coordinates must be (0, 0): the lossy path rejects out-of-range
+        // coordinates, and the lossless path must not silently accept a
+        // tile that claims to sit elsewhere.
+        if (header.tile_x != 0 || header.tile_y != 0) {
+            return std::unexpected(Error{ErrorCode::InvalidTileCoord,
+                                         "lossless tile must be at (0, 0)"});
+        }
+
         auto decoded = lossless_decode(*tile_data, width, height, hdr.bit_depth);
         if (!decoded) return std::unexpected(decoded.error());
 
