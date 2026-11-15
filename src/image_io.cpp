@@ -14,6 +14,8 @@
 // limitations under the License.
 
 #include "image_io.h"
+#include "stb/stb_image.h"
+#include "stb/stb_image_write.h"
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -21,12 +23,6 @@
 #include <memory>
 #include <sstream>
 #include <vector>
-
-#ifdef _WIN32
-#include <objbase.h>
-#include <windows.h>
-#include <wincodec.h>
-#endif
 
 namespace wk::io {
 
@@ -207,271 +203,77 @@ Result<void> save_ppm(std::string_view path, const Image& image) {
     return {};
 }
 
-#ifdef _WIN32
-
-struct ComReleaser {
-    template <typename T>
-    void operator()(T* ptr) const {
-        if (ptr) {
-            ptr->Release();
-        }
+// stb_image decodes JPG/PNG/BMP/TGA/GIF (and more) on every platform,
+// replacing the old Windows-only WIC path: wkenc could only read PPM
+// on Linux/Termux, and wkdec could only write PNG on Windows.
+// Dimensions are probed with stbi_info first so a file claiming a huge
+// size is rejected before any raster allocation (same caps as the
+// container: 65535 per side, 2^28 pixels).
+Result<Image> load_stb_image(std::string_view path) {
+    const std::string file_path(path);
+    int width = 0, height = 0, channels = 0;
+    if (stbi_info(file_path.c_str(), &width, &height, &channels) == 0) {
+        return std::unexpected(Error{ErrorCode::IoError,
+                                     std::string("failed to read image: ") + stbi_failure_reason()});
     }
-};
-
-template <typename T>
-using ComPtr = std::unique_ptr<T, ComReleaser>;
-
-class ScopedComInit {
-public:
-    ScopedComInit() {
-        hr_ = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (width <= 0 || height <= 0 || width > 65535 || height > 65535 ||
+        static_cast<uint64_t>(width) * static_cast<uint64_t>(height) > (1u << 28)) {
+        return std::unexpected(Error{ErrorCode::InvalidHeader, "image dimensions out of range"});
     }
-
-    ~ScopedComInit() {
-        if (SUCCEEDED(hr_)) {
-            CoUninitialize();
-        }
+    if (channels != 1 && channels != 2 && channels != 3 && channels != 4) {
+        return std::unexpected(Error{ErrorCode::UnsupportedFeature, "unsupported channel count"});
     }
 
-    [[nodiscard]] bool ok() const {
-        return SUCCEEDED(hr_) || hr_ == RPC_E_CHANGED_MODE;
+    unsigned char* data = stbi_load(file_path.c_str(), &width, &height, &channels, 0);
+    if (!data) {
+        return std::unexpected(Error{ErrorCode::IoError,
+                                     std::string("failed to load image: ") + stbi_failure_reason()});
     }
 
-    [[nodiscard]] HRESULT hr() const {
-        return hr_;
+    const bool has_alpha = (channels == 2 || channels == 4);
+    Image image(static_cast<uint32_t>(width), static_cast<uint32_t>(height), BitDepth::Bits8,
+                has_alpha);
+    const size_t pixel_count = static_cast<size_t>(width) * static_cast<size_t>(height);
+    auto out = image.pixels();
+    switch (channels) {
+        case 1:
+            for (size_t i = 0; i < pixel_count; ++i) {
+                out[i * 3 + 0] = data[i];
+                out[i * 3 + 1] = data[i];
+                out[i * 3 + 2] = data[i];
+            }
+            break;
+        case 2:
+            for (size_t i = 0; i < pixel_count; ++i) {
+                out[i * 4 + 0] = data[i * 2 + 0];
+                out[i * 4 + 1] = data[i * 2 + 0];
+                out[i * 4 + 2] = data[i * 2 + 0];
+                out[i * 4 + 3] = data[i * 2 + 1];
+            }
+            break;
+        case 3:
+        case 4:
+            std::copy(data, data + pixel_count * static_cast<size_t>(channels), out.begin());
+            break;
     }
-
-private:
-    HRESULT hr_ = E_FAIL;
-};
-
-std::wstring utf8_to_wide(std::string_view input) {
-    if (input.empty()) {
-        return {};
-    }
-
-    int length = MultiByteToWideChar(CP_UTF8, 0, input.data(), static_cast<int>(input.size()), nullptr, 0);
-    UINT codepage = CP_UTF8;
-    if (length == 0) {
-        codepage = CP_ACP;
-        length = MultiByteToWideChar(codepage, 0, input.data(), static_cast<int>(input.size()), nullptr, 0);
-    }
-    std::wstring output(static_cast<size_t>(length), L'\0');
-    MultiByteToWideChar(codepage, 0, input.data(), static_cast<int>(input.size()), output.data(), length);
-    return output;
-}
-
-Error wic_error(HRESULT hr, std::string message) {
-    std::ostringstream builder;
-    builder << std::move(message) << " (HRESULT=0x" << std::hex << static_cast<unsigned long>(hr) << ')';
-    return Error{ErrorCode::IoError, builder.str()};
-}
-
-bool format_supports_transparency(IWICImagingFactory* factory, REFWICPixelFormatGUID format) {
-    IWICComponentInfo* raw_component = nullptr;
-    if (FAILED(factory->CreateComponentInfo(format, &raw_component))) {
-        return false;
-    }
-    ComPtr<IWICComponentInfo> component(raw_component);
-
-    IWICPixelFormatInfo2* raw_info = nullptr;
-    if (FAILED(component->QueryInterface(IID_IWICPixelFormatInfo2, reinterpret_cast<void**>(&raw_info)))) {
-        return false;
-    }
-    ComPtr<IWICPixelFormatInfo2> info(raw_info);
-
-    BOOL supports = FALSE;
-    if (FAILED(info->SupportsTransparency(&supports))) {
-        return false;
-    }
-    return supports != FALSE;
-}
-
-Result<Image> load_wic_image(std::string_view path) {
-    ScopedComInit com;
-    if (!com.ok()) {
-        return std::unexpected(wic_error(com.hr(), "failed to initialize COM"));
-    }
-
-    IWICImagingFactory* raw_factory = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                  IID_IWICImagingFactory, reinterpret_cast<void**>(&raw_factory));
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to create WIC factory"));
-    }
-    ComPtr<IWICImagingFactory> factory(raw_factory);
-
-    IWICBitmapDecoder* raw_decoder = nullptr;
-    const std::wstring wide_path = utf8_to_wide(path);
-    hr = factory->CreateDecoderFromFilename(wide_path.c_str(), nullptr, GENERIC_READ,
-                                            WICDecodeMetadataCacheOnLoad, &raw_decoder);
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to open image file"));
-    }
-    ComPtr<IWICBitmapDecoder> decoder(raw_decoder);
-
-    IWICBitmapFrameDecode* raw_frame = nullptr;
-    hr = decoder->GetFrame(0, &raw_frame);
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to read image frame"));
-    }
-    ComPtr<IWICBitmapFrameDecode> frame(raw_frame);
-
-    UINT width = 0;
-    UINT height = 0;
-    hr = frame->GetSize(&width, &height);
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to read image dimensions"));
-    }
-
-    WICPixelFormatGUID source_format = {};
-    hr = frame->GetPixelFormat(&source_format);
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to read source pixel format"));
-    }
-    const bool has_alpha = format_supports_transparency(factory.get(), source_format);
-
-    IWICFormatConverter* raw_converter = nullptr;
-    hr = factory->CreateFormatConverter(&raw_converter);
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to create format converter"));
-    }
-    ComPtr<IWICFormatConverter> converter(raw_converter);
-
-    const WICPixelFormatGUID target_format = has_alpha ? GUID_WICPixelFormat32bppRGBA : GUID_WICPixelFormat24bppRGB;
-    hr = converter->Initialize(frame.get(), target_format,
-                               WICBitmapDitherTypeNone, nullptr, 0.0,
-                               WICBitmapPaletteTypeCustom);
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to convert image to an 8-bit RGB format"));
-    }
-
-    Image image(width, height, BitDepth::Bits8, has_alpha);
-    const UINT stride = width * image.bytes_per_pixel();
-    hr = converter->CopyPixels(nullptr, stride,
-                               static_cast<UINT>(image.pixels().size()),
-                               image.pixels().data());
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to copy image pixels"));
-    }
-
+    stbi_image_free(data);
     return image;
 }
 
-Result<void> save_png(std::string_view path, const Image& image) {
+Result<void> save_stb_png(std::string_view path, const Image& image) {
     if (image.bit_depth() != BitDepth::Bits8) {
         return std::unexpected(Error{ErrorCode::UnsupportedFeature, "PNG output only supports 8-bit images"});
     }
-
-    ScopedComInit com;
-    if (!com.ok()) {
-        return std::unexpected(wic_error(com.hr(), "failed to initialize COM"));
+    const int channels = image.has_alpha() ? 4 : 3;
+    const int stride = static_cast<int>(image.width()) * channels;
+    const int ok = stbi_write_png(std::string(path).c_str(), static_cast<int>(image.width()),
+                                  static_cast<int>(image.height()), channels,
+                                  image.pixels().data(), stride);
+    if (ok == 0) {
+        return std::unexpected(Error{ErrorCode::IoError, "failed to write PNG file"});
     }
-
-    IWICImagingFactory* raw_factory = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                  IID_IWICImagingFactory, reinterpret_cast<void**>(&raw_factory));
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to create WIC factory"));
-    }
-    ComPtr<IWICImagingFactory> factory(raw_factory);
-
-    IWICStream* raw_stream = nullptr;
-    hr = factory->CreateStream(&raw_stream);
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to create WIC stream"));
-    }
-    ComPtr<IWICStream> stream(raw_stream);
-
-    const std::wstring wide_path = utf8_to_wide(path);
-    hr = stream->InitializeFromFilename(wide_path.c_str(), GENERIC_WRITE);
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to open PNG output"));
-    }
-
-    IWICBitmapEncoder* raw_encoder = nullptr;
-    hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &raw_encoder);
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to create PNG encoder"));
-    }
-    ComPtr<IWICBitmapEncoder> encoder(raw_encoder);
-
-    hr = encoder->Initialize(stream.get(), WICBitmapEncoderNoCache);
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to initialize PNG encoder"));
-    }
-
-    IWICBitmapFrameEncode* raw_frame = nullptr;
-    IPropertyBag2* raw_props = nullptr;
-    hr = encoder->CreateNewFrame(&raw_frame, &raw_props);
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to create PNG frame"));
-    }
-    ComPtr<IWICBitmapFrameEncode> frame(raw_frame);
-    ComPtr<IPropertyBag2> props(raw_props);
-
-    hr = frame->Initialize(props.get());
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to initialize PNG frame"));
-    }
-
-    hr = frame->SetSize(image.width(), image.height());
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to set PNG size"));
-    }
-
-    std::vector<uint8_t> encoded_pixels;
-    const size_t pixel_count = static_cast<size_t>(image.width()) * image.height();
-    const auto pixels = image.pixels();
-    UINT stride = 0;
-    WICPixelFormatGUID pixel_format = GUID_WICPixelFormat24bppBGR;
-
-    if (image.has_alpha()) {
-        pixel_format = GUID_WICPixelFormat32bppBGRA;
-        stride = image.width() * 4;
-        encoded_pixels.resize(pixel_count * 4);
-        for (size_t i = 0; i < pixel_count; ++i) {
-            encoded_pixels[i * 4 + 0] = pixels[i * 4 + 2];
-            encoded_pixels[i * 4 + 1] = pixels[i * 4 + 1];
-            encoded_pixels[i * 4 + 2] = pixels[i * 4 + 0];
-            encoded_pixels[i * 4 + 3] = pixels[i * 4 + 3];
-        }
-    } else {
-        pixel_format = GUID_WICPixelFormat24bppBGR;
-        stride = image.width() * 3;
-        encoded_pixels.resize(pixel_count * 3);
-        for (size_t i = 0; i < pixel_count; ++i) {
-            encoded_pixels[i * 3 + 0] = pixels[i * 3 + 2];
-            encoded_pixels[i * 3 + 1] = pixels[i * 3 + 1];
-            encoded_pixels[i * 3 + 2] = pixels[i * 3 + 0];
-        }
-    }
-
-    hr = frame->SetPixelFormat(&pixel_format);
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to set PNG pixel format"));
-    }
-
-    hr = frame->WritePixels(image.height(), stride,
-                            static_cast<UINT>(encoded_pixels.size()),
-                            encoded_pixels.data());
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to write PNG pixels"));
-    }
-
-    hr = frame->Commit();
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to finalize PNG frame"));
-    }
-    hr = encoder->Commit();
-    if (FAILED(hr)) {
-        return std::unexpected(wic_error(hr, "failed to finalize PNG file"));
-    }
-
     return {};
 }
-
-#endif
 
 }
 
@@ -480,11 +282,10 @@ Result<Image> load_image_file(std::string_view path) {
     if (ext == ".ppm") {
         return load_ppm(path);
     }
-#ifdef _WIN32
-    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png") {
-        return load_wic_image(path);
+    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" ||
+        ext == ".tga" || ext == ".gif") {
+        return load_stb_image(path);
     }
-#endif
     return std::unexpected(Error{ErrorCode::UnsupportedFeature, "unsupported input image format"});
 }
 
@@ -493,11 +294,9 @@ Result<void> save_image_file(std::string_view path, const Image& image) {
     if (ext == ".ppm") {
         return save_ppm(path, image);
     }
-#ifdef _WIN32
     if (ext == ".png") {
-        return save_png(path, image);
+        return save_stb_png(path, image);
     }
-#endif
     return std::unexpected(Error{ErrorCode::UnsupportedFeature, "unsupported output image format"});
 }
 
