@@ -31,6 +31,7 @@
 #include <wk/wk.hpp>
 #include <wk/wk.h>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <new>
