@@ -100,6 +100,15 @@ Result<void> lz_decode_indices(const std::vector<LzToken>& tokens, uint8_t* indi
     uint8_t bit_depth);
 
 
+// Encodes just the palette path's inner payload (u16 count, count x u32
+// colors, u32 token count, LZ tokens) for one image. Returns nullopt
+// when the image has more than 256 colors. The caller writes the
+// transform-flags and predictor-mode bytes around it; the predictor
+// mode is meaningless on the palette path (the decoder ignores it).
+[[nodiscard]] std::optional<std::vector<uint8_t>> lossless_encode_palette(
+    const uint8_t* rgba, uint32_t width, uint32_t height);
+
+
 [[nodiscard]] Result<std::vector<uint8_t>> lossless_decode(
     std::span<const uint8_t> data, uint32_t width, uint32_t height,
     uint8_t bit_depth);

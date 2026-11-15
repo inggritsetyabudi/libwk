@@ -89,38 +89,107 @@ Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& co
 
     Image output(width, height, static_cast<BitDepth>(hdr.bit_depth), hdr.has_alpha());
     if (hdr.is_lossless()) {
-        // The lossless path decodes a single tile holding the whole
-        // frame: extra tiles would be silently ignored if accepted.
-        if (file->tile_chunks.size() != 1) {
+        // A lossless frame is either the pre-0.2.8 format (one tile at
+        // (0,0) holding the whole frame) or the per-tile format (v0.2.8:
+        // tile_count() tiles covering the grid exactly once). A single
+        // tile at (0,0) is always read as the whole frame, so old files
+        // decode unchanged; a file with any other tile count must cover
+        // the grid exactly once, like the lossy path. Animated files
+        // keep the old rule: the encoder never produces animated
+        // lossless, so a multi-tile animated lossless file is not a
+        // format this decoder has to support.
+        if (hdr.is_animated() || file->tile_chunks.size() == 1) {
+            if (file->tile_chunks.size() != 1) {
+                return std::unexpected(Error{ErrorCode::DecodeFailed,
+                                             "lossless image must have exactly one tile"});
+            }
+
+            TileHeader header;
+            auto tile_data = tile_payload_view(file->tile_chunks.front(), header);
+            if (!tile_data) return std::unexpected(tile_data.error());
+
+            // A lossless image is one tile holding the whole frame, so its
+            // coordinates must be (0, 0): the lossy path rejects out-of-range
+            // coordinates, and the lossless path must not silently accept a
+            // tile that claims to sit elsewhere.
+            if (header.tile_x != 0 || header.tile_y != 0) {
+                return std::unexpected(Error{ErrorCode::InvalidTileCoord,
+                                             "lossless tile must be at (0, 0)"});
+            }
+
+            auto decoded = lossless_decode(*tile_data, width, height, hdr.bit_depth);
+            if (!decoded) return std::unexpected(decoded.error());
+
+            if (hdr.has_alpha()) {
+                std::memcpy(output.pixels().data(), decoded->data(),
+                            std::min(decoded->size(), output.pixels().size()));
+            } else {
+                const size_t pixel_count = static_cast<size_t>(width) * height;
+                for (size_t i = 0; i < pixel_count; ++i) {
+                    output.pixels()[i * 3 + 0] = (*decoded)[i * 4 + 0];
+                    output.pixels()[i * 3 + 1] = (*decoded)[i * 4 + 1];
+                    output.pixels()[i * 3 + 2] = (*decoded)[i * 4 + 2];
+                }
+            }
+            return output;
+        }
+
+        // Per-tile format: the TILE chunks must cover the frame grid
+        // exactly once. A truncated file (fewer chunks than the grid)
+        // fails here; a single tile payload decoded as a whole frame
+        // above fails in the rANS/LZ stream instead -- either way it
+        // fails loudly, never as wrong pixels.
+        const uint32_t tiles_x = hdr.tiles_x();
+        const uint32_t tiles_y = hdr.tiles_y();
+        if (file->tile_chunks.size() != hdr.tile_count()) {
             return std::unexpected(Error{ErrorCode::DecodeFailed,
-                                         "lossless image must have exactly one tile"});
+                                         "tile chunk count does not match frame grid"});
+        }
+        std::vector<char> seen(static_cast<size_t>(tiles_x) * tiles_y, 0);
+        for (const auto& tile_chunk : file->tile_chunks) {
+            TileHeader tile_header;
+            auto tile_data = tile_payload_view(tile_chunk, tile_header);
+            if (!tile_data) return std::unexpected(tile_data.error());
+            if (tile_header.tile_x >= tiles_x || tile_header.tile_y >= tiles_y) {
+                return std::unexpected(Error{ErrorCode::InvalidTileCoord,
+                                             "tile coordinates out of range"});
+            }
+            const size_t index = static_cast<size_t>(tile_header.tile_y) * tiles_x +
+                                 tile_header.tile_x;
+            if (seen[index]) {
+                return std::unexpected(Error{ErrorCode::InvalidTileCoord,
+                                             "duplicate tile chunk"});
+            }
+            seen[index] = 1;
         }
 
-        TileHeader header;
-        auto tile_data = tile_payload_view(file->tile_chunks.front(), header);
-        if (!tile_data) return std::unexpected(tile_data.error());
+        const uint32_t tile_size = hdr.tile_size();
+        for (const auto& tile_chunk : file->tile_chunks) {
+            TileHeader tile_header;
+            auto tile_data = tile_payload_view(tile_chunk, tile_header);
+            if (!tile_data) return std::unexpected(tile_data.error());
+            const uint32_t tw = std::min(tile_size, width - tile_header.tile_x * tile_size);
+            const uint32_t th = std::min(tile_size, height - tile_header.tile_y * tile_size);
 
-        // A lossless image is one tile holding the whole frame, so its
-        // coordinates must be (0, 0): the lossy path rejects out-of-range
-        // coordinates, and the lossless path must not silently accept a
-        // tile that claims to sit elsewhere.
-        if (header.tile_x != 0 || header.tile_y != 0) {
-            return std::unexpected(Error{ErrorCode::InvalidTileCoord,
-                                         "lossless tile must be at (0, 0)"});
-        }
+            auto tile_decoded = lossless_decode(*tile_data, tw, th, hdr.bit_depth);
+            if (!tile_decoded) return std::unexpected(tile_decoded.error());
 
-        auto decoded = lossless_decode(*tile_data, width, height, hdr.bit_depth);
-        if (!decoded) return std::unexpected(decoded.error());
-
-        if (hdr.has_alpha()) {
-            std::memcpy(output.pixels().data(), decoded->data(),
-                        std::min(decoded->size(), output.pixels().size()));
-        } else {
-            const size_t pixel_count = static_cast<size_t>(width) * height;
-            for (size_t i = 0; i < pixel_count; ++i) {
-                output.pixels()[i * 3 + 0] = (*decoded)[i * 4 + 0];
-                output.pixels()[i * 3 + 1] = (*decoded)[i * 4 + 1];
-                output.pixels()[i * 3 + 2] = (*decoded)[i * 4 + 2];
+            const uint32_t dst_x0 = tile_header.tile_x * tile_size;
+            const uint32_t dst_y0 = tile_header.tile_y * tile_size;
+            for (uint32_t y = 0; y < th; ++y) {
+                uint8_t* dst_row = output.row(dst_y0 + y);
+                for (uint32_t x = 0; x < tw; ++x) {
+                    const size_t src = (static_cast<size_t>(y) * tw + x) * 4;
+                    if (hdr.has_alpha()) {
+                        uint8_t* dst = dst_row + (dst_x0 + x) * 4;
+                        std::memcpy(dst, tile_decoded->data() + src, 4);
+                    } else {
+                        uint8_t* dst = dst_row + (dst_x0 + x) * 3;
+                        dst[0] = (*tile_decoded)[src + 0];
+                        dst[1] = (*tile_decoded)[src + 1];
+                        dst[2] = (*tile_decoded)[src + 2];
+                    }
+                }
             }
         }
         return output;

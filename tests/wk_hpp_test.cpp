@@ -50,5 +50,5 @@ TEST(WkHppTest, PublicHeaderIsSelfContained) {
 TEST(WkHppTest, VersionMatchesSpec) {
     // Pins the reported version to the SPEC/CMake version, so it cannot
     // silently go stale again (it stayed "0.2.1" through V11 / 0.2.6).
-    EXPECT_EQ(wk::version(), "0.2.7");
+    EXPECT_EQ(wk::version(), "0.2.8");
 }
