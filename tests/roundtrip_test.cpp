@@ -317,6 +317,67 @@ TEST(RoundtripTest, LosslessSmallImage) {
     EXPECT_TRUE(std::equal(image.pixels().begin(), image.pixels().end(), decoded->pixels().begin()));
 }
 
+// A lossless image is a single tile holding the whole frame, so its
+// coordinates must be (0, 0). The lossy path already rejects
+// out-of-range coordinates; the lossless path used to silently accept
+// any tile_x/tile_y (found by the stage-7 mutation fuzzer, exp-j1:
+// 49/49 single-mutation tile_xy cases accepted).
+TEST(RoundtripTest, LosslessNonzeroTileCoordRejected) {
+    Image image(16, 16, BitDepth::Bits8, true);
+    for (uint32_t y = 0; y < 16; ++y) {
+        uint8_t* row = image.row(y);
+        for (uint32_t x = 0; x < 16; ++x) {
+            row[x * 4 + 0] = static_cast<uint8_t>(x * 16);
+            row[x * 4 + 1] = static_cast<uint8_t>(y * 16);
+            row[x * 4 + 2] = static_cast<uint8_t>((x + y) * 8);
+            row[x * 4 + 3] = 255;
+        }
+    }
+
+    EncoderConfig config;
+    config.lossless = true;
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    ASSERT_EQ(file->tile_chunks.size(), 1u);
+    ASSERT_GE(file->tile_chunks[0].payload.size(), 9u);
+
+    // The tile header's first two payload bytes are tile_x (u16 LE).
+    for (uint16_t bad_coord : {1u, 0xFFFFu}) {
+        auto mutated = *file;
+        mutated.tile_chunks[0].payload[0] = static_cast<uint8_t>(bad_coord & 0xFF);
+        mutated.tile_chunks[0].payload[1] = static_cast<uint8_t>(bad_coord >> 8);
+
+        auto rewritten = write_container(mutated);
+        ASSERT_TRUE(rewritten.has_value()) << rewritten.error().message;
+
+        auto decoded = decode(*rewritten);
+        EXPECT_FALSE(decoded.has_value()) << "lossless tile_x=" << bad_coord << " accepted";
+        if (!decoded.has_value()) {
+            EXPECT_EQ(decoded.error().code, ErrorCode::InvalidTileCoord);
+        }
+    }
+
+    // tile_y lives at payload bytes 2-3.
+    {
+        auto mutated = *file;
+        mutated.tile_chunks[0].payload[2] = 1;
+        mutated.tile_chunks[0].payload[3] = 0;
+
+        auto rewritten = write_container(mutated);
+        ASSERT_TRUE(rewritten.has_value()) << rewritten.error().message;
+
+        auto decoded = decode(*rewritten);
+        EXPECT_FALSE(decoded.has_value()) << "lossless tile_y=1 accepted";
+        if (!decoded.has_value()) {
+            EXPECT_EQ(decoded.error().code, ErrorCode::InvalidTileCoord);
+        }
+    }
+}
+
 TEST(RoundtripTest, LossySolidColor) {
     Image image(64, 64, BitDepth::Bits8, true);
     for (uint32_t y = 0; y < 64; ++y) {
