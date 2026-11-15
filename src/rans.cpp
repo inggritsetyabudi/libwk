@@ -17,40 +17,6 @@
 
 namespace wk {
 
-// Only rans.cpp uses this (the explicit instantiations below), so
-// it lives here instead of in rans.h.
-template<int PrecisionBits = RANS_PRECISION_BITS>
-class ContextRansTables {
-public:
-    explicit ContextRansTables(int num_contexts, int num_symbols)
-        : num_contexts_(num_contexts), num_symbols_(num_symbols) {
-        tables_.resize(num_contexts_);
-    }
-
-    void build_context(int context, const uint32_t* counts) {
-        tables_[context].build_from_counts(counts, num_symbols_);
-    }
-
-    void build_all_uniform() {
-        for (auto& table : tables_) {
-            table.build_uniform(num_symbols_);
-        }
-    }
-
-    [[nodiscard]] const RansTable<PrecisionBits>& table(int context) const {
-        return tables_[context % num_contexts_];
-    }
-
-    [[nodiscard]] int num_contexts() const { return num_contexts_; }
-
-private:
-    int num_contexts_;
-    int num_symbols_;
-    std::vector<RansTable<PrecisionBits>> tables_;
-};
-
-
-
 template class RansTable<10>;
 template class RansTable<11>;
 template class RansTable<12>;
@@ -65,10 +31,5 @@ template class RansDecoder<10>;
 template class RansDecoder<11>;
 template class RansDecoder<12>;
 template class RansDecoder<14>;
-
-template class ContextRansTables<10>;
-template class ContextRansTables<11>;
-template class ContextRansTables<12>;
-template class ContextRansTables<14>;
 
 }
