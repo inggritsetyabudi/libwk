@@ -165,66 +165,6 @@ Result<void> lz_decode_indices(const std::vector<LzToken>& tokens,
 
 
 
-EntropyImage build_entropy_image(const uint8_t* rgba, uint32_t width, uint32_t height,
-                                  int max_context_sets) {
-    EntropyImage ei;
-    ei.subsample_log2 = 4;
-    uint32_t k = 1u << ei.subsample_log2;
-    ei.meta_width = (width + k - 1) / k;
-    ei.meta_height = (height + k - 1) / k;
-    ei.context_map.resize(ei.meta_width * ei.meta_height);
-
-
-
-    max_context_sets = std::min(max_context_sets, 12);
-
-    std::vector<float> entropies(ei.meta_width * ei.meta_height);
-    float max_entropy = 0;
-
-    for (uint32_t my = 0; my < ei.meta_height; my++) {
-        for (uint32_t mx = 0; mx < ei.meta_width; mx++) {
-
-            uint32_t hist[256] = {};
-            uint32_t total = 0;
-
-            uint32_t y0 = my * k, y1 = std::min(y0 + k, height);
-            uint32_t x0 = mx * k, x1 = std::min(x0 + k, width);
-
-            for (uint32_t y = y0; y < y1; y++) {
-                for (uint32_t x = x0; x < x1; x++) {
-
-                    hist[rgba[(y * width + x) * 4 + 1]]++;
-                    total++;
-                }
-            }
-
-
-            float entropy = 0;
-            for (int i = 0; i < 256; i++) {
-                if (hist[i] > 0) {
-                    float p = static_cast<float>(hist[i]) / total;
-                    entropy -= p * std::log2(p);
-                }
-            }
-            entropies[my * ei.meta_width + mx] = entropy;
-            max_entropy = std::max(max_entropy, entropy);
-        }
-    }
-
-
-    ei.num_context_sets = max_context_sets;
-    for (size_t i = 0; i < entropies.size(); i++) {
-        float normalized = (max_entropy > 0) ? entropies[i] / max_entropy : 0;
-        int ctx = static_cast<int>(normalized * (max_context_sets - 1) + 0.5f);
-        ei.context_map[i] = static_cast<uint8_t>(
-            std::clamp(ctx, 0, max_context_sets - 1));
-    }
-
-    return ei;
-}
-
-
-
 static inline uint8_t predict_pixel(LosslessPred mode, uint8_t l, uint8_t t,
                                      uint8_t tr, uint8_t tl) {
     switch (mode) {
@@ -332,19 +272,43 @@ Result<std::vector<uint8_t>> lossless_encode(
 
 
     Palette palette;
-    bool use_palette = build_palette(rgba, width, height, palette);
+    const bool palette_possible = build_palette(rgba, width, height, palette);
 
+    // Palette path payload (when the image fits a palette): the palette
+    // itself plus LZ-coded indices. Encoded into a temp buffer so it can
+    // be compared against the predictor path below.
+    std::vector<uint8_t> palette_payload;
+    if (palette_possible) {
+        ByteWriter pw;
+        pw.write_u16(static_cast<uint16_t>(palette.count));
+        for (int i = 0; i < palette.count; i++) {
+            pw.write_u32(palette.colors[i]);
+        }
+        std::vector<uint8_t> indices(pixel_count);
+        apply_palette(rgba, width, height, palette, indices.data());
+        auto tokens = lz_encode_indices(indices.data(), pixel_count);
+        pw.write_u32(static_cast<uint32_t>(tokens.size()));
+        for (const auto& tok : tokens) {
+            pw.write_u8(static_cast<uint8_t>(tok.type));
+            if (tok.type == LzToken::LITERAL) {
+                pw.write_u8(tok.literal);
+            } else {
+                pw.write_u16(tok.distance);
+                pw.write_u16(tok.length);
+            }
+        }
+        palette_payload = pw.finish();
+    }
 
-
-    // Predictor selection (non-palette path only): measure the true
-    // coded size of the top-3 candidates and keep the smallest.
-    // Ranking from tools/lossless_gap_diag (2026-11-15): MED, SELECT,
-    // CLAMP_ADD are the top 3 on every benchmark photo by a clear
-    // margin; the rest are 5-15% worse. The winner's bytes are
-    // already encoded, so there is no re-encode.
+    // Predictor selection: measure the true coded size of the top-3
+    // candidates and keep the smallest. Ranking from
+    // tools/lossless_gap_diag (2026-11-15): MED, SELECT, CLAMP_ADD are
+    // the top 3 on every benchmark photo by a clear margin; the rest
+    // are 5-15% worse. The winner's bytes are already encoded, so there
+    // is no re-encode.
     LosslessPred pred_mode = LosslessPred::SELECT;
     std::vector<uint8_t> nonpalette_payload;
-    if (!use_palette) {
+    {
         size_t best_size = std::numeric_limits<size_t>::max();
         for (LosslessPred cand : {LosslessPred::SELECT, LosslessPred::MED,
                                   LosslessPred::CLAMP_ADD}) {
@@ -360,6 +324,16 @@ Result<std::vector<uint8_t>> lossless_encode(
         }
     }
 
+    // Path selection: the palette is not always smaller. A smooth
+    // 256-color gradient predicts to near-zero residuals (499 B) while
+    // its palette path costs 7,193 B in LZ indices; a 2-color
+    // checkerboard is 14.5% smaller via predictors (measured
+    // 2026-11-15, exp-h1). Encode both paths and keep the smaller; the
+    // palette wins ties. The flags byte tells the decoder which path
+    // the payload holds, so the format is unchanged.
+    const bool use_palette =
+        palette_possible && palette_payload.size() <= nonpalette_payload.size();
+
     ByteWriter header;
     // Adaptive frequency tables (bit 1) apply to the non-palette path
     // only; the palette path carries no frequency tables.
@@ -370,28 +344,7 @@ Result<std::vector<uint8_t>> lossless_encode(
     header.write_u8(static_cast<uint8_t>(pred_mode));
 
     if (use_palette) {
-        header.write_u16(static_cast<uint16_t>(palette.count));
-        for (int i = 0; i < palette.count; i++) {
-            header.write_u32(palette.colors[i]);
-        }
-
-
-        std::vector<uint8_t> indices(pixel_count);
-        apply_palette(rgba, width, height, palette, indices.data());
-
-        auto tokens = lz_encode_indices(indices.data(), pixel_count);
-
-
-        header.write_u32(static_cast<uint32_t>(tokens.size()));
-        for (const auto& tok : tokens) {
-            header.write_u8(static_cast<uint8_t>(tok.type));
-            if (tok.type == LzToken::LITERAL) {
-                header.write_u8(tok.literal);
-            } else {
-                header.write_u16(tok.distance);
-                header.write_u16(tok.length);
-            }
-        }
+        header.write_bytes(palette_payload);
     } else {
         // Winner's bytes were encoded during selection above.
         header.write_bytes(nonpalette_payload);

@@ -2265,6 +2265,46 @@ TEST(RoundtripTest, LosslessMedPredictorSelectedOnPhoto) {
         << "lossless with MED must decode pixel-identical";
 }
 
+TEST(RoundtripTest, LosslessPredictorPathBeatsPaletteOnSmoothGradient) {
+    // A smooth gradient fits a palette (127 unique colors) but predicts
+    // to near-zero residuals, so the predictor path must win over the
+    // palette path (measured 2026-11-15, exp-h1: a 256-color gradient
+    // is 499 B via predictors vs 7,193 B via palette). The encoder
+    // encodes both paths and keeps the smaller.
+    Image image(64, 64, BitDepth::Bits8, false);
+    for (uint32_t y = 0; y < 64; ++y) {
+        uint8_t* row = image.row(y);
+        for (uint32_t x = 0; x < 64; ++x) {
+            row[x * 3 + 0] = static_cast<uint8_t>(x + y);
+            row[x * 3 + 1] = 128;
+            row[x * 3 + 2] = 200;
+        }
+    }
+
+    EncoderConfig config;
+    config.lossless = true;
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto parsed = parse_container(*encoded);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ASSERT_EQ(parsed->tile_chunks.size(), 1u);
+    const auto& payload = parsed->tile_chunks[0].payload;
+    ASSERT_GE(payload.size(), 11u);
+    // Tile payload offset 9 = transform flags: bit 0 is the palette
+    // path, bit 1 is adaptive tables (non-palette path). The gradient
+    // must take the predictor path (0x02), not the palette path (0x01).
+    EXPECT_EQ(payload[9], 0x02u) << "smooth gradient must use predictor path, not palette";
+
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    EXPECT_EQ(decoded->width(), 64u);
+    EXPECT_EQ(decoded->height(), 64u);
+    EXPECT_TRUE(std::equal(image.pixels().begin(), image.pixels().end(),
+                           decoded->pixels().begin()))
+        << "lossless via predictor path must decode pixel-identical";
+}
+
 TEST(RoundtripTest, LosslessUnknownPredictorRejected) {
     // A predictor mode outside the enum (>= NUM_PREDS = 14) must be
     // rejected, not silently decoded to wrong pixels.
