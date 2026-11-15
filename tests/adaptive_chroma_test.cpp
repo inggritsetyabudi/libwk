@@ -108,3 +108,61 @@ TEST(AdaptiveChroma, DegenerateTileStays444) {
     EXPECT_FALSE(should_subsample_chroma_420(cb.data(), cr.data(), 8, 8, 0, 0, 2, 8));
     EXPECT_FALSE(should_subsample_chroma_420(cb.data(), cr.data(), 8, 8, 0, 0, 8, 1));
 }
+
+TEST(AdaptiveChroma, P999CatchesSharpEdgeTheMeanDrowns) {
+    // 64x64 tile, one vertical Cb step of 100 at column 32 (the f1
+    // step_edge probe, scaled down). The mean is low (only 2 of 62
+    // interior columns carry the step) but p999 is high.
+    // Mean: 124 pixels at |lap| 100 over 3844 interior Cb pixels,
+    // c_lap = 0.5 * 12400/3844 = 1.6129 < 2.1. p999 = 100 (124 of 7688
+    // values are 100, more than the 0.1% the percentile needs).
+    // sat_p999 = 100 (the col-32 step pixels are saturated, sat 100).
+    std::vector<int16_t> cb(64 * 64), cr(64 * 64, 128);
+    for (uint32_t r = 0; r < 64; ++r) {
+        for (uint32_t c = 0; c < 64; ++c) {
+            cb[r * 64 + c] = static_cast<int16_t>(c < 32 ? 128 : 228);
+        }
+    }
+    const auto stats = chroma_laplacian_stats(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64);
+    EXPECT_NEAR(stats.mean, 1.6129, 1e-3);
+    EXPECT_DOUBLE_EQ(stats.p999, 100.0);
+    EXPECT_DOUBLE_EQ(stats.sat_p999, 100.0);
+    // Second conditions off: the mean alone sends it to 420.
+    EXPECT_TRUE(should_subsample_chroma_420(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64,
+                                            2.1, 0.0, 0.0));
+    // p999 alone forces 444, and so does sat_p999 alone.
+    EXPECT_FALSE(should_subsample_chroma_420(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64,
+                                             2.1, 79.0, 0.0));
+    EXPECT_FALSE(should_subsample_chroma_420(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64,
+                                             2.1, 0.0, 100.0));
+    EXPECT_FALSE(should_subsample_chroma_420(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64,
+                                             2.1, 79.0, 100.0));
+}
+
+TEST(AdaptiveChroma, SatP999CatchesSmallSaturatedFeature) {
+    // 256x256 tile, flat except an 8x8 saturated block (Cr 212, sat 84)
+    // at the centre (the d_skin lips, scaled down). Only 60 of 129032
+    // |lap| values are non-zero, so the plain p999 is 0 and misses it;
+    // but 28 of them sit on saturated pixels, so sat_p999 is 168.
+    // Mean c_lap = 5376 / 129032 = 0.0417 < 2.1.
+    std::vector<int16_t> cb(256 * 256, 128), cr(256 * 256, 128);
+    for (uint32_t r = 124; r < 132; ++r) {
+        for (uint32_t c = 124; c < 132; ++c) {
+            cr[r * 256 + c] = 212;
+        }
+    }
+    const auto stats = chroma_laplacian_stats(cb.data(), cr.data(), 256, 256, 0, 0, 256, 256);
+    EXPECT_NEAR(stats.mean, 0.0417, 1e-3);
+    EXPECT_DOUBLE_EQ(stats.p999, 0.0);
+    EXPECT_DOUBLE_EQ(stats.sat_p999, 168.0);
+    // Mean alone, and p999 alone, both send it to 420 (the d_skin miss).
+    EXPECT_TRUE(should_subsample_chroma_420(cb.data(), cr.data(), 256, 256, 0, 0, 256, 256,
+                                            2.1, 0.0, 0.0));
+    EXPECT_TRUE(should_subsample_chroma_420(cb.data(), cr.data(), 256, 256, 0, 0, 256, 256,
+                                            2.1, 79.0, 0.0));
+    // The saturated p999 catches it and forces 444.
+    EXPECT_FALSE(should_subsample_chroma_420(cb.data(), cr.data(), 256, 256, 0, 0, 256, 256,
+                                             2.1, 0.0, 100.0));
+    EXPECT_FALSE(should_subsample_chroma_420(cb.data(), cr.data(), 256, 256, 0, 0, 256, 256,
+                                             2.1, 79.0, 100.0));
+}

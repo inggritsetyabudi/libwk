@@ -139,6 +139,10 @@ void print_usage() {
         << "                          Disable adaptive chroma subsampling (default)\n"
         << "  --chroma-lap-threshold F\n"
         << "                          Laplacian threshold for adaptive subsampling (default: 2.1)\n"
+        << "  --chroma-lap-p999-threshold F\n"
+        << "                          Force 444 when a tile's p99.9 |Laplacian| reaches F (0: off)\n"
+        << "  --chroma-lap-sat-p999-threshold F\n"
+        << "                          Force 444 when a tile's saturated p99.9 |Laplacian| reaches F (0: off)\n"
         << "  --import-exif FILE      Import EXIF from JPEG/TIFF donor file\n"
         << "  --metrics               Decode the output and report PSNR/SSIM vs the source\n"
         << "  -v, --verbose           Show debug logs (per-step detail)\n"
@@ -298,6 +302,28 @@ int main(int argc, char* argv[]) {
                 config.adaptive_chroma_laplacian_threshold = std::stof(argv[++i]);
             } catch (...) {
                 std::cerr << "Error: invalid Laplacian threshold\n";
+                return 1;
+            }
+        } else if (arg == "--chroma-lap-p999-threshold") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --chroma-lap-p999-threshold requires a value\n";
+                return 1;
+            }
+            try {
+                config.adaptive_chroma_lap_p999_threshold = std::stof(argv[++i]);
+            } catch (...) {
+                std::cerr << "Error: invalid p999 threshold\n";
+                return 1;
+            }
+        } else if (arg == "--chroma-lap-sat-p999-threshold") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --chroma-lap-sat-p999-threshold requires a value\n";
+                return 1;
+            }
+            try {
+                config.adaptive_chroma_lap_sat_p999_threshold = std::stof(argv[++i]);
+            } catch (...) {
+                std::cerr << "Error: invalid saturated p999 threshold\n";
                 return 1;
             }
         } else if (arg == "--import-exif") {
