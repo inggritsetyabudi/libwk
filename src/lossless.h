@@ -95,30 +95,6 @@ Result<void> lz_decode_indices(const std::vector<LzToken>& tokens, uint8_t* indi
 
 
 
-struct EntropyImage {
-    uint8_t  subsample_log2 = 2;
-    uint32_t meta_width  = 0;
-    uint32_t meta_height = 0;
-    std::vector<uint8_t> context_map;
-    int num_context_sets = 1;
-};
-
-
-EntropyImage build_entropy_image(const uint8_t* rgba, uint32_t width, uint32_t height,
-                                  int max_context_sets = 12);
-
-
-inline int get_context_set(const EntropyImage& ei, uint32_t x, uint32_t y) {
-    uint32_t mx = x >> ei.subsample_log2;
-    uint32_t my = y >> ei.subsample_log2;
-    mx = std::min(mx, ei.meta_width - 1);
-    my = std::min(my, ei.meta_height - 1);
-    return ei.context_map[my * ei.meta_width + mx];
-}
-
-
-
-
 [[nodiscard]] Result<std::vector<uint8_t>> lossless_encode(
     const uint8_t* rgba, uint32_t width, uint32_t height,
     uint8_t bit_depth);
