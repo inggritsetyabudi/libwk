@@ -138,27 +138,6 @@ TEST_F(PredictTest, ModeSelectionHorizontal) {
     auto result = select_best_mode(original, above, left, above_left, 1.0f, 255, quant, 8);
     EXPECT_EQ(result.mode, PredMode::H);
 }
-TEST_F(PredictTest, DeterministicModeNoNeighborsUsesDc128) {
-    EXPECT_EQ(select_deterministic_mode(nullptr, nullptr, above_left, 255), PredMode::DC_128);
-}
-
-TEST_F(PredictTest, DeterministicModeSingleEdgeFollowsDirection) {
-    EXPECT_EQ(select_deterministic_mode(above, nullptr, above_left, 255), PredMode::V);
-    EXPECT_EQ(select_deterministic_mode(nullptr, left, above_left, 255), PredMode::H);
-}
-
-TEST_F(PredictTest, DeterministicModeSmoothCornerUsesTrueMotion) {
-    int16_t smooth_above[8] = {130, 131, 131, 132, 132, 133, 133, 134};
-    int16_t smooth_left[8] = {130, 130, 131, 131, 132, 132, 133, 133};
-    EXPECT_EQ(select_deterministic_mode(smooth_above, smooth_left, 130, 255), PredMode::TM);
-}
-
-TEST_F(PredictTest, DeterministicModeDisjointEdgesUsesDc) {
-    int16_t flat_above[8] = {200, 200, 200, 200, 200, 200, 200, 200};
-    int16_t flat_left[8] = {40, 40, 40, 40, 40, 40, 40, 40};
-    EXPECT_EQ(select_deterministic_mode(flat_above, flat_left, 128, 255), PredMode::DC);
-}
-
 TEST_F(PredictTest, AllModesProduceValid) {
     for (int m = 0; m < static_cast<int>(PredMode::NUM_MODES); m++) {
         predict_8x8(static_cast<PredMode>(m), above, left, above_left, pred, 255);

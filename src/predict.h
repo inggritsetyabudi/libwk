@@ -86,9 +86,6 @@ RdResult select_best_mode(const int16_t* original, const int16_t* above,
                            const QuantTable& quant, uint8_t bit_depth,
                            float quant_scale = 1.0f);
 
-PredMode select_deterministic_mode(const int16_t* above, const int16_t* left,
-                                   int16_t above_left, int16_t max_val);
-
 float compute_ssd_8x8(const int16_t* a, const int16_t* b);
 
 
