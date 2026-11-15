@@ -14,13 +14,16 @@
 // limitations under the License.
 #include "../src/common.h"
 #include "../src/image_io.h"
+#ifdef WK_VIEWER_GUI
 #include <MiniFB.h>
+#endif
 #include <wk/wk.hpp>
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -31,6 +34,14 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -122,8 +133,10 @@ struct ViewerState {
     ViewerLayout layout;
     DisplayBuffer present;
     ViewerDocument document;
+#ifdef WK_VIEWER_GUI
     std::array<uint8_t, static_cast<size_t>(MFB_KB_KEY_LAST) + 1> previous_keys{};
     std::array<uint8_t, 8> previous_mouse_buttons{};
+#endif
 };
 
 using Glyph = std::array<uint8_t, 7>;
@@ -447,7 +460,10 @@ uint8_t scale_to_u8(uint16_t sample, wk::BitDepth bit_depth) {
 }
 
 uint32_t pack_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
-    return MFB_ARGB(a, r, g, b);
+    // Same layout as MiniFB's MFB_ARGB, written out so this file does
+    // not need MiniFB for the terminal path.
+    return (static_cast<uint32_t>(a) << 24) | (static_cast<uint32_t>(r) << 16) |
+           (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
 }
 
 uint8_t channel_b(uint32_t pixel) {
@@ -1099,6 +1115,8 @@ ViewerDocument load_document(const ViewerItem& item) {
     return document;
 }
 
+#ifdef WK_VIEWER_GUI
+
 std::string build_window_title(const ViewerState& state) {
     const ViewerItem& item = state.items[state.current_index];
     std::string title = "WK Viewer - ";
@@ -1382,6 +1400,8 @@ DisplayBuffer compose_window(const ViewerState& state, uint32_t window_width, ui
     return canvas;
 }
 
+#endif  // WK_VIEWER_GUI
+
 void clamp_scroll(ViewerState& state) {
     if (!state.layout.has_sidebar || state.layout.visible_rows == 0) {
         state.list_scroll = 0;
@@ -1420,6 +1440,8 @@ void set_current_index(ViewerState& state, size_t index) {
     ensure_selection_visible(state);
     load_current_document(state);
 }
+
+#ifdef WK_VIEWER_GUI
 
 bool pressed_once(const uint8_t* keys,
                   const std::array<uint8_t, static_cast<size_t>(MFB_KB_KEY_LAST) + 1>& previous,
@@ -1523,11 +1545,353 @@ void handle_mouse(ViewerState& state, mfb_window* window, const uint8_t* buttons
     }
 }
 
+#endif  // WK_VIEWER_GUI
+
+// ---- Terminal (CLI) viewer ----
+// Renders the same document the window shows, as ANSI truecolor
+// half-blocks: one terminal cell shows two vertical pixels (the top one
+// in the foreground, the bottom one in the background, U+2580). Used
+// when no display is available (Termux, SSH, headless) or when --cli
+// is given, so wkview never needs a window to show a picture.
+
+struct TerminalSize {
+    uint32_t cols = 80;
+    uint32_t rows = 24;
+};
+
+TerminalSize terminal_size() {
+    TerminalSize size;
+    const char* columns = std::getenv("COLUMNS");
+    if (columns != nullptr && columns[0] != '\0') {
+        const long value = std::strtol(columns, nullptr, 10);
+        if (value > 0) {
+            size.cols = static_cast<uint32_t>(value);
+        }
+    }
+#if defined(__unix__) || defined(__APPLE__)
+    struct winsize ws {};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        if (ws.ws_col > 0) {
+            size.cols = ws.ws_col;
+        }
+        if (ws.ws_row > 0) {
+            size.rows = ws.ws_row;
+        }
+    }
+#elif defined(_WIN32)
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info) != 0) {
+        const SHORT cols = info.srWindow.Right - info.srWindow.Left + 1;
+        const SHORT rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+        if (cols > 0) {
+            size.cols = static_cast<uint32_t>(cols);
+        }
+        if (rows > 0) {
+            size.rows = static_cast<uint32_t>(rows);
+        }
+    }
+#endif
+    return size;
+}
+
+struct Rgb8 {
+    uint8_t r = 0;
+    uint8_t g = 0;
+    uint8_t b = 0;
+};
+
+Rgb8 sample_average(const DisplayBuffer& image, double x0, double y0, double x1, double y1) {
+    const int ix0 = std::max(0, static_cast<int>(std::floor(x0)));
+    const int iy0 = std::max(0, static_cast<int>(std::floor(y0)));
+    const int ix1 = std::min(static_cast<int>(image.width), std::max(ix0 + 1, static_cast<int>(std::ceil(x1))));
+    const int iy1 = std::min(static_cast<int>(image.height), std::max(iy0 + 1, static_cast<int>(std::ceil(y1))));
+    uint64_t r = 0, g = 0, b = 0, count = 0;
+    for (int y = iy0; y < iy1; ++y) {
+        for (int x = ix0; x < ix1; ++x) {
+            const uint32_t pixel = image.pixels[static_cast<size_t>(y) * image.width + x];
+            const uint32_t alpha = channel_a(pixel);
+            // Composite over black: a transparent pixel shows as black.
+            r += static_cast<uint64_t>(channel_r(pixel)) * alpha / 255u;
+            g += static_cast<uint64_t>(channel_g(pixel)) * alpha / 255u;
+            b += static_cast<uint64_t>(channel_b(pixel)) * alpha / 255u;
+            ++count;
+        }
+    }
+    if (count == 0) {
+        return {};
+    }
+    return {static_cast<uint8_t>(r / count), static_cast<uint8_t>(g / count),
+            static_cast<uint8_t>(b / count)};
+}
+
+// Rows (in terminal cells) an image needs at the given cell width.
+// One cell shows two vertical pixels, so the row count is h/2 per w.
+uint32_t terminal_rows_for(uint32_t src_width, uint32_t src_height, uint32_t cell_cols) {
+    if (src_width == 0 || cell_cols == 0) {
+        return 0;
+    }
+    return std::max(1u, static_cast<uint32_t>(std::lround(
+                             static_cast<double>(src_height) * static_cast<double>(cell_cols) /
+                             (2.0 * static_cast<double>(src_width)))));
+}
+
+std::string ansi_fg(const Rgb8& color) {
+    return "\x1b[38;2;" + std::to_string(color.r) + ";" + std::to_string(color.g) + ";" +
+           std::to_string(color.b) + "m";
+}
+
+std::string ansi_bg(const Rgb8& color) {
+    return "\x1b[48;2;" + std::to_string(color.r) + ";" + std::to_string(color.g) + ";" +
+           std::to_string(color.b) + "m";
+}
+
+uint8_t luma_of(const Rgb8& color) {
+    return static_cast<uint8_t>(std::lround(0.299 * color.r + 0.587 * color.g + 0.114 * color.b));
+}
+
+// Render one image to lines of terminal text, exactly cell_cols wide
+// and cell_rows tall. Color mode uses half-blocks; --no-color uses a
+// brightness ramp so the picture stays readable on a dumb terminal.
+std::vector<std::string> render_terminal_image(const DisplayBuffer& image, uint32_t cell_cols,
+                                               uint32_t cell_rows, bool no_color) {
+    static constexpr std::string_view kRamp = " .:-=+*#%@";
+    std::vector<std::string> lines;
+    if (image.width == 0 || image.height == 0 || cell_cols == 0 || cell_rows == 0) {
+        return lines;
+    }
+    lines.reserve(cell_rows);
+
+    const double step_x = static_cast<double>(image.width) / static_cast<double>(cell_cols);
+    const double step_y = static_cast<double>(image.height) / static_cast<double>(cell_rows * 2);
+
+    for (uint32_t row = 0; row < cell_rows; ++row) {
+        std::string line;
+        Rgb8 last_fg{0, 0, 0}, last_bg{0, 0, 0};
+        bool have_color = false;
+        for (uint32_t col = 0; col < cell_cols; ++col) {
+            const double x0 = col * step_x;
+            const double x1 = (col + 1) * step_x;
+            const Rgb8 top = sample_average(image, x0, row * 2 * step_y, x1, (row * 2 + 1) * step_y);
+            const Rgb8 bottom = sample_average(image, x0, (row * 2 + 1) * step_y, x1, (row * 2 + 2) * step_y);
+            if (no_color) {
+                const uint8_t luma = static_cast<uint8_t>((static_cast<unsigned>(luma_of(top)) +
+                                                           static_cast<unsigned>(luma_of(bottom))) /
+                                                          2u);
+                const size_t index = static_cast<size_t>(luma) * (kRamp.size() - 1) / 255u;
+                line.push_back(kRamp[index]);
+                continue;
+            }
+            if (!have_color || top.r != last_fg.r || top.g != last_fg.g || top.b != last_fg.b ||
+                bottom.r != last_bg.r || bottom.g != last_bg.g || bottom.b != last_bg.b) {
+                line += ansi_fg(top);
+                line += ansi_bg(bottom);
+                last_fg = top;
+                last_bg = bottom;
+                have_color = true;
+            }
+            line += "\xE2\x96\x80";  // U+2580 UPPER HALF BLOCK
+        }
+        line += "\x1b[0m";
+        lines.push_back(std::move(line));
+    }
+    return lines;
+}
+
+// Classic "hot" colormap: black -> red -> yellow -> white.
+Rgb8 hot_color(double t) {
+    const double clamped = std::clamp(t, 0.0, 1.0);
+    const auto channel = [](double x) -> uint8_t {
+        return static_cast<uint8_t>(std::clamp(std::lround(std::clamp(x, 0.0, 1.0) * 255.0), 0l, 255l));
+    };
+    return {channel(clamped * 3.0), channel(clamped * 3.0 - 1.0), channel(clamped * 3.0 - 2.0)};
+}
+
+// Per-pixel absolute difference (max over channels) between two images
+// of the same size, rendered as a heatmap. Returns the lines plus the
+// mean and max difference for the footer.
+struct DiffRender {
+    std::vector<std::string> lines;
+    double mean = 0.0;
+    uint8_t max = 0;
+};
+
+DiffRender render_terminal_diff(const DisplayBuffer& left, const DisplayBuffer& right,
+                                uint32_t cell_cols, uint32_t cell_rows, bool no_color) {
+    DiffRender result;
+    if (left.width == 0 || left.height == 0 || left.width != right.width ||
+        left.height != right.height || cell_cols == 0 || cell_rows == 0) {
+        return result;
+    }
+
+    const double step_x = static_cast<double>(left.width) / static_cast<double>(cell_cols);
+    const double step_y = static_cast<double>(left.height) / static_cast<double>(cell_rows * 2);
+    uint64_t total = 0;
+    uint64_t count = 0;
+
+    // First pass: per-cell difference and the true max, so the heatmap
+    // is scaled to the largest actual difference (a q75 encode differs
+    // by ~5 at most, which would be invisible on an absolute 0-255
+    // scale). The footer reports the absolute max, so the scale stays
+    // interpretable.
+    std::vector<uint8_t> cell_diffs(static_cast<size_t>(cell_cols) * cell_rows, 0);
+    for (uint32_t row = 0; row < cell_rows; ++row) {
+        for (uint32_t col = 0; col < cell_cols; ++col) {
+            uint8_t cell_diff = 0;
+            for (uint32_t sub = 0; sub < 2; ++sub) {
+                const Rgb8 a = sample_average(left, col * step_x, (row * 2 + sub) * step_y,
+                                              (col + 1) * step_x, (row * 2 + sub + 1) * step_y);
+                const Rgb8 b = sample_average(right, col * step_x, (row * 2 + sub) * step_y,
+                                              (col + 1) * step_x, (row * 2 + sub + 1) * step_y);
+                const uint8_t d = std::max({static_cast<uint8_t>(std::abs(static_cast<int>(a.r) - static_cast<int>(b.r))),
+                                            static_cast<uint8_t>(std::abs(static_cast<int>(a.g) - static_cast<int>(b.g))),
+                                            static_cast<uint8_t>(std::abs(static_cast<int>(a.b) - static_cast<int>(b.b)))});
+                cell_diff = std::max(cell_diff, d);
+            }
+            cell_diffs[static_cast<size_t>(row) * cell_cols + col] = cell_diff;
+            total += cell_diff;
+            ++count;
+            result.max = std::max(result.max, cell_diff);
+        }
+    }
+    result.mean = count == 0 ? 0.0 : static_cast<double>(total) / static_cast<double>(count);
+
+    for (uint32_t row = 0; row < cell_rows; ++row) {
+        std::string line;
+        Rgb8 last_color{0, 0, 0};
+        bool have_color = false;
+        for (uint32_t col = 0; col < cell_cols; ++col) {
+            const uint8_t cell_diff = cell_diffs[static_cast<size_t>(row) * cell_cols + col];
+            if (no_color) {
+                static constexpr std::string_view kRamp = " .:-=+*#%@";
+                const size_t index = result.max == 0
+                                         ? 0
+                                         : static_cast<size_t>(cell_diff) * (kRamp.size() - 1) /
+                                               static_cast<size_t>(result.max);
+                line.push_back(kRamp[index]);
+                continue;
+            }
+            const Rgb8 color = hot_color(result.max == 0
+                                             ? 0.0
+                                             : static_cast<double>(cell_diff) /
+                                                   static_cast<double>(result.max));
+            if (!have_color || color.r != last_color.r || color.g != last_color.g ||
+                color.b != last_color.b) {
+                line += ansi_fg(color);
+                line += ansi_bg(color);
+                last_color = color;
+                have_color = true;
+            }
+            line += "\xE2\x96\x88";  // U+2588 FULL BLOCK
+        }
+        line += "\x1b[0m";
+        result.lines.push_back(std::move(line));
+    }
+    return result;
+}
+
+bool display_available() {
+#if defined(_WIN32) || defined(__APPLE__)
+    return true;
+#else
+    const char* display = std::getenv("DISPLAY");
+    if (display != nullptr && display[0] != '\0') {
+        return true;
+    }
+    const char* wayland = std::getenv("WAYLAND_DISPLAY");
+    if (wayland != nullptr && wayland[0] != '\0') {
+        return true;
+    }
+    return false;
+#endif
+}
+
+struct TerminalViewOptions {
+    uint32_t width = 0;  // 0 = terminal width
+    bool diff = false;
+    bool no_color = false;
+};
+
+int run_terminal_viewer(const ViewerState& state, const TerminalViewOptions& options) {
+    const ViewerDocument& document = state.document;
+    const TerminalSize size = terminal_size();
+    const uint32_t total_cols = options.width != 0 ? options.width : size.cols;
+    const bool has_compare = state.compare_requested && document.source_panel.has_value();
+
+    std::cout << document.decoded_panel.label << "  " << document.decoded_panel.image.width << 'x'
+              << document.decoded_panel.image.height;
+    if (has_compare) {
+        std::cout << "  vs  " << document.source_panel->label << "  "
+                  << document.source_panel->image.width << 'x' << document.source_panel->image.height;
+    }
+    std::cout << '\n';
+
+    if (options.diff) {
+        if (!has_compare) {
+            std::cerr << "Error: --diff needs a source image to compare against\n";
+            return 1;
+        }
+        if (document.decoded_panel.image.width != document.source_panel->image.width ||
+            document.decoded_panel.image.height != document.source_panel->image.height) {
+            std::cerr << "Error: --diff needs decoded and source at the same size\n";
+            return 1;
+        }
+        const uint32_t cell_rows = terminal_rows_for(document.decoded_panel.image.width,
+                                                     document.decoded_panel.image.height, total_cols);
+        DiffRender diff = render_terminal_diff(document.decoded_panel.image,
+                                               document.source_panel->image, total_cols, cell_rows,
+                                               options.no_color);
+        for (const std::string& line : diff.lines) {
+            std::cout << line << '\n';
+        }
+        std::cout << "diff: mean " << std::fixed << std::setprecision(2) << diff.mean << "  max "
+                  << static_cast<unsigned>(diff.max) << "  (black = identical, white = largest)\n";
+        return 0;
+    }
+
+    if (!has_compare) {
+        const uint32_t cell_rows = terminal_rows_for(document.decoded_panel.image.width,
+                                                     document.decoded_panel.image.height, total_cols);
+        for (const std::string& line :
+             render_terminal_image(document.decoded_panel.image, total_cols, cell_rows,
+                                   options.no_color)) {
+            std::cout << line << '\n';
+        }
+        return 0;
+    }
+
+    // Side by side: each panel gets half the width minus the separator.
+    const uint32_t panel_cols = total_cols >= 3 ? (total_cols - 3) / 2 : 1;
+    const uint32_t rows = std::max(terminal_rows_for(document.decoded_panel.image.width,
+                                                     document.decoded_panel.image.height, panel_cols),
+                                   terminal_rows_for(document.source_panel->image.width,
+                                                     document.source_panel->image.height, panel_cols));
+    std::vector<std::string> left_lines = render_terminal_image(
+        document.decoded_panel.image, panel_cols, rows, options.no_color);
+    std::vector<std::string> right_lines = render_terminal_image(
+        document.source_panel->image, panel_cols, rows, options.no_color);
+
+    for (uint32_t row = 0; row < rows; ++row) {
+        const std::string& left = row < left_lines.size() ? left_lines[row] : std::string();
+        const std::string& right = row < right_lines.size() ? right_lines[row] : std::string();
+        std::cout << left << "\x1b[0m \xE2\x94\x82 " << right << '\n';
+    }
+    return 0;
+}
+
 void print_usage() {
     std::cerr
         << "Usage: wkview <file.wk|directory> [source.{jpg,jpeg,png,ppm}|source_directory]\n"
+        << "       wkview [options] <file.wk|directory> [source]\n"
         << "       wkview --help\n"
-        << "\nControls:\n"
+        << "\nModes (default is auto):\n"
+        << "  --cli                 Render in the terminal instead of a window\n"
+        << "  --window              Open a window (error when no display is available)\n"
+        << "  auto: a window when a display exists, otherwise the terminal\n"
+        << "\nTerminal options:\n"
+        << "  --width N             Terminal output width in cells (default: terminal width)\n"
+        << "  --diff                Heatmap of decoded-vs-source difference (needs a source)\n"
+        << "  --no-color            Grayscale brightness ramp instead of truecolor\n"
+        << "\nControls (window mode):\n"
         << "  Left/Right or A/D   Previous or next WK file\n"
         << "  Up/Down             Move selection in the file list\n"
         << "  Home/End            Jump to first or last file\n"
@@ -1542,13 +1906,62 @@ void print_usage() {
 } // namespace
 
 int main(int argc, char* argv[]) {
-    if (argc < 2 || std::string_view(argv[1]) == "-h" || std::string_view(argv[1]) == "--help") {
-        print_usage();
-        return argc < 2 ? 1 : 0;
+    enum class ViewMode { Auto, Cli, Window };
+    ViewMode mode = ViewMode::Auto;
+    TerminalViewOptions terminal_options;
+    std::vector<std::string> positional;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg(argv[i]);
+        if (arg == "-h" || arg == "--help") {
+            print_usage();
+            return 0;
+        }
+        if (arg == "--cli" || arg == "--terminal") {
+            mode = ViewMode::Cli;
+            continue;
+        }
+        if (arg == "--window" || arg == "--gui") {
+            mode = ViewMode::Window;
+            continue;
+        }
+        if (arg == "--diff") {
+            terminal_options.diff = true;
+            mode = ViewMode::Cli;
+            continue;
+        }
+        if (arg == "--no-color") {
+            terminal_options.no_color = true;
+            continue;
+        }
+        if (arg == "--width") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --width needs a number\n";
+                return 1;
+            }
+            const long value = std::strtol(argv[++i], nullptr, 10);
+            if (value <= 0 || value > 10000) {
+                std::cerr << "Error: --width must be between 1 and 10000\n";
+                return 1;
+            }
+            terminal_options.width = static_cast<uint32_t>(value);
+            continue;
+        }
+        if (arg.starts_with("--")) {
+            std::cerr << "Error: unknown option: " << arg << '\n';
+            print_usage();
+            return 1;
+        }
+        positional.push_back(std::string(arg));
     }
 
-    const std::string input_path = argv[1];
-    const std::string source_hint = argc >= 3 ? argv[2] : std::string();
+    if (positional.empty()) {
+        print_usage();
+        return 1;
+    }
+
+    const std::string input_path = positional[0];
+    const std::string source_hint = positional.size() >= 2 ? positional[1] : std::string();
 
     auto playlist = build_playlist(input_path, source_hint);
     if (!playlist) {
@@ -1561,8 +1974,15 @@ int main(int argc, char* argv[]) {
     state.current_index = playlist->second;
     state.show_list = state.items.size() > 1;
     state.compare_requested = state.items[state.current_index].has_source;
-    load_current_document(state);
+    state.document = load_document(state.items[state.current_index]);
 
+    // Smart default: a window when a display exists, otherwise the
+    // terminal. --cli forces the terminal, --window forces a window.
+    if (mode == ViewMode::Cli || (mode == ViewMode::Auto && !display_available())) {
+        return run_terminal_viewer(state, terminal_options);
+    }
+
+#ifdef WK_VIEWER_GUI
     const uint32_t preferred_content_height = std::max(state.document.decoded_panel.image.height,
                                                        state.document.source_panel ? state.document.source_panel->image.height : 0u);
     const uint32_t preferred_info_height = std::max(info_block_height(state.document.decoded_panel),
@@ -1580,8 +2000,10 @@ int main(int argc, char* argv[]) {
                                      initial_height,
                                      MFB_WF_RESIZABLE);
     if (window == nullptr) {
-        std::cerr << "Error: failed to create viewer window\n";
-        return 1;
+        // A display seemed to exist but the window still failed to open:
+        // fall back to the terminal instead of giving up.
+        std::cerr << "Note: failed to create viewer window, falling back to terminal\n";
+        return run_terminal_viewer(state, terminal_options);
     }
 
     while (true) {
@@ -1627,4 +2049,8 @@ int main(int argc, char* argv[]) {
 
     mfb_close(window);
     return 0;
+#else
+    std::cerr << "Error: this wkview was built without window support (WK_BUILD_VIEWER=OFF); use --cli\n";
+    return 1;
+#endif
 }

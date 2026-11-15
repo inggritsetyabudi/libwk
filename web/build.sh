@@ -42,6 +42,7 @@ em++ \
   ../src/encoder.cpp \
   ../src/exif_import.cpp \
   ../src/image_io.cpp \
+  ../src/stb_image.cpp \
   ../src/lossless.cpp \
   ../src/lossy_coeff_stream.cpp \
   ../src/lossy_tile_decode.cpp \
