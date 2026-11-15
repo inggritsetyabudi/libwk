@@ -163,35 +163,52 @@ void subsample_420(const int16_t* in, int16_t* out,
 
 void upsample_420(const int16_t* in, int16_t* out,
                    uint32_t width, uint32_t height) {
+    // Catmull-Rom bicubic upsampling. Phase matches the 2x2 box-average
+    // subsampler above: src = dst*0.5 - 0.25 (the subsampled sample is the
+    // centre of its 2x2 block). The result is clamped to the input plane's
+    // [min, max] because Catmull-Rom's negative lobes can overshoot.
     const uint32_t in_w = (width + 1) / 2;
     const uint32_t in_h = (height + 1) / 2;
 
-    auto sample = [&](int x, int y) -> int16_t {
+    int16_t lo = in[0];
+    int16_t hi = in[0];
+    for (size_t i = 1; i < static_cast<size_t>(in_w) * in_h; ++i) {
+        lo = std::min(lo, in[i]);
+        hi = std::max(hi, in[i]);
+    }
+
+    auto sample = [&](int x, int y) -> double {
         x = std::clamp(x, 0, static_cast<int>(in_w) - 1);
         y = std::clamp(y, 0, static_cast<int>(in_h) - 1);
-        return in[static_cast<size_t>(y) * in_w + static_cast<size_t>(x)];
+        return static_cast<double>(in[static_cast<size_t>(y) * in_w + static_cast<size_t>(x)]);
+    };
+
+    auto catmull_rom = [](double t, double p0, double p1, double p2, double p3) -> double {
+        const double t2 = t * t;
+        const double t3 = t2 * t;
+        return p0 * (-0.5 * t + t2 - 0.5 * t3) + p1 * (1.0 - 2.5 * t2 + 1.5 * t3) +
+               p2 * (0.5 * t + 2.0 * t2 - 1.5 * t3) + p3 * (-0.5 * t2 + 0.5 * t3);
     };
 
     for (uint32_t row = 0; row < height; ++row) {
         const double src_y = static_cast<double>(row) * 0.5 - 0.25;
         const int y0 = static_cast<int>(std::floor(src_y));
-        const int y1 = y0 + 1;
         const double ty = src_y - static_cast<double>(y0);
 
         for (uint32_t col = 0; col < width; ++col) {
             const double src_x = static_cast<double>(col) * 0.5 - 0.25;
             const int x0 = static_cast<int>(std::floor(src_x));
-            const int x1 = x0 + 1;
             const double tx = src_x - static_cast<double>(x0);
 
-            const double s00 = static_cast<double>(sample(x0, y0));
-            const double s10 = static_cast<double>(sample(x1, y0));
-            const double s01 = static_cast<double>(sample(x0, y1));
-            const double s11 = static_cast<double>(sample(x1, y1));
-
-            const double top = s00 + (s10 - s00) * tx;
-            const double bottom = s01 + (s11 - s01) * tx;
-            out[static_cast<size_t>(row) * width + col] = static_cast<int16_t>(std::lround(top + (bottom - top) * ty));
+            double row_vals[4];
+            for (int j = -1; j <= 2; ++j) {
+                row_vals[j + 1] = catmull_rom(tx, sample(x0 - 1, y0 + j), sample(x0, y0 + j),
+                                              sample(x0 + 1, y0 + j), sample(x0 + 2, y0 + j));
+            }
+            const double v = catmull_rom(ty, row_vals[0], row_vals[1], row_vals[2], row_vals[3]);
+            out[static_cast<size_t>(row) * width + col] =
+                static_cast<int16_t>(std::lround(std::clamp(v, static_cast<double>(lo),
+                                                            static_cast<double>(hi))));
         }
     }
 }
