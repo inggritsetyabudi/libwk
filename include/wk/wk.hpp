@@ -191,6 +191,16 @@ namespace wk
         // (2.0 on the float reference; 2.1 compensates the small
         // positive bias of the encoder's int16 measurement).
         float adaptive_chroma_laplacian_threshold = 2.1f;
+        // Second conditions for the adaptive decision above: when > 0, a
+        // tile is forced to YUV444 when its 99.9th percentile |Laplacian|
+        // (p999) or its saturated p999 reaches the threshold, even when
+        // c_lap is below the threshold above. 0 disables the condition
+        // (the V11 behaviour). The plain p999 catches long sharp edges
+        // the mean drowns (step edge: p999 79, mean 0.15); the saturated
+        // p999 catches small saturated features (lips: sat_p999 116,
+        // plain p999 34).
+        float adaptive_chroma_lap_p999_threshold = 79.0f;
+        float adaptive_chroma_lap_sat_p999_threshold = 100.0f;
         // Reserved: accepted but currently ignored -- no
         // SSIMULACRA2-targeted mode exists yet (the wkenc flag was
         // removed rather than advertise a no-op).

@@ -256,7 +256,10 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
                         tile_subsampling = should_subsample_chroma_420(
                             cb_plane.data(), cr_plane.data(), width, height,
                             x0, y0, tw, th,
-                            static_cast<double>(config.adaptive_chroma_laplacian_threshold))
+                            static_cast<double>(config.adaptive_chroma_laplacian_threshold),
+                            static_cast<double>(config.adaptive_chroma_lap_p999_threshold),
+                            static_cast<double>(config.adaptive_chroma_lap_sat_p999_threshold),
+                            fhdr.bit_depth)
                             ? ChromaSubsampling::YUV420 : ChromaSubsampling::YUV444;
                         if (tile_subsampling == ChromaSubsampling::YUV420) {
                             tile_cb = cb_plane_420.data();
@@ -401,6 +404,8 @@ void wk_encoder_config_init(wk_encoder_config_t* config) {
     config->full_range = 1;
     config->adaptive_chroma_subsampling = 1;
     config->adaptive_chroma_laplacian_threshold = 2.1f;
+    config->adaptive_chroma_lap_p999_threshold = 79.0f;
+    config->adaptive_chroma_lap_sat_p999_threshold = 100.0f;
 }
 
 wk_error_t wk_encode(
@@ -481,6 +486,8 @@ wk_error_t wk_encode(
     enc_config.target_ssimulacra2 = config->target_ssimulacra2;
     enc_config.adaptive_chroma_subsampling = config->adaptive_chroma_subsampling != 0;
     enc_config.adaptive_chroma_laplacian_threshold = config->adaptive_chroma_laplacian_threshold;
+    enc_config.adaptive_chroma_lap_p999_threshold = config->adaptive_chroma_lap_p999_threshold;
+    enc_config.adaptive_chroma_lap_sat_p999_threshold = config->adaptive_chroma_lap_sat_p999_threshold;
 
     auto result = wk::encode(*image, enc_config);
     if (!result) {
