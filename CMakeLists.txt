@@ -143,6 +143,7 @@ if(WK_BUILD_TESTS)
     wk_add_test(cclm_test tests/cclm_test.cpp)
     wk_add_test(adaptive_chroma_test tests/adaptive_chroma_test.cpp)
     wk_add_test(tool_log_test tests/tool_log_test.cpp)
+    wk_add_test(tile_util_test tests/tile_util_test.cpp)
 endif()
 
 # Install the library, the command-line tools, and the public headers.
