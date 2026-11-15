@@ -264,6 +264,6 @@ namespace wk
 
     [[nodiscard]] Result<Image> decode(std::span<const uint8_t> data, const DecoderConfig &config = {});
 
-    constexpr std::string_view version() { return "0.2.7"; }
+    constexpr std::string_view version() { return "0.2.8"; }
 
 }

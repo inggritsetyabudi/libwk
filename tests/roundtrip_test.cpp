@@ -619,11 +619,11 @@ TEST(RoundtripTest, DefaultLossyTilePolicyUses1024ButLosslessStays512) {
 
     auto lossless_info = get_info(*encoded_lossless);
     ASSERT_TRUE(lossless_info.has_value()) << lossless_info.error().message;
-    EXPECT_EQ(lossless_info->tile_size, 512u);
+    EXPECT_EQ(lossless_info->tile_size, 256u);
 
     auto lossless_file = parse_container(*encoded_lossless);
     ASSERT_TRUE(lossless_file.has_value()) << lossless_file.error().message;
-    EXPECT_EQ(lossless_file->header.tile_size_log2, 9u);
+    EXPECT_EQ(lossless_file->header.tile_size_log2, 8u);
 }
 
 TEST(RoundtripTest, SmoothChromaRampKeepsFineStepsAtQ75) {
@@ -2364,6 +2364,210 @@ TEST(RoundtripTest, LosslessPredictorPathBeatsPaletteOnSmoothGradient) {
     EXPECT_TRUE(std::equal(image.pixels().begin(), image.pixels().end(),
                            decoded->pixels().begin()))
         << "lossless via predictor path must decode pixel-identical";
+}
+
+// Per-tile lossless (v0.2.8): the predictor path is split into 256x256
+// tiles, each with its own rANS tables, instead of one tile holding the
+// whole image. Measured 2026-11-15 (exp-h1): -5.6% (tile 512) / -7.3%
+// (tile 256) on the 5 non-palette benchmark photos; the gain is local
+// table adaptation, not predictor selection (per-tile predictor oracle:
+// 19 B of 4,489,297). The palette path stays whole-image: the encoder
+// compares the whole-image palette against the per-tile predictor total
+// and keeps the smaller, so a palette image can never regress.
+TEST(RoundtripTest, LosslessPerTileRoundtripSmallerOnPhoto) {
+    const std::filesystem::path photo = find_photo_named("meadow-6d3b.jpg");
+    ASSERT_TRUE(std::filesystem::exists(photo)) << "meadow-6d3b.jpg not found";
+    auto source = wk::io::load_image_file(photo.string());
+    ASSERT_TRUE(source.has_value()) << source.error().message;
+    ASSERT_EQ(source->width(), 935u);
+    ASSERT_EQ(source->height(), 360u);
+
+    EncoderConfig config;
+    config.lossless = true;
+    auto encoded = encode(*source, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto parsed = parse_container(*encoded);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    EXPECT_EQ(parsed->header.tile_size_log2, 8u);
+    // 935x360 at tile 256 -> 4x2 = 8 tiles.
+    ASSERT_EQ(parsed->tile_chunks.size(), 8u);
+
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    EXPECT_EQ(decoded->width(), 935u);
+    EXPECT_EQ(decoded->height(), 360u);
+    EXPECT_TRUE(std::equal(source->pixels().begin(), source->pixels().end(),
+                           decoded->pixels().begin()))
+        << "per-tile lossless must decode pixel-identical";
+
+    // The per-tile payloads (tile header stripped) must beat the
+    // whole-image payload: local rANS tables adapt per tile.
+    size_t per_tile_payload = 0;
+    for (const auto& chunk : parsed->tile_chunks) {
+        ASSERT_GE(chunk.payload.size(), 9u);
+        per_tile_payload += chunk.payload.size() - 9;
+    }
+    const size_t pixel_count = 935u * 360u;
+    std::vector<uint8_t> rgba(pixel_count * 4, 255);
+    for (size_t i = 0; i < pixel_count; ++i) {
+        rgba[i * 4 + 0] = source->pixels()[i * 3 + 0];
+        rgba[i * 4 + 1] = source->pixels()[i * 3 + 1];
+        rgba[i * 4 + 2] = source->pixels()[i * 3 + 2];
+    }
+    auto whole = lossless_encode(rgba.data(), 935, 360, 8);
+    ASSERT_TRUE(whole.has_value()) << whole.error().message;
+    EXPECT_LT(per_tile_payload, whole->size())
+        << "per-tile lossless must be smaller than whole-image lossless";
+}
+
+TEST(RoundtripTest, LosslessPerTileSmallImageSingleTile) {
+    Image image = make_lossless_colorful(16, 16);
+    EncoderConfig config;
+    config.lossless = true;
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto parsed = parse_container(*encoded);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ASSERT_EQ(parsed->tile_chunks.size(), 1u);
+
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    EXPECT_TRUE(std::equal(image.pixels().begin(), image.pixels().end(),
+                           decoded->pixels().begin()))
+        << "single-tile lossless must decode pixel-identical";
+}
+
+TEST(RoundtripTest, LosslessPerTileEdgeTiles) {
+    // 300x300 at tile 256 -> 2x2 tiles, edge tiles 44 wide/high.
+    // 257x257 -> 2x2 tiles, edge tiles 1 px wide/high.
+    for (uint32_t size : {300u, 257u}) {
+        Image image = make_lossless_colorful(size, size);
+        EncoderConfig config;
+        config.lossless = true;
+        auto encoded = encode(image, config);
+        ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+        auto parsed = parse_container(*encoded);
+        ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+        ASSERT_EQ(parsed->tile_chunks.size(), 4u) << "size=" << size;
+
+        auto decoded = decode(*encoded);
+        ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+        EXPECT_EQ(decoded->width(), size);
+        EXPECT_EQ(decoded->height(), size);
+        EXPECT_TRUE(std::equal(image.pixels().begin(), image.pixels().end(),
+                               decoded->pixels().begin()))
+            << "edge tiles must decode pixel-identical, size=" << size;
+    }
+}
+
+TEST(RoundtripTest, LosslessMissingTileRejected) {
+    const std::filesystem::path photo = find_photo_named("meadow-6d3b.jpg");
+    ASSERT_TRUE(std::filesystem::exists(photo)) << "meadow-6d3b.jpg not found";
+    auto source = wk::io::load_image_file(photo.string());
+    ASSERT_TRUE(source.has_value()) << source.error().message;
+
+    EncoderConfig config;
+    config.lossless = true;
+    auto encoded = encode(*source, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    ASSERT_EQ(file->tile_chunks.size(), 8u);
+
+    auto mutated = *file;
+    mutated.tile_chunks.erase(mutated.tile_chunks.begin() + 2);
+    auto rewritten = write_container(mutated);
+    ASSERT_TRUE(rewritten.has_value()) << rewritten.error().message;
+
+    auto decoded = decode(*rewritten);
+    EXPECT_FALSE(decoded.has_value()) << "lossless file missing a tile accepted";
+}
+
+TEST(RoundtripTest, LosslessDuplicateTileRejected) {
+    const std::filesystem::path photo = find_photo_named("meadow-6d3b.jpg");
+    ASSERT_TRUE(std::filesystem::exists(photo)) << "meadow-6d3b.jpg not found";
+    auto source = wk::io::load_image_file(photo.string());
+    ASSERT_TRUE(source.has_value()) << source.error().message;
+
+    EncoderConfig config;
+    config.lossless = true;
+    auto encoded = encode(*source, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    ASSERT_EQ(file->tile_chunks.size(), 8u);
+
+    // Point tile 1 at tile 0's coordinates (payload bytes 0-3).
+    auto mutated = *file;
+    std::memcpy(mutated.tile_chunks[1].payload.data(),
+                mutated.tile_chunks[0].payload.data(), 4);
+    auto rewritten = write_container(mutated);
+    ASSERT_TRUE(rewritten.has_value()) << rewritten.error().message;
+
+    auto decoded = decode(*rewritten);
+    EXPECT_FALSE(decoded.has_value()) << "lossless file with a duplicated tile accepted";
+}
+
+TEST(RoundtripTest, LosslessTruncatedNewFileFailsLoudly) {
+    // A new-format file cut down to its first tile only: the single tile
+    // at (0,0) holds a 256x256 tile payload, not a whole frame. Decoding
+    // it as a whole frame must FAIL, not produce wrong pixels silently.
+    Image image = make_lossless_colorful(600, 400);
+    EncoderConfig config;
+    config.lossless = true;
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    ASSERT_EQ(file->tile_chunks.size(), 6u);
+
+    auto mutated = *file;
+    mutated.tile_chunks.resize(1);
+    auto rewritten = write_container(mutated);
+    ASSERT_TRUE(rewritten.has_value()) << rewritten.error().message;
+
+    auto decoded = decode(*rewritten);
+    EXPECT_FALSE(decoded.has_value())
+        << "truncated per-tile lossless file decoded instead of failing";
+}
+
+TEST(RoundtripTest, LosslessSingleTileOldFormatStillDecodes) {
+    // Golden file written by the pre-0.2.8 encoder: one tile at (0,0)
+    // holding the whole 600x400 frame (tile_size_log2 9). The new
+    // decoder must still read it exactly.
+    const auto bytes = read_fixture_bytes("lossless_single_tile_600x400.wk.hex");
+    ASSERT_FALSE(bytes.empty())
+        << "missing tests/fixtures/lossless_single_tile_600x400.wk.hex";
+
+    auto parsed = parse_container(bytes);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ASSERT_EQ(parsed->tile_chunks.size(), 1u);
+    EXPECT_EQ(parsed->header.tile_size_log2, 9u);
+
+    auto decoded = decode(bytes);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    EXPECT_EQ(decoded->width(), 600u);
+    EXPECT_EQ(decoded->height(), 400u);
+
+    Image expected(600, 400, BitDepth::Bits8, false);
+    for (uint32_t y = 0; y < 400; ++y) {
+        uint8_t* row = expected.row(y);
+        for (uint32_t x = 0; x < 600; ++x) {
+            row[x * 3 + 0] = static_cast<uint8_t>((x * 7 + y * 13) % 256);
+            row[x * 3 + 1] = static_cast<uint8_t>((x * 11 + y * 5) % 256);
+            row[x * 3 + 2] = static_cast<uint8_t>((x * 3 + y * 17) % 256);
+        }
+    }
+    EXPECT_EQ(expected.pixels().size(), decoded->pixels().size());
+    EXPECT_TRUE(std::equal(expected.pixels().begin(), expected.pixels().end(),
+                           decoded->pixels().begin()))
+        << "old single-tile lossless file must decode pixel-identical";
 }
 
 TEST(RoundtripTest, LosslessUnknownPredictorRejected) {

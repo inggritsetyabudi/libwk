@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <optional>
 
 namespace wk {
 
@@ -255,6 +256,33 @@ static Result<void> encode_nonpalette_channels(const uint8_t* transformed,
     return {};
 }
 
+std::optional<std::vector<uint8_t>> lossless_encode_palette(
+    const uint8_t* rgba, uint32_t width, uint32_t height) {
+    Palette palette;
+    if (!build_palette(rgba, width, height, palette)) return std::nullopt;
+
+    const size_t pixel_count = static_cast<size_t>(width) * height;
+    ByteWriter pw;
+    pw.write_u16(static_cast<uint16_t>(palette.count));
+    for (int i = 0; i < palette.count; i++) {
+        pw.write_u32(palette.colors[i]);
+    }
+    std::vector<uint8_t> indices(pixel_count);
+    apply_palette(rgba, width, height, palette, indices.data());
+    auto tokens = lz_encode_indices(indices.data(), pixel_count);
+    pw.write_u32(static_cast<uint32_t>(tokens.size()));
+    for (const auto& tok : tokens) {
+        pw.write_u8(static_cast<uint8_t>(tok.type));
+        if (tok.type == LzToken::LITERAL) {
+            pw.write_u8(tok.literal);
+        } else {
+            pw.write_u16(tok.distance);
+            pw.write_u16(tok.length);
+        }
+    }
+    return pw.finish();
+}
+
 Result<std::vector<uint8_t>> lossless_encode(
     const uint8_t* rgba, uint32_t width, uint32_t height, uint8_t bit_depth) {
 
@@ -271,34 +299,13 @@ Result<std::vector<uint8_t>> lossless_encode(
     apply_subtract_green(transformed.data(), width, height);
 
 
-    Palette palette;
-    const bool palette_possible = build_palette(rgba, width, height, palette);
-
     // Palette path payload (when the image fits a palette): the palette
     // itself plus LZ-coded indices. Encoded into a temp buffer so it can
     // be compared against the predictor path below.
-    std::vector<uint8_t> palette_payload;
-    if (palette_possible) {
-        ByteWriter pw;
-        pw.write_u16(static_cast<uint16_t>(palette.count));
-        for (int i = 0; i < palette.count; i++) {
-            pw.write_u32(palette.colors[i]);
-        }
-        std::vector<uint8_t> indices(pixel_count);
-        apply_palette(rgba, width, height, palette, indices.data());
-        auto tokens = lz_encode_indices(indices.data(), pixel_count);
-        pw.write_u32(static_cast<uint32_t>(tokens.size()));
-        for (const auto& tok : tokens) {
-            pw.write_u8(static_cast<uint8_t>(tok.type));
-            if (tok.type == LzToken::LITERAL) {
-                pw.write_u8(tok.literal);
-            } else {
-                pw.write_u16(tok.distance);
-                pw.write_u16(tok.length);
-            }
-        }
-        palette_payload = pw.finish();
-    }
+    auto palette_payload_opt = lossless_encode_palette(rgba, width, height);
+    const bool palette_possible = palette_payload_opt.has_value();
+    std::vector<uint8_t> palette_payload =
+        palette_possible ? std::move(*palette_payload_opt) : std::vector<uint8_t>{};
 
     // Predictor selection: measure the true coded size of the top-3
     // candidates and keep the smallest. Ranking from

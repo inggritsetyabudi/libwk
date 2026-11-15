@@ -59,7 +59,10 @@ static Result<uint8_t> resolve_tile_size_log2(const EncoderConfig& config) {
     }
 
     if (config.lossless) {
-        return static_cast<uint8_t>(9);
+        // Per-tile lossless (v0.2.8): 256px tiles, each with its own
+        // rANS tables. Measured 2026-11-15 (exp-h1): -7.3% vs the
+        // whole-image tile on the 5 non-palette benchmark photos.
+        return static_cast<uint8_t>(8);
     }
 
     return static_cast<uint8_t>(10);
@@ -136,6 +139,11 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
     file.header = fhdr;
 
     if (config.lossless) {
+        if (fhdr.bit_depth != 8) {
+            return std::unexpected(Error{ErrorCode::UnsupportedFeature,
+                "lossless currently only supports 8-bit"});
+        }
+
         std::vector<uint8_t> expanded_rgb;
         const uint8_t* lossless_pixels = image.pixels().data();
         if (!source_has_alpha && config.bit_depth == BitDepth::Bits8) {
@@ -143,25 +151,101 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
             lossless_pixels = expanded_rgb.data();
         }
 
-        auto encoded = lossless_encode(lossless_pixels, width, height, fhdr.bit_depth);
-        if (!encoded) return std::unexpected(encoded.error());
+        // Per-tile lossless (v0.2.8): the predictor path is split into
+        // tiles, each encoded independently via lossless_encode (which
+        // picks palette-vs-predictor per tile, so a tile that fits a
+        // palette uses it). The whole-image palette is compared
+        // against the per-tile total instead: a palette image keeps
+        // its single whole-image tile when that is smaller.
+        // Per-tile container overhead: 9 B chunk framing + 9 B tile
+        // header per TILE chunk; counted in the comparison so the
+        // choice is by true file size.
+        constexpr size_t kPerTileOverhead = 18;
+        const uint32_t tile_size = fhdr.tile_size();
+        const uint32_t tiles_x = fhdr.tiles_x();
+        const uint32_t tiles_y = fhdr.tiles_y();
 
-        Chunk tile_chunk;
-        std::memcpy(tile_chunk.type, CHUNK_TILE, 4);
+        auto palette_payload =
+            lossless_encode_palette(lossless_pixels, width, height);
 
-        TileHeader th;
-        th.tile_x = 0;
-        th.tile_y = 0;
-        th.layer_flags = TILE_HAS_BASE;
-        th.compressed_size = static_cast<uint32_t>(encoded->size());
+        std::vector<std::vector<uint8_t>> tile_payloads;
+        tile_payloads.reserve(static_cast<size_t>(tiles_x) * tiles_y);
+        size_t per_tile_total = 0;
+        for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+            for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+                const uint32_t tw = std::min(tile_size, width - tx * tile_size);
+                const uint32_t th = std::min(tile_size, height - ty * tile_size);
+                std::vector<uint8_t> tile_rgba(
+                    static_cast<size_t>(tw) * th * 4);
+                for (uint32_t y = 0; y < th; ++y) {
+                    std::memcpy(tile_rgba.data() + static_cast<size_t>(y) * tw * 4,
+                                lossless_pixels +
+                                    (static_cast<size_t>(ty * tile_size + y) * width +
+                                     tx * tile_size) * 4,
+                                static_cast<size_t>(tw) * 4);
+                }
+                auto encoded_tile = lossless_encode(tile_rgba.data(), tw, th,
+                                                    fhdr.bit_depth);
+                if (!encoded_tile) return std::unexpected(encoded_tile.error());
+                per_tile_total += encoded_tile->size() + kPerTileOverhead;
+                tile_payloads.push_back(std::move(*encoded_tile));
+            }
+        }
 
-        ByteWriter tw;
-        auto th_data = serialize_tile_header(th);
-        tw.write_bytes(th_data);
-        tw.write_bytes(*encoded);
-        tile_chunk.payload = tw.finish();
+        // The palette wins ties (same rule as the whole-image choice
+        // before 0.2.8). A palette payload is flags(1) + pred_mode(1)
+        // + inner payload, in one tile.
+        const bool use_palette =
+            palette_payload.has_value() &&
+            (palette_payload->size() + 2 + kPerTileOverhead) <= per_tile_total;
 
-        file.tile_chunks.push_back(std::move(tile_chunk));
+        if (use_palette) {
+            Chunk tile_chunk;
+            std::memcpy(tile_chunk.type, CHUNK_TILE, 4);
+
+            TileHeader th;
+            th.tile_x = 0;
+            th.tile_y = 0;
+            th.layer_flags = TILE_HAS_BASE;
+            th.compressed_size =
+                static_cast<uint32_t>(palette_payload->size() + 2);
+
+            ByteWriter tw;
+            auto th_data = serialize_tile_header(th);
+            tw.write_bytes(th_data);
+            tw.write_u8(kLosslessTransformFlagPalette);
+            // The predictor mode is ignored on the palette path; SELECT
+            // is a valid value that keeps the byte well-formed.
+            tw.write_u8(static_cast<uint8_t>(LosslessPred::SELECT));
+            tw.write_bytes(*palette_payload);
+            tile_chunk.payload = tw.finish();
+
+            file.tile_chunks.push_back(std::move(tile_chunk));
+        } else {
+            size_t tile_index = 0;
+            for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+                for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+                    Chunk tile_chunk;
+                    std::memcpy(tile_chunk.type, CHUNK_TILE, 4);
+
+                    TileHeader th;
+                    th.tile_x = static_cast<uint16_t>(tx);
+                    th.tile_y = static_cast<uint16_t>(ty);
+                    th.layer_flags = TILE_HAS_BASE;
+                    th.compressed_size = static_cast<uint32_t>(
+                        tile_payloads[tile_index].size());
+
+                    ByteWriter tw;
+                    auto th_data = serialize_tile_header(th);
+                    tw.write_bytes(th_data);
+                    tw.write_bytes(tile_payloads[tile_index]);
+                    tile_chunk.payload = tw.finish();
+
+                    file.tile_chunks.push_back(std::move(tile_chunk));
+                    ++tile_index;
+                }
+            }
+        }
     } else {
         size_t pixel_count = static_cast<size_t>(width) * height;
 
@@ -539,7 +623,7 @@ void wk_free(void* ptr) {
 }
 
 const char* wk_version(void) {
-    return "0.2.7";
+    return "0.2.8";
 }
 
 }
