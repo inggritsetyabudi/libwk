@@ -35,6 +35,7 @@
 #include <wk/wkmeta.hpp>
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 #include <exception>
 #include <new>
