@@ -17,6 +17,7 @@
 #include "../src/common.h"
 #include "../src/container.h"
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -25,6 +26,11 @@ int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::fprintf(stderr, "Usage: wkmeta-dump <input.wk>\n");
         return 1;
+    }
+
+    if (std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0) {
+        std::fprintf(stderr, "Usage: wkmeta-dump <input.wk>\n");
+        return 0;
     }
 
     const char* input_path = argv[1];
