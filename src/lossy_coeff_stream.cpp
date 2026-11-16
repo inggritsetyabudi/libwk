@@ -29,6 +29,26 @@ namespace {
 constexpr size_t kTableClusterCandidateLimit = 8;
 constexpr size_t kTableClusterMaxPasses = 2;
 
+// Log-frequency band bounds for pooled coefficient tables: positions
+// sharing a band pool their counts into one table, so a tile's bank
+// holds ~6 tables instead of up to 64. Bounds match the research
+// coder (var_transform 2026-11-16 §7): {0}, {1..3}, {4..7}, {8..15},
+// {16..31}, {32..63}, ... — each band spans one octave of positions.
+constexpr int kCoeffBandBounds[] = {0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
+
+[[nodiscard]] int coeff_band_of(int coeff_index) {
+    int band = 0;
+    while (band + 1 < static_cast<int>(std::size(kCoeffBandBounds)) &&
+           kCoeffBandBounds[band + 1] <= coeff_index) {
+        ++band;
+    }
+    return band;
+}
+
+[[nodiscard]] int coeff_band_count(int coeff_limit) {
+    return coeff_limit > 0 ? coeff_band_of(coeff_limit - 1) + 1 : 0;
+}
+
 struct SymbolCoding {
     int offset = 1024;
     int num_symbols = 2049;
@@ -651,6 +671,94 @@ struct CoeffContextAnalysis {
     return counts;
 }
 
+[[nodiscard]] std::vector<LossyCoeffTable> build_plane_band_tables(
+    std::span<const DctBlockI16> blocks,
+    std::span<const uint8_t> spans,
+    std::span<const EncodedCoeffContextStream> streams,
+    const SymbolCoding& coding) {
+    const int coeff_limit = static_cast<int>(streams.size());
+    const int band_count = coeff_band_count(coeff_limit);
+    std::vector<std::vector<uint32_t>> band_counts(
+        static_cast<size_t>(band_count),
+        std::vector<uint32_t>(static_cast<size_t>(coding.num_symbols), 0));
+    for (int pos = 0; pos < coeff_limit; ++pos) {
+        if (streams[static_cast<size_t>(pos)].active_blocks == 0) {
+            continue;
+        }
+        const std::vector<uint32_t> counts = build_plane_counts(
+            blocks, spans, pos, coding, streams[static_cast<size_t>(pos)].use_significance_map);
+        std::vector<uint32_t>& pooled =
+            band_counts[static_cast<size_t>(coeff_band_of(pos))];
+        for (size_t symbol = 0; symbol < pooled.size(); ++symbol) {
+            pooled[symbol] += counts[symbol];
+        }
+    }
+    std::vector<LossyCoeffTable> band_tables;
+    band_tables.reserve(static_cast<size_t>(band_count));
+    for (int band = 0; band < band_count; ++band) {
+        uint64_t total = 0;
+        for (const uint32_t count : band_counts[static_cast<size_t>(band)]) {
+            total += count;
+        }
+        LossyCoeffTable table;
+        if (total == 0) {
+            // Band with no data (all positions inactive or all-zero in
+            // sparse mode): a single-symbol table, as the per-position
+            // path uses — never a uniform table, which would serialize
+            // thousands of symbols into the bank.
+            table = make_single_symbol_table(coding);
+        } else {
+            table.build_from_counts(band_counts[static_cast<size_t>(band)].data(),
+                                    coding.num_symbols);
+        }
+        band_tables.push_back(std::move(table));
+    }
+    return band_tables;
+}
+
+[[nodiscard]] std::vector<LossyCoeffTable> build_chroma_band_tables(
+    std::span<const DctBlockI16> cb_blocks,
+    std::span<const DctBlockI16> cr_blocks,
+    std::span<const uint8_t> spans,
+    std::span<const EncodedCoeffContextStream> cb_streams,
+    const SymbolCoding& coding) {
+    const int coeff_limit = static_cast<int>(cb_streams.size());
+    const int band_count = coeff_band_count(coeff_limit);
+    std::vector<std::vector<uint32_t>> band_counts(
+        static_cast<size_t>(band_count),
+        std::vector<uint32_t>(static_cast<size_t>(coding.num_symbols), 0));
+    for (int pos = 0; pos < coeff_limit; ++pos) {
+        if (cb_streams[static_cast<size_t>(pos)].active_blocks == 0) {
+            continue;
+        }
+        const std::vector<uint32_t> counts = build_chroma_counts(
+            cb_blocks, cr_blocks, spans, pos, coding,
+            cb_streams[static_cast<size_t>(pos)].use_significance_map);
+        std::vector<uint32_t>& pooled =
+            band_counts[static_cast<size_t>(coeff_band_of(pos))];
+        for (size_t symbol = 0; symbol < pooled.size(); ++symbol) {
+            pooled[symbol] += counts[symbol];
+        }
+    }
+    std::vector<LossyCoeffTable> band_tables;
+    band_tables.reserve(static_cast<size_t>(band_count));
+    for (int band = 0; band < band_count; ++band) {
+        uint64_t total = 0;
+        for (const uint32_t count : band_counts[static_cast<size_t>(band)]) {
+            total += count;
+        }
+        LossyCoeffTable table;
+        if (total == 0) {
+            table = make_single_symbol_table(coding);
+        } else {
+            table.build_from_counts(band_counts[static_cast<size_t>(band)].data(),
+                                    coding.num_symbols);
+        }
+        band_tables.push_back(std::move(table));
+    }
+    return band_tables;
+}
+
 [[nodiscard]] bool same_coeff_table(const LossyCoeffTable& lhs,
                                     const LossyCoeffTable& rhs,
                                     int num_symbols) {
@@ -791,6 +899,137 @@ struct CoeffContextAnalysis {
     return writer.size();
 }
 
+// Pooled-band variant (plane): re-encode every active position with its
+// log-band pooled table and keep the whole variant only if the total
+// serialized payload (bank + streams) is strictly smaller than the
+// current best. Evaluated wholesale — a greedy per-position swap cannot
+// see the win, because the saving comes from bank dedup once many
+// positions share one table. Each position keeps its own
+// significance-map mode; the pooled counts contain that position's
+// counts in its own mode, so the band table supports them (checked
+// explicitly anyway).
+[[nodiscard]] Result<bool> try_pooled_plane_band_tables(
+    std::span<const DctBlockI16> blocks,
+    std::span<const uint8_t> spans,
+    std::span<LossyCoeffTable> tables,
+    std::span<EncodedCoeffContextStream> streams,
+    const SymbolCoding& coding,
+    const LossyCoeffStreamConfig& config,
+    size_t& best_payload_size) {
+    const std::vector<LossyCoeffTable> band_tables =
+        build_plane_band_tables(blocks, spans, streams, coding);
+    std::vector<LossyCoeffTable> trial_tables(tables.begin(), tables.end());
+    std::vector<EncodedCoeffContextStream> trial_streams(streams.begin(), streams.end());
+    for (size_t pos = 0; pos < tables.size(); ++pos) {
+        if (streams[pos].active_blocks == 0) {
+            continue;
+        }
+        const LossyCoeffTable& band_table =
+            band_tables[static_cast<size_t>(coeff_band_of(static_cast<int>(pos)))];
+        if (same_coeff_table(tables[pos], band_table, coding.num_symbols)) {
+            continue;
+        }
+        const std::vector<uint32_t> counts = build_plane_counts(
+            blocks, spans, static_cast<int>(pos), coding, streams[pos].use_significance_map);
+        if (!table_supports_counts(band_table, counts)) {
+            continue;
+        }
+        const CoeffContextAnalysis analysis = analyze_coeff_context(
+            blocks, spans, static_cast<int>(pos), streams[pos].use_significance_map);
+        auto trial_stream = encode_coeff_context_stream(
+            blocks, spans, static_cast<int>(pos), analysis, band_table, coding, config,
+            streams[pos].use_significance_map);
+        if (!trial_stream) {
+            return std::unexpected(trial_stream.error());
+        }
+        trial_tables[pos] = band_table;
+        trial_streams[pos] = std::move(*trial_stream);
+    }
+    auto trial_size =
+        serialized_plane_bank_payload_size(trial_tables, trial_streams, coding, config);
+    if (!trial_size) {
+        return std::unexpected(trial_size.error());
+    }
+    if (*trial_size < best_payload_size) {
+        for (size_t pos = 0; pos < tables.size(); ++pos) {
+            tables[pos] = trial_tables[pos];
+            streams[pos] = trial_streams[pos];
+        }
+        best_payload_size = *trial_size;
+        return true;
+    }
+    return false;
+}
+
+// Pooled-band variant (chroma): same wholesale evaluation, one band
+// table per position shared by the Cb and Cr streams of that position.
+[[nodiscard]] Result<bool> try_pooled_chroma_band_tables(
+    std::span<const DctBlockI16> cb_blocks,
+    std::span<const DctBlockI16> cr_blocks,
+    std::span<const uint8_t> spans,
+    std::span<LossyCoeffTable> tables,
+    std::span<EncodedCoeffContextStream> cb_streams,
+    std::span<EncodedCoeffContextStream> cr_streams,
+    const SymbolCoding& coding,
+    const LossyCoeffStreamConfig& config,
+    size_t& best_payload_size) {
+    const std::vector<LossyCoeffTable> band_tables =
+        build_chroma_band_tables(cb_blocks, cr_blocks, spans, cb_streams, coding);
+    std::vector<LossyCoeffTable> trial_tables(tables.begin(), tables.end());
+    std::vector<EncodedCoeffContextStream> trial_cb_streams(cb_streams.begin(), cb_streams.end());
+    std::vector<EncodedCoeffContextStream> trial_cr_streams(cr_streams.begin(), cr_streams.end());
+    for (size_t pos = 0; pos < tables.size(); ++pos) {
+        if (cb_streams[pos].active_blocks == 0) {
+            continue;
+        }
+        const LossyCoeffTable& band_table =
+            band_tables[static_cast<size_t>(coeff_band_of(static_cast<int>(pos)))];
+        if (same_coeff_table(tables[pos], band_table, coding.num_symbols)) {
+            continue;
+        }
+        const std::vector<uint32_t> counts = build_chroma_counts(
+            cb_blocks, cr_blocks, spans, static_cast<int>(pos), coding,
+            cb_streams[pos].use_significance_map);
+        if (!table_supports_counts(band_table, counts)) {
+            continue;
+        }
+        const CoeffContextAnalysis cb_analysis = analyze_coeff_context(
+            cb_blocks, spans, static_cast<int>(pos), cb_streams[pos].use_significance_map);
+        const CoeffContextAnalysis cr_analysis = analyze_coeff_context(
+            cr_blocks, spans, static_cast<int>(pos), cb_streams[pos].use_significance_map);
+        auto trial_cb_stream = encode_coeff_context_stream(
+            cb_blocks, spans, static_cast<int>(pos), cb_analysis, band_table, coding, config,
+            cb_streams[pos].use_significance_map);
+        if (!trial_cb_stream) {
+            return std::unexpected(trial_cb_stream.error());
+        }
+        auto trial_cr_stream = encode_coeff_context_stream(
+            cr_blocks, spans, static_cast<int>(pos), cr_analysis, band_table, coding, config,
+            cb_streams[pos].use_significance_map);
+        if (!trial_cr_stream) {
+            return std::unexpected(trial_cr_stream.error());
+        }
+        trial_tables[pos] = band_table;
+        trial_cb_streams[pos] = std::move(*trial_cb_stream);
+        trial_cr_streams[pos] = std::move(*trial_cr_stream);
+    }
+    auto trial_size = serialized_chroma_bank_payload_size(trial_tables, trial_cb_streams,
+                                                          trial_cr_streams, coding, config);
+    if (!trial_size) {
+        return std::unexpected(trial_size.error());
+    }
+    if (*trial_size < best_payload_size) {
+        for (size_t pos = 0; pos < tables.size(); ++pos) {
+            tables[pos] = trial_tables[pos];
+            cb_streams[pos] = trial_cb_streams[pos];
+            cr_streams[pos] = trial_cr_streams[pos];
+        }
+        best_payload_size = *trial_size;
+        return true;
+    }
+    return false;
+}
+
 [[nodiscard]] Result<void> optimize_plane_table_clusters(
     std::span<const DctBlockI16> blocks,
     std::span<const uint8_t> spans,
@@ -864,6 +1103,16 @@ struct CoeffContextAnalysis {
         if (!changed) {
             break;
         }
+    }
+
+    // Extra candidate alongside cluster reuse: the pooled-band variant
+    // wins exactly where cluster reuse cannot (positions whose supports
+    // differ, so no single position's table supports another's counts).
+    size_t pooled_best_size = *best_payload_size;
+    auto pooled = try_pooled_plane_band_tables(blocks, spans, tables, streams, coding, config,
+                                               pooled_best_size);
+    if (!pooled) {
+        return std::unexpected(pooled.error());
     }
 
     return {};
@@ -961,6 +1210,13 @@ struct CoeffContextAnalysis {
         if (!changed) {
             break;
         }
+    }
+
+    size_t pooled_best_size = *best_payload_size;
+    auto pooled = try_pooled_chroma_band_tables(cb_blocks, cr_blocks, spans, tables, cb_streams,
+                                                cr_streams, coding, config, pooled_best_size);
+    if (!pooled) {
+        return std::unexpected(pooled.error());
     }
 
     return {};
