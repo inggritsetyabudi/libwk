@@ -15,9 +15,7 @@
 
 #include "cclm.h"
 #include "lossy_tile_decode.h"
-#include "cclm.h"
 #include "coeff_span_stream.h"
-#include "container.h"
 #include "dct.h"
 #include "lossy_coeff_stream.h"
 #include "mode_span_rans.h"
@@ -25,14 +23,8 @@
 #include "predict.h"
 #include "quantize.h"
 #include "superblock_quant.h"
-#include "colorspace.h"
 #include <wk/wk.hpp>
-#include <wk/wk.h>
 #include <cmath>
-#include <cstring>
-#include <exception>
-#include <new>
-#include <optional>
 
 namespace wk {
 

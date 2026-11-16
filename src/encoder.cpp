@@ -15,17 +15,8 @@
 
 #include "common.h"
 #include "adaptive_chroma.h"
-#include "coeff_span_stream.h"
 #include "container.h"
-#include "cclm.h"
 #include "control_field.h"
-#include "superblock_quant.h"
-#include "dct.h"
-#include "lossy_coeff_stream.h"
-#include "mode_span_rans.h"
-#include "mode_stream.h"
-#include "quantize.h"
-#include "predict.h"
 #include "colorspace.h"
 #include "lossless.h"
 #include "lossy_tile_encode.h"
@@ -34,7 +25,6 @@
 #include <wk/wk.h>
 #include <wk/wkmeta.hpp>
 #include <cstring>
-#include <cmath>
 #include <cstdlib>
 #include <algorithm>
 #include <exception>

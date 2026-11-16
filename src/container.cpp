@@ -14,7 +14,6 @@
 // limitations under the License.
 
 #include "container.h"
-#include <optional>
 #include <cstring>
 
 namespace wk

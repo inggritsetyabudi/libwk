@@ -20,8 +20,6 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
-#include <memory>
-#include <sstream>
 #include <vector>
 
 namespace wk::io {

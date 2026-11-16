@@ -13,24 +13,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "cclm.h"
 #include "common.h"
-#include "coeff_span_stream.h"
 #include "container.h"
-#include "dct.h"
-#include "lossy_coeff_stream.h"
-#include "mode_span_rans.h"
 #include "mode_stream.h"
-#include "predict.h"
-#include "quantize.h"
-#include "superblock_quant.h"
 #include "colorspace.h"
 #include "lossless.h"
 #include "tile_util.h"
 #include "lossy_tile_decode.h"
 #include <wk/wk.hpp>
 #include <wk/wk.h>
-#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <exception>

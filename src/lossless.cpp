@@ -17,7 +17,6 @@
 #include "coeff_table_stream.h"
 #include <unordered_map>
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <limits>
 #include <optional>

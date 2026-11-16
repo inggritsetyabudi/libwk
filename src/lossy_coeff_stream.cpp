@@ -20,7 +20,6 @@
 #include "coeff_table_stream.h"
 #include "rans.h"
 #include <algorithm>
-#include <cmath>
 #include <optional>
 
 namespace wk {
