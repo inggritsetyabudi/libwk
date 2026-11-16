@@ -20,9 +20,9 @@
 
 #include <wk/wk.hpp>
 
-#include "../src/colorspace.h"
-#include "../src/control_field.h"
-#include "../src/lossy_tile_encode.h"
+#include "../src/core/colorspace.h"
+#include "../src/core/control_field.h"
+#include "../src/core/lossy_tile_encode.h"
 
 using namespace wk;
 

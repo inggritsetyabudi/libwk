@@ -14,8 +14,8 @@
 // limitations under the License.
 #include <gtest/gtest.h>
 
-#include "../src/common.h"
-#include "../src/mode_stream.h"
+#include "../src/core/common.h"
+#include "../src/core/mode_stream.h"
 
 using namespace wk;
 

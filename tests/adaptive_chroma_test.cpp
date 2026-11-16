@@ -17,7 +17,7 @@
 #include <cmath>
 #include <vector>
 
-#include "../src/adaptive_chroma.h"
+#include "../src/core/adaptive_chroma.h"
 
 using namespace wk;
 

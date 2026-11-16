@@ -3,8 +3,8 @@
 // the encoder/decoder integration is trusted.
 #include <gtest/gtest.h>
 
-#include "../src/control_field.h"
-#include "../src/superblock_quant.h"
+#include "../src/core/control_field.h"
+#include "../src/core/superblock_quant.h"
 
 using namespace wk;
 

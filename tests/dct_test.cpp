@@ -14,7 +14,7 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
-#include "../src/dct.h"
+#include "../src/core/dct.h"
 #include <cmath>
 #include <random>
 

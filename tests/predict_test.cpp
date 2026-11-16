@@ -14,8 +14,8 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
-#include "../src/predict.h"
-#include "../src/quantize.h"
+#include "../src/core/predict.h"
+#include "../src/core/quantize.h"
 #include <cstring>
 
 using namespace wk;

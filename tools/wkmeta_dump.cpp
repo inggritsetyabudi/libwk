@@ -14,8 +14,8 @@
 // limitations under the License.
 
 #include <wk/wkmeta.hpp>
-#include "../src/common.h"
-#include "../src/container.h"
+#include "../src/core/common.h"
+#include "../src/core/container.h"
 #include <cstdio>
 #include <cstring>
 #include <fstream>

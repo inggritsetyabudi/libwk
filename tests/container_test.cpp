@@ -14,7 +14,7 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
-#include "../src/container.h"
+#include "../src/core/container.h"
 #include <cstring>
 
 using namespace wk;

@@ -15,9 +15,9 @@
 
 #include <wk/wk.hpp>
 #include <wk/wkmeta.hpp>
-#include "../src/common.h"
-#include "../src/container.h"
-#include "../src/exif_import.h"
+#include "../src/core/common.h"
+#include "../src/core/container.h"
+#include "../src/core/exif_import.h"
 #include <algorithm>
 #include <charconv>
 #include <cstdlib>

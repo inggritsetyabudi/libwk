@@ -17,45 +17,46 @@
 EXPORTED_FUNCTIONS="['_wk_wasm_alloc','_wk_wasm_free','_wk_wasm_decode','_wk_wasm_encode','_wk_wasm_version','_malloc','_free']"
 EXPORTED_RUNTIME="['wasmMemory']"
 
-# Source list: every src/*.cpp EXCEPT threading.cpp and the removed
-# quantize.cpp. threading.cpp is deliberately excluded: under
-# __EMSCRIPTEN__ threading.h provides an inline single-threaded
-# ThreadPool, and the real pool in threading.cpp would conflict with
-# it. Keep this list in sync with src/ when modules are added.
+# Source list: every src/core/*.cpp plus the stb implementation
+# unit. src/arch/generic/threading.cpp is deliberately excluded:
+# under __EMSCRIPTEN__ src/core/threading.h provides the inline
+# single-threaded ThreadPool from src/arch/wasm, and the real pool in
+# generic/threading.cpp would conflict with it. Keep this list in
+# sync with src/ when modules are added.
 # em++ (not emcc): the engine is C++ and the link needs the C++
 # standard library (operator new/delete, std::string).
 em++ \
   -I../include \
   -I../src \
-  ../src/adaptive_chroma.cpp \
-  ../src/cclm.cpp \
-  ../src/coeff_presence_stream.cpp \
-  ../src/coeff_sign_stream.cpp \
-  ../src/coeff_span_stream.cpp \
-  ../src/coeff_table_bank_stream.cpp \
-  ../src/coeff_table_stream.cpp \
-  ../src/colorspace.cpp \
-  ../src/container.cpp \
-  ../src/control_field.cpp \
-  ../src/dct.cpp \
-  ../src/decoder.cpp \
-  ../src/encoder.cpp \
-  ../src/exif_import.cpp \
-  ../src/image_io.cpp \
-  ../src/stb_image.cpp \
-  ../src/lossless.cpp \
-  ../src/lossy_coeff_stream.cpp \
-  ../src/lossy_tile_decode.cpp \
-  ../src/lossy_tile_encode.cpp \
-  ../src/metrics.cpp \
-  ../src/mode_span_rans.cpp \
-  ../src/mode_stream.cpp \
-  ../src/predict.cpp \
-  ../src/rans.cpp \
-  ../src/superblock_quant.cpp \
+  ../src/core/adaptive_chroma.cpp \
+  ../src/core/cclm.cpp \
+  ../src/core/coeff_presence_stream.cpp \
+  ../src/core/coeff_sign_stream.cpp \
+  ../src/core/coeff_span_stream.cpp \
+  ../src/core/coeff_table_bank_stream.cpp \
+  ../src/core/coeff_table_stream.cpp \
+  ../src/core/colorspace.cpp \
+  ../src/core/container.cpp \
+  ../src/core/control_field.cpp \
+  ../src/core/dct.cpp \
+  ../src/core/decoder.cpp \
+  ../src/core/encoder.cpp \
+  ../src/core/exif_import.cpp \
+  ../src/core/image_io.cpp \
+  ../src/stb/stb_image.cpp \
+  ../src/core/lossless.cpp \
+  ../src/core/lossy_coeff_stream.cpp \
+  ../src/core/lossy_tile_decode.cpp \
+  ../src/core/lossy_tile_encode.cpp \
+  ../src/core/metrics.cpp \
+  ../src/core/mode_span_rans.cpp \
+  ../src/core/mode_stream.cpp \
+  ../src/core/predict.cpp \
+  ../src/core/rans.cpp \
+  ../src/core/superblock_quant.cpp \
   threading_stub.cpp \
-  ../src/tile_util.cpp \
-  ../src/wkmeta.cpp \
+  ../src/core/tile_util.cpp \
+  ../src/core/wkmeta.cpp \
   wk_wasm.cpp \
   -o wk.js \
   -s WASM=1 \

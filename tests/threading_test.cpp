@@ -16,7 +16,7 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
-#include "../src/threading.h"
+#include "../src/core/threading.h"
 
 using namespace wk;
 
