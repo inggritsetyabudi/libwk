@@ -15,7 +15,6 @@
 
 #include "exif_import.h"
 #include <algorithm>
-#include <array>
 #include <ctime>
 #include <string>
 

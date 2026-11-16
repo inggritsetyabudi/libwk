@@ -17,14 +17,10 @@
 #include "common.h"
 #include "exif_import.h"
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstring>
 #include <ctime>
-#include <iomanip>
 #include <map>
-#include <optional>
-#include <sstream>
 #include <charconv>
 
 namespace wk::meta

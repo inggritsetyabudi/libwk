@@ -126,15 +126,6 @@ Result<std::vector<uint8_t>> unpack_coefficient_sign_modes(std::span<const uint8
     return modes;
 }
 
-Result<void> write_packed_coefficient_signs(ByteWriter& writer, std::span<const uint8_t> signs) {
-    auto packed = pack_coefficient_signs(signs);
-    if (!packed) {
-        return std::unexpected(packed.error());
-    }
-    writer.write_bytes(*packed);
-    return {};
-}
-
 Result<std::vector<uint8_t>> read_packed_coefficient_signs(ByteReader& reader,
                                                            size_t expected_count,
                                                            std::string_view label) {

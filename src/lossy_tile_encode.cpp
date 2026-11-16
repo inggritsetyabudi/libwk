@@ -15,9 +15,7 @@
 
 #include "common.h"
 #include "lossy_tile_encode.h"
-#include "adaptive_chroma.h"
 #include "coeff_span_stream.h"
-#include "container.h"
 #include "cclm.h"
 #include "control_field.h"
 #include "superblock_quant.h"
@@ -27,16 +25,9 @@
 #include "mode_stream.h"
 #include "quantize.h"
 #include "predict.h"
-#include "colorspace.h"
-#include "threading.h"
-#include <wk/wk.h>
-#include <wk/wkmeta.hpp>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
-#include <exception>
-#include <new>
-#include <optional>
 
 namespace wk {
 

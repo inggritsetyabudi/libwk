@@ -16,7 +16,6 @@
 #include "predict.h"
 #include <cmath>
 #include <algorithm>
-#include <numeric>
 #include <limits>
 
 namespace wk
