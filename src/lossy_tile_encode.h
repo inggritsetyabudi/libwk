@@ -35,6 +35,11 @@ struct TileEncodeResult {
 
 Result<TileEncodeResult> encode_lossy_tile(
     const int16_t* y_plane, const int16_t* cb_plane, const int16_t* cr_plane,
+    // Full-resolution chroma for the control-field classification.
+    // cb_plane/cr_plane above are at the TILE's subsampling resolution
+    // (half-res for a 420 tile); the classifier was measured on
+    // full-res chroma, so the full planes are passed separately.
+    const int16_t* cb_plane_full, const int16_t* cr_plane_full,
     const int16_t* alpha_plane,
     uint32_t image_width, uint32_t image_height,
     uint32_t tile_x, uint32_t tile_y, uint32_t tile_size,

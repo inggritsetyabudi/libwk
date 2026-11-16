@@ -2598,23 +2598,31 @@ TEST(RoundtripTest, ControlFieldSuperblockMapRoundtrips) {
     // by measurement — coarsening real texture bought size with
     // disproportionate PSNR loss (meadow -0.97 dB at q75) — so the
     // field-on file must be the SAME size as the field-off file of
-    // the same image (the field changes nothing now), not smaller.
-    // The map machinery itself (write/read of a non-trivial map) is
-    // covered by the SuperblockQuantTest unit tests, and old V9/V10
-    // files with a non-trivial map still decode via the 12-file
-    // backward-compat gate.
+    // the same image (the field's superblock policy changes nothing
+    // now), not smaller. The map machinery itself (write/read of a
+    // non-trivial map) is covered by the SuperblockQuantTest unit
+    // tests, and old V9/V10 files with a non-trivial map still decode
+    // via the 12-file backward-compat gate.
+    // The texture is GRAYSCALE on purpose: random RGB noise contains
+    // blocks whose mean colour falls in the skin box, and the skin
+    // policy (quant scale 0.5 on Skin blocks, luma-only) would grow
+    // the field-on file — that policy is covered by
+    // skin_protection_test, not here. Grey keeps every block on the
+    // v1 Textured path, so this test still guards exactly the
+    // disabled coarser step.
     Image image(128, 128, BitDepth::Bits8, true);
     uint32_t seed = 0x12345678u;
     for (uint32_t y = 0; y < 128; ++y) {
         uint8_t* row = image.row(y);
         for (uint32_t x = 0; x < 128; ++x) {
-            for (int c = 0; c < 3; ++c) {
-                // xorshift32: deterministic, high-variance texture.
-                seed ^= seed << 13;
-                seed ^= seed >> 17;
-                seed ^= seed << 5;
-                row[x * 4 + c] = static_cast<uint8_t>(seed & 0xff);
-            }
+            // xorshift32: deterministic, high-variance texture.
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            const uint8_t v = static_cast<uint8_t>(seed & 0xff);
+            row[x * 4 + 0] = v;
+            row[x * 4 + 1] = v;
+            row[x * 4 + 2] = v;
             row[x * 4 + 3] = 255;
         }
     }
@@ -2643,7 +2651,8 @@ TEST(RoundtripTest, ControlFieldSuperblockMapRoundtrips) {
     EXPECT_GT(metrics->psnr, 20.0) << "V9 PSNR too low: " << metrics->psnr;
     // The textured coarser step is disabled (see above), so the V9
     // file must be the same size as the field-off file of the same
-    // image — the field no longer changes the quant.
+    // image — on this greyscale texture the field changes no quant
+    // (no Skin blocks, superblock map identity).
     EXPECT_EQ(encoded_on->size(), encoded_off->size())
         << "field-on file (" << encoded_on->size() << " B) should equal the "
         << "field-off file (" << encoded_off->size() << " B) on a textured image "

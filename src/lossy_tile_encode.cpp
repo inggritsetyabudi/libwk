@@ -379,6 +379,7 @@ static bool tile_has_smooth_chroma_ramp(const TileVisualComplexity& stats) {
 
 Result<TileEncodeResult> encode_lossy_tile(
     const int16_t* y_plane, const int16_t* cb_plane, const int16_t* cr_plane,
+    const int16_t* cb_plane_full, const int16_t* cr_plane_full,
     const int16_t* alpha_plane,
     uint32_t image_width, uint32_t image_height,
     uint32_t tile_x, uint32_t tile_y, uint32_t tile_size,
@@ -467,14 +468,32 @@ Result<TileEncodeResult> encode_lossy_tile(
         }
     }
 
-    // Phase 2 control field: per-block content analysis of this tile's
-    // luma. Phase 3 aggregates it to a per-superblock quant map (V9);
-    // the per-block V7 scales proved too expensive to signal for a
-    // dense field (see superblock_quant.h), so the field's per-block
-    // scale is NOT used directly — only its superblock aggregate is.
+    // Phase 2 control field: per-block content analysis of this tile.
+    // The chroma planes are passed at full luma resolution (the tile
+    // planes above are at the tile's subsampling resolution — half-res
+    // for a 420 tile — so the full planes come in separately), and the
+    // content-type classes match the measured classification. Phase 3
+    // aggregates the field to a per-superblock quant map (V9); the
+    // per-block V7 scales proved too expensive to signal for a dense
+    // field (see superblock_quant.h), so only the superblock aggregate
+    // is used — except the skin policy below, which spends a finer
+    // scale on the few Skin blocks only.
+    std::vector<int16_t> tile_cb_full, tile_cr_full;
+    if (use_control_field) {
+        tile_cb_full.resize(tw * th);
+        tile_cr_full.resize(tw * th);
+        for (uint32_t r = 0; r < th; ++r) {
+            for (uint32_t c = 0; c < tw; ++c) {
+                tile_cb_full[r * tw + c] = cb_plane_full[(y0 + r) * image_width + (x0 + c)];
+                tile_cr_full[r * tw + c] = cr_plane_full[(y0 + r) * image_width + (x0 + c)];
+            }
+        }
+    }
     const std::vector<BlockControl> control_field =
-        use_control_field ? analyze_control_field(tile_y_data.data(), tw, th)
-                          : std::vector<BlockControl>{};
+        use_control_field
+            ? analyze_control_field(tile_y_data.data(), tw, th,
+                                    tile_cb_full.data(), tile_cr_full.data())
+            : std::vector<BlockControl>{};
     const std::vector<uint8_t> superblock_scales =
         use_control_field
             ? aggregate_superblock_scales(control_field, blocks_x, blocks_y)
@@ -491,8 +510,8 @@ Result<TileEncodeResult> encode_lossy_tile(
     // ramp's rise at boundaries, not from the seed row's step size --
     // and the finer steps flip the RDO layout choices chaotically.
     // V7 stays as the adaptive-quantization foundation (SPEC 3.2);
-    // no policy currently emits a non-identity scale, so all tiles
-    // are V6 until a policy that actually helps lands.
+    // the skin policy below is the first policy to emit a
+    // non-identity scale (0.5 on Skin blocks, luma-only).
     const bool smooth_ramp_tile = tile_has_smooth_chroma_ramp(tile_stats);
     // Seed boost, retried under the quantization-aware RDO: on a
     // smooth-ramp tile at low quality, the seed blocks (first row or
@@ -513,8 +532,9 @@ Result<TileEncodeResult> encode_lossy_tile(
     // worst step got worse (4 -> 5) and the file grew +275%
     // (2637 -> 9883 B). The RDO's bit estimate undercounts the true
     // rANS cost of the finer coefficients, so the finer step is not
-    // worth it. V7 stays dormant (no policy emits a non-identity
-    // scale) until a policy with a better size/quality tradeoff lands.
+    // worth it on a whole tile. The skin policy below is the first
+    // use of a 0.5 scale that pays off: it applies to the few Skin
+    // blocks only, not to a whole tile.
 
     QuantTable quant_y, quant_c, quant_a;
     quant_y.build(luma_quality, false, bit_depth);
@@ -567,15 +587,22 @@ Result<TileEncodeResult> encode_lossy_tile(
                 above_left = reconstructed_y[(by0 - 1) * tw + (bx0 - 1)];
             }
 
-            // Per-block scale (seed boost only). This is what
-            // BlockData stores and what the V7/V8 per-block stream
-            // serializes — it stays sparse and cheap. The superblock
-            // scale (V9 map) is applied on top at quantize time but
-            // is NOT stored per block; the decoder reconstructs it
-            // from the map. Effective scale: per-block wins when
-            // non-identity, else the block's superblock scale.
+            // Per-block scale (skin protection, then seed boost).
+            // This is what BlockData stores and what the V7/V8
+            // per-block stream serializes — it stays sparse and cheap.
+            // The superblock scale (V9 map) is applied on top at
+            // quantize time but is NOT stored per block; the decoder
+            // reconstructs it from the map. Effective scale:
+            // per-block wins when non-identity, else the block's
+            // superblock scale. A Skin block gets quant scale 0.5
+            // (index 0, luma-only); a block that is both skin and
+            // seed takes the finer skin scale.
+            const bool is_skin_block =
+                use_control_field &&
+                control_field[by * blocks_x + bx].content == BlockContent::Skin;
             const uint8_t per_block_scale_index =
-                (seed_boost_tile && (by == 0 || bx == 0))
+                is_skin_block ? 0
+                : (seed_boost_tile && (by == 0 || bx == 0))
                     ? 2 : QuantTable::kQuantScaleIdentity;
             const uint8_t sb_scale_index =
                 superblock_scale_for(superblock_scales, blocks_x, bx, by);

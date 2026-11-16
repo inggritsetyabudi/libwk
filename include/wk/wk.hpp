@@ -161,14 +161,15 @@ namespace wk
         uint8_t tile_size_log2 = 0;
         uint32_t threads = 0;
         // Phase 2 perceptual control field: when true, the encoder
-        // analyzes each tile's luma into a per-block content field
-        // (flat / textured / edge / normal) and aggregates it to a
-        // per-superblock quant map (V9). The quant policy is
-        // currently disabled: since 2026-11-14 every superblock stays
-        // at identity (the >=75% textured -> 1.25 boost cost meadow
-        // -0.97 dB), so the field changes nothing and only costs CPU.
-        // Default off; set true to re-enable the analysis for a
-        // future policy.
+        // analyzes each tile into a per-block content field (luma
+        // classes plus, from the tile's chroma, content-type classes
+        // such as Skin) and applies the skin policy: quant scale 0.5
+        // on Skin blocks only, luma-only, via the V7 scale stream
+        // (measured: +1.92% file at equal SSIM for a visible gain on
+        // skin). The superblock quant policy stays disabled: since
+        // 2026-11-14 every superblock is identity (the >=75%
+        // textured -> 1.25 boost cost meadow -0.97 dB).
+        // Default off.
         bool use_control_field = false;
         // Cross-component linear model (CCLM) chroma prediction (V10):
         // predict each chroma block from its co-located reconstructed
