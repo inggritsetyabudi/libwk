@@ -13,7 +13,6 @@
   <a href="#platform-notes"><img src="https://img.shields.io/badge/platform-Linux-green" alt="Platform Linux" /></a>
 </p>
 
-# WK
 
 WK is an experimental still-image codec and container built around a native
 `.wk` bitstream: tiled lossy and lossless coding, structured `WKMETA`
