@@ -36,10 +36,34 @@ else()
     endfunction()
 endif()
 
-file(GLOB_RECURSE WK_SOURCES CONFIGURE_DEPENDS src/*.cpp)
-list(FILTER WK_SOURCES EXCLUDE REGEX "tools/")
+# Layout: src/core/ is the portable codec, src/arch/<target>/
+# holds per-target code (generic fallback + wasm today; x86_64,
+# aarch64 and arm when they gain real content), src/stb/ is vendored
+# third-party. The split is explicit here: core is always compiled,
+# arch is selected by target, nothing relies on a recursive glob.
+file(GLOB WK_CORE_SOURCES CONFIGURE_DEPENDS src/core/*.cpp)
+file(GLOB WK_STB_SOURCES CONFIGURE_DEPENDS src/stb/*.cpp)
 
-add_library(wk STATIC ${WK_SOURCES})
+if(EMSCRIPTEN)
+    set(WK_ARCH_DIR wasm)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    set(WK_ARCH_DIR x86_64)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(WK_ARCH_DIR aarch64)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
+    set(WK_ARCH_DIR arm)
+else()
+    set(WK_ARCH_DIR generic)
+endif()
+message(STATUS "wk arch: ${WK_ARCH_DIR} (processor: ${CMAKE_SYSTEM_PROCESSOR})")
+
+file(GLOB WK_ARCH_SOURCES CONFIGURE_DEPENDS src/arch/generic/*.cpp)
+if(NOT WK_ARCH_DIR STREQUAL "generic")
+    file(GLOB WK_ARCH_TARGET_SOURCES CONFIGURE_DEPENDS src/arch/${WK_ARCH_DIR}/*.cpp)
+    list(APPEND WK_ARCH_SOURCES ${WK_ARCH_TARGET_SOURCES})
+endif()
+
+add_library(wk STATIC ${WK_CORE_SOURCES} ${WK_STB_SOURCES} ${WK_ARCH_SOURCES})
 target_include_directories(wk PUBLIC include)
 target_include_directories(wk PRIVATE src)
 
@@ -139,6 +163,7 @@ if(WK_BUILD_TESTS)
     wk_add_test(c_api_test tests/c_api_test.cpp)
     wk_add_test(wk_hpp_test tests/wk_hpp_test.cpp)
     wk_add_test(threading_test tests/threading_test.cpp)
+    wk_add_test(arch_test tests/arch_test.cpp)
     wk_add_test(image_io_test tests/image_io_test.cpp)
     wk_add_test(exif_gps_test tests/exif_gps_test.cpp)
     wk_add_test(wkmeta_strict_test tests/wkmeta_strict_test.cpp)

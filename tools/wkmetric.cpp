@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <wk/wk.hpp>
-#include "../src/image_io.h"
-#include "../src/metrics.h"
+#include "../src/core/image_io.h"
+#include "../src/core/metrics.h"
 #include <algorithm>
 #include <cctype>
 #include <filesystem>

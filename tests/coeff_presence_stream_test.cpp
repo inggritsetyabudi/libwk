@@ -14,7 +14,7 @@
 // limitations under the License.
 #include <gtest/gtest.h>
 
-#include "../src/coeff_presence_stream.h"
+#include "../src/core/coeff_presence_stream.h"
 
 using namespace wk;
 

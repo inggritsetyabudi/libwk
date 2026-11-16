@@ -17,7 +17,7 @@
 #include <array>
 #include <vector>
 
-#include "../src/coeff_table_bank_stream.h"
+#include "../src/core/coeff_table_bank_stream.h"
 
 using namespace wk;
 

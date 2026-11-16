@@ -14,7 +14,7 @@
 // limitations under the License.
 #include <gtest/gtest.h>
 
-#include "../src/coeff_table_stream.h"
+#include "../src/core/coeff_table_stream.h"
 
 using namespace wk;
 

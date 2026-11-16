@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 #include <wk/wkmeta.hpp>
-#include "../src/exif_import.h"
+#include "../src/core/exif_import.h"
 
 using namespace wk::meta;
 

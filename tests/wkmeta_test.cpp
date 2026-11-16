@@ -15,8 +15,8 @@
 
 #include <gtest/gtest.h>
 #include <wk/wkmeta.hpp>
-#include "../src/common.h"
-#include "../src/exif_import.h"
+#include "../src/core/common.h"
+#include "../src/core/exif_import.h"
 #include <cmath>
 #include <string>
 #include <vector>

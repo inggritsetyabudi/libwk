@@ -14,8 +14,8 @@
 // limitations under the License.
 #include <gtest/gtest.h>
 
-#include "../src/coeff_span_stream.h"
-#include "../src/common.h"
+#include "../src/core/coeff_span_stream.h"
+#include "../src/core/common.h"
 
 using namespace wk;
 

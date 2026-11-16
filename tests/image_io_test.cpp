@@ -16,7 +16,7 @@
 #include <gtest/gtest.h>
 #include <filesystem>
 #include <fstream>
-#include "../src/image_io.h"
+#include "../src/core/image_io.h"
 
 using namespace wk;
 

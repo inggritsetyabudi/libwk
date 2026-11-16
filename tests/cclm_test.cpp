@@ -9,9 +9,9 @@
 #include <cmath>
 #include <vector>
 
-#include "../src/cclm.h"
-#include "../src/container.h"
-#include "../src/mode_stream.h"
+#include "../src/core/cclm.h"
+#include "../src/core/container.h"
+#include "../src/core/mode_stream.h"
 #include "wk/wk.hpp"
 
 using namespace wk;

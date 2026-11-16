@@ -15,10 +15,10 @@
 
 #include <wk/wk.hpp>
 #include <wk/wkmeta.hpp>
-#include "../src/common.h"
-#include "../src/container.h"
-#include "../src/image_io.h"
-#include "../src/metrics.h"
+#include "../src/core/common.h"
+#include "../src/core/container.h"
+#include "../src/core/image_io.h"
+#include "../src/core/metrics.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>

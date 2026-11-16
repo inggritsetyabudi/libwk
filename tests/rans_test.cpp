@@ -14,7 +14,7 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
-#include "../src/rans.h"
+#include "../src/core/rans.h"
 #include <random>
 #include <numeric>
 

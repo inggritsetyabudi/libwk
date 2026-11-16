@@ -5,9 +5,9 @@
 #include <cstring>
 #include <vector>
 
-#include "../src/common.h"
-#include "../src/container.h"
-#include "../src/tile_util.h"
+#include "../src/core/common.h"
+#include "../src/core/container.h"
+#include "../src/core/tile_util.h"
 
 using namespace wk;
 

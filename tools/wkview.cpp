@@ -12,8 +12,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#include "../src/common.h"
-#include "../src/image_io.h"
+#include "../src/core/common.h"
+#include "../src/core/image_io.h"
 #ifdef WK_VIEWER_GUI
 #include <MiniFB.h>
 #endif

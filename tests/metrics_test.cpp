@@ -15,7 +15,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <wk/wk.hpp>
-#include "../src/metrics.h"
+#include "../src/core/metrics.h"
 
 using namespace wk;
 

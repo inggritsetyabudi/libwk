@@ -16,7 +16,7 @@
 
 #include <cmath>
 
-#include "../src/control_field.h"
+#include "../src/core/control_field.h"
 
 using namespace wk;
 

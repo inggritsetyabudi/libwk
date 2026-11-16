@@ -17,7 +17,7 @@
 #include <array>
 #include <utility>
 
-#include "../src/lossy_coeff_stream.h"
+#include "../src/core/lossy_coeff_stream.h"
 
 using namespace wk;
 

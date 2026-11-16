@@ -15,7 +15,7 @@
 
 #include <gtest/gtest.h>
 #include <wk/wkmeta.hpp>
-#include "../src/common.h"
+#include "../src/core/common.h"
 #include <cmath>
 #include <string>
 #include <vector>
