@@ -258,6 +258,16 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
                       fhdr.cicp_matrix, fhdr.bit_depth, fhdr.full_range(),
                       source_has_alpha);
 
+        // Full-resolution chroma for the control-field classification:
+        // the tile planes handed to encode_lossy_tile below are at the
+        // tile's subsampling resolution (half-res for a 420 tile), but
+        // the classifier was measured on full-res chroma. Saved here,
+        // before the moves below: the buffers move into cb_plane /
+        // cr_plane (444 case) or stay put (420 case), but the
+        // allocation outlives the tile futures either way.
+        const int16_t* classify_cb_plane = cb_plane_full.data();
+        const int16_t* classify_cr_plane = cr_plane_full.data();
+
         std::vector<int16_t> cb_plane;
         std::vector<int16_t> cr_plane;
         std::vector<int16_t> alpha_plane;
@@ -353,6 +363,7 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
                     }
                     return encode_lossy_tile(
                         y_plane.data(), tile_cb, tile_cr,
+                        classify_cb_plane, classify_cr_plane,
                         alpha_plane.empty() ? nullptr : alpha_plane.data(),
                         width, height, tx, ty, tile_size,
                         config.quality, fhdr.bit_depth,

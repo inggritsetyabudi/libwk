@@ -1,338 +1,342 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="extra/WK_logo_only.png" />
+    <img src="extra/WK_logo_transparent.png" alt="WK logo" width="256" />
+  </picture>
+</p>
+
+<p align="center">
+  <a href="SPEC.md"><img src="https://img.shields.io/badge/version-0.2.8-blue" alt="Version 0.2.8" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License Apache-2.0" /></a>
+  <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-23-blue" alt="C++23" /></a>
+  <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/CMake-%3E%3D_3.28-blue" alt="CMake >= 3.28" /></a>
+  <a href="#platform-notes"><img src="https://img.shields.io/badge/platform-Linux-green" alt="Platform Linux" /></a>
+</p>
+
 # WK
 
-WK is an experimental still-image codec and container centered around a native `.wk` bitstream, structured `WKMETA` metadata, a small CLI toolchain, measurable image-quality analysis, and a desktop compare viewer for visual inspection.
+WK is an experimental still-image codec and container built around a native
+`.wk` bitstream: tiled lossy and lossless coding, structured `WKMETA`
+metadata, a small CLI toolchain, measurable image-quality analysis, and a
+desktop compare viewer for visual inspection. Its differentiator is a
+content-aware perceptual control field — the encoder classifies each block
+(skin, sky, foliage, text, flat graphics) and can spend bits where the eye
+actually notices them.
 
-The repo is currently focused on making the still-image workflow correct, measurable, and pleasant to inspect:
+This is research software, not a finished product. It is developed and tested
+Linux-first, it is honest about what it does not do yet, and it makes no claim
+of beating JPEG, WebP, or AVIF on compression. The current stage is about
+correctness, observability, and measured, incremental tuning.
 
 - `JPEG/PNG/PPM -> WK`
 - `WK -> PNG/PPM`
 - metadata import, edit, and export through `WKMETA`
 - numeric quality measurement through `wkmetric`
 - side-by-side compare and format inspection through `wkview`
+- an in-browser WebAssembly build under `web/`
 
-WK is not claimed yet as a finished replacement for JPEG, WebP, or AVIF. The current stage is about correctness, observability, and iterative compression tuning before bigger claims are made.
+## Quick Start
 
-## Demo
+### Build (Linux)
 
-Below is a real `wkview` compare screenshot stored in this repo at `extra/ember-7f3a_q85_demo.png`.
-It shows a decoded benchmark output against the original JPEG source.
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
 
-![WK Viewer compare demo](extra/ember-7f3a_q85_demo.png)
+Requirements: CMake `>= 3.28`, a C++23 compiler, Ninja (recommended).
+Dependencies are fetched automatically by CMake: `minifb` for the viewer and
+`googletest` for tests. The viewer is built by default (`WK_BUILD_VIEWER=ON`);
+with `WK_BUILD_VIEWER=OFF`, `wkview` is still built but terminal-only.
 
-The viewer is no longer just a raw image window. It now shows:
+### Encode and decode
 
-- the decoded `WK` panel and the original source panel side by side
-- the filename on each side so the `.wk` result and source image are easy to distinguish
-- file size for both sides
-- image dimensions and bit depth
-- alpha status
-- `lossless` vs `lossy`
-- `WKMETA`, `HDR`, tile size, frame count, and `CICP` information for the `.wk` side
-- a better missing-file error with filename suggestions when you mistype a benchmark output path
+```bash
+# Lossless
+./build/wkenc --lossless photos/people/ember-7f3a.jpg photos/people/ember-7f3a_lossless.wk
 
-That makes `wkview` useful both as a visual compare tool and as a quick format inspector when checking benchmark outputs.
+# Lossy, quality 75 (default)
+./build/wkenc --quality 75 photos/people/ember-7f3a.jpg photos/people/ember-7f3a_lossy.wk
+
+# Decode to PNG
+./build/wkdec photos/people/ember-7f3a_lossy.wk photos/people/decoded_lossy.png
+
+# Inspect a file
+./build/wkdec --info photos/people/ember-7f3a_lossy.wk
+
+# Measure a .wk against its source
+./build/wkmetric photos/people/ember-7f3a.jpg photos/people/ember-7f3a_lossy.wk
+
+# Compare visually in the viewer
+./build/wkview photos/people/ember-7f3a_lossy.wk photos/people/ember-7f3a.jpg
+```
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph API["Public API"]
+        CPP["C++ API - include/wk/wk.hpp"]
+        CAPI["C API - include/wk/wk.h"]
+    end
+    subgraph LIB["Library - src"]
+        ENC["Encoder - encoder.cpp"]
+        DEC["Decoder - decoder.cpp"]
+        CONT["Container - container.cpp"]
+        LOSSY["Lossy tiles - lossy_tile_encode and lossy_tile_decode"]
+        LOSSLESS["Lossless - lossless.cpp"]
+        CF["Control field - control_field.cpp"]
+        PRED["Intra prediction - predict.cpp and cclm.cpp"]
+        DCT["DCT and quant - dct.cpp and quantize.h"]
+        STREAMS["Coefficient streams - mode span table sign presence"]
+        RANS["rANS entropy - rans.cpp"]
+        IO["Image I/O - image_io.cpp and stb"]
+        META["Metadata - wkmeta.cpp and exif_import.cpp"]
+        METRICS["Metrics - metrics.cpp"]
+    end
+    subgraph TOOLS["Tools - tools and web"]
+        CLI["wkenc wkdec wkmetric wkmeta-dump wkmeta-edit"]
+        VIEW["wkview"]
+        WEB["Web build - web"]
+    end
+    CAPI --> CPP
+    CPP --> ENC
+    CPP --> DEC
+    ENC --> LOSSY
+    ENC --> LOSSLESS
+    ENC --> CONT
+    DEC --> LOSSY
+    DEC --> LOSSLESS
+    DEC --> CONT
+    LOSSY --> CF
+    LOSSY --> PRED
+    LOSSY --> DCT
+    LOSSY --> STREAMS
+    STREAMS --> RANS
+    LOSSLESS --> RANS
+    ENC --> IO
+    DEC --> IO
+    ENC --> META
+    DEC --> META
+    CLI --> CPP
+    CLI --> METRICS
+    VIEW --> CPP
+    WEB --> CPP
+```
+
+The library is the codec; the tools are thin front-ends over the public API.
+The encoder and decoder share the container parser, the tile machinery, the
+rANS engine, and the coefficient streams — only the direction of the pipeline
+differs. A deeper, generated dependency graph lives in
+`graphify-out/GRAPH_REPORT.md` (May 2026 snapshot; the current `src/` listing
+is authoritative where the two disagree).
+
+## Format at a Glance
+
+A `.wk` file is a little-endian container (format version `0x0001`) with a
+fixed header, a sequence of 9-byte-framed chunks, and a strict parser: `FHDR`
+must be first, `FEND` must exist and be last, tile payload sizes are
+validated, unknown required chunks are rejected, and unknown optional chunks
+are skipped safely.
+
+```mermaid
+flowchart LR
+    HDR["File header - magic WKIMG and version 0x0001"]
+    FHDR["FHDR - frame header - required first"]
+    TILE["TILE - tile data - one or more"]
+    FEND["FEND - end marker - required last"]
+
+    HDR --> FHDR --> TILE --> FEND
+```
+
+Optional chunks (`META`, `ICCP`, `PROV`, `ANIM`) sit between `FHDR` and the
+`TILE` chunks. The full bitstream specification is `SPEC.md` (v0.2.8).
+
+| Chunk | Contents |
+| --- | --- |
+| `FHDR` | Frame header, 19 bytes: dimensions, bit depth, tile size, CICP |
+| `META` | `WKMETA` structured metadata (optional) |
+| `ICCP` | ICC color profile (optional) |
+| `PROV` | C2PA manifest (optional) |
+| `ANIM` | Animation header, present iff animated |
+| `TILE` | One tile's payload, repeatable |
+| `FEND` | End marker, zero-byte payload, required last |
+
+Lossy tiles use one of eleven layouts, `V1`–`V11`, selected per tile by the
+encoder; older files decode unchanged. The current layout, `V11`, adds
+per-tile chroma subsampling on top of `V10` (CCLM chroma prediction), `V9`
+(superblock quant map), `V8` (rANS-coded mode and span streams), and `V7`
+(per-block quant scales plus the PLANAR prediction mode). Lossy coding uses
+15 intra prediction modes (0–14, including PLANAR mode 13 and chroma-only
+CCLM mode 14), 8×8 DCT, quantization-aware RDO mode selection, and 12-bit
+rANS entropy coding.
+
+## Pipelines
+
+### Lossy encode
+
+```mermaid
+flowchart LR
+    SRC["Source image - RGB 8-bit"]
+    CS["RGB to YCbCr - BT.709"]
+    TILE["Split into tiles - 1024 px default"]
+    PRED["Intra prediction - 15 modes"]
+    DCT["DCT 8x8 on the residual"]
+    Q["Quantization - per-block scales"]
+    RANS["rANS entropy coding"]
+    PACK["Pack TILE chunks"]
+    WK[".wk file"]
+    CF["Control field - Skin blocks to scale 0.5"]
+
+    SRC --> CS --> TILE --> PRED --> DCT --> Q --> RANS --> PACK --> WK
+    TILE --> CF
+    CF -.-> Q
+```
+
+Each tile is converted to YCbCr (BT.709), split into 8×8 blocks, predicted
+with the best of 15 intra modes under a quantization-aware RDO, transformed
+with an 8×8 DCT, and quantized. Per-block quant scales ride the V7 scale
+stream; mode, span, and coefficient streams are rANS-coded. Chroma is YUV444
+by default, with per-tile YUV420 where the source chroma Laplacian says the
+tile is smooth enough (V11, with edge and saturation safeguards that force
+444 back). Lossy alpha, when present, is stored directly in the tile payload.
+
+### Lossy decode
+
+```mermaid
+flowchart LR
+    WK[".wk file"]
+    PARSE["Parse container - FHDR first and FEND last"]
+    TILE["Read TILE chunks"]
+    RANS["rANS decode"]
+    DQ["Dequantize - per-block scales"]
+    IDCT["Inverse DCT 8x8"]
+    REC["Add prediction to reconstruct"]
+    CS["YCbCr to RGB - BT.709"]
+    OUT["Decoded image - PNG or PPM"]
+
+    WK --> PARSE --> TILE --> RANS --> DQ --> IDCT --> REC --> CS --> OUT
+```
+
+Decoding mirrors encoding: the container is parsed strictly, each tile's
+streams are rANS-decoded, coefficients are dequantized (applying the tile's
+per-block scales), inverse-transformed, and added to the prediction. The
+decoder infers chroma subsampling from the tile header, not from a global
+setting, and upsamples YUV420 tiles with the same filter the encoder assumes.
+
+### Lossless
+
+```mermaid
+flowchart LR
+    SRC["Source image - RGB 8-bit"]
+    TILE["Split into tiles - 256 px default"]
+    PAL["Palette path - whole image"]
+    PRED["Predictor path - SELECT MED CLAMP_ADD per tile"]
+    CMP["Keep the smaller total"]
+    RANS["rANS entropy coding - own tables per tile"]
+    PACK["Pack TILE chunks"]
+    WK[".wk file"]
+
+    SRC --> TILE --> PRED --> CMP --> RANS --> PACK --> WK
+    SRC --> PAL --> CMP
+```
+
+Lossless coding is per tile (256 px by default since v0.2.8). Each tile picks
+its best predictor — `SELECT`, `MED` (JPEG-LS median edge detector), or
+`CLAMP_ADD` — by true coded size, with its own rANS tables, so a tile's
+payload is self-contained. The encoder compares that per-tile predictor total
+against a whole-image palette path (including 18 bytes of container overhead
+per tile) and keeps the smaller one, so a palette image can never regress.
+The decoder stitches the tiles back into the frame; a single tile at (0,0)
+is the pre-0.2.8 format and still decodes.
 
 ## Current Status
 
 What is in a good working state right now:
 
-- lossless still-image encode/decode
-- lossy still-image encode/decode
-- lossy alpha preserved inside the `WK` tile payload
-- shared image metrics through `wkmetric`
+- lossless still-image encode/decode, pixel-identical round-trips
+- lossy still-image encode/decode, including lossy alpha in the tile payload
+- per-tile adaptive chroma subsampling (V11) and CCLM chroma prediction (V10)
+- the perceptual control field, opt-in via `--control-field` (see below)
+- shared image metrics through `wkmetric` (file size, MAE, MSE, PSNR, SSIM,
+  RGB per-channel and Y/Cb/Cr breakdowns, weighted chroma artifact metrics)
 - strict container parsing with explicit failure on malformed files
-- EXIF import into `WKMETA`
+  (20,000-iteration fuzzing, zero crashes)
+- EXIF import into `WKMETA`, metadata edit and JSON export
 - PNG output for 8-bit decode
 - side-by-side compare viewer with file and format information
-- C and C++ public APIs
-- unit and integration tests passing in the current tree
+- C and C++ public APIs, and a WebAssembly build under `web/`
+- 30 test binaries passing in the current tree (Release and ASan/UBSan)
 
 What is intentionally not claimed as finished yet:
 
-- full animation encode/decode, even though the spec/container already has animation structures
+- full animation encode/decode, even though the spec and container already
+  have animation structures
 - native `.webp` input/output support
-- advanced HDR output writers
-- full ICC-aware color-managed display in the viewer
-- compression efficiency that already competes with mature JPEG/WebP/AVIF encoders
-
-## What The Repo Looks Like Now
-
-Below is the high-level architecture graph of the `wk` codec, illustrating the relationships between the core components, coefficient streams, transforms, and metadata handling:
-
-![WK Architecture Graph](extra/113650.png)
-
-### Codec and container
-
-- little-endian `.wk` container with `FHDR`, `META`, `ICCP`, `PROV`, `ANIM`, `TILE`, and `FEND` chunks
-- strict parser rules:
-- `FHDR` must be first
-- `FEND` must exist and be last
-- tile payload sizes are validated
-- unknown required chunks are rejected
-- unknown optional chunks are skipped safely
-- tiled image layout with configurable tile size
-
-### Lossy path
-
-- RGB -> YCbCr conversion
-- `YUV444` or `YUV420` chroma modes
-- 8x8 DCT/IDCT
-- quantization
-- intra prediction
-- `rANS` entropy coding
-- lossy alpha stored directly in the tile payload when alpha exists
-- decoder infers subsampling from tile payload geometry instead of hardcoding `YUV420`
-
-### Measurement and inspection
-
-- `wkmetric` compares a source image against another image or directly against a `.wk` file
-- current metrics include file size, `MAE`, `MSE`, `PSNR`, `SSIM`, RGB per-channel breakdown, Y/Cb/Cr breakdown, and weighted chroma artifact metrics
-- `wkview` is used as the visual judge after the numeric pass
-- corpus benchmark outputs are written to `benchmark/`
-
-### Metadata
-
-- `WKMETA` structured metadata chunk
-- CLI editing via `wkmeta-edit`
-- EXIF import from JPEG/TIFF donor files
-- metadata export as JSON
-
-## Platform Notes
-
-The repo currently has the best day-to-day experience on Windows.
-
-### Windows
-
-- JPEG and PNG I/O use Windows WIC
-- viewer is supported and buildable
-- MinGW runtime DLLs are copied next to executables automatically
-- the old `wkview` `LoadLibrary failed with error 1114` issue was fixed by copying runtime DLLs and forcing `MiniFB` away from the problematic OpenGL path on Windows
-
-### Non-Windows
-
-- the core library is more portable than the convenience image I/O layer
-- the shared I/O layer only guarantees `PPM` outside Windows in the current tree
-- JPEG/PNG workflow is effectively Windows-first right now
-
-## Viewer Notes
-
-A few practical notes for `wkview` based on the current repo behavior:
-
-- benchmark outputs live in `benchmark/` and now flatten the recursive source path into the filename, for example `benchmark/people_mira-5b8d_q85_yuv444.wk`
-- if you type the wrong filename, `wkview` now tries to suggest nearby matches instead of only failing with a generic open error
-- if you still somehow hit the old Windows popup about `LoadLibrary failed with error 1114`, make sure you are launching the fresh executable from `build/` and not an older copied binary from another directory
-- the viewer currently aims to be a reliable debug and compare window first, not a full color-managed HDR presentation app
-
-## Build
-
-### Requirements
-
-- CMake `>= 3.28`
-- a C++23 compiler
-- on Windows, the repo is currently developed and tested with MSYS2 UCRT64 + MinGW
-- Ninja is recommended
-
-### Windows example
-
-Use MSYS UCRT64 bash Terminal for compile and test the project
-
-```bash
-cmake -S . -B build -G Ninja
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure
-```
-
-Dependencies are fetched automatically by CMake:
-
-- `minifb` for the viewer
-- `googletest` for tests
-
-## Quick Start
-
-The preferred sample photo path in the current tree is:
-
-- `photos/people/ember-7f3a.jpg`
-
-### Encode lossless
-
-```powershell
-.\build\wkenc.exe --lossless photos\people\ember-7f3a.jpg photos\people\ember-7f3a_lossless.wk
-```
-
-### Encode lossy
-
-```powershell
-.\build\wkenc.exe --quality 75 photos\people\ember-7f3a.jpg photos\people\ember-7f3a_lossy.wk
-```
-
-### Decode
-
-```powershell
-.\build\wkdec.exe photos\people\ember-7f3a_lossy.wk photos\people\decoded_lossy.png
-```
-
-### Inspect info
-
-```powershell
-.\build\wkdec.exe --info photos\people\ember-7f3a_lossy.wk
-```
-
-### Measure a `.wk` against the source image
-
-```powershell
-.\build\wkmetric.exe photos\people\ember-7f3a.jpg photos\people\ember-7f3a_lossy.wk
-```
-
-### Compare visually in the viewer
-
-```powershell
-.\build\wkview.exe photos\people\ember-7f3a_lossy.wk photos\people\ember-7f3a.jpg
-```
-
-### View a benchmark output directly
-
-```powershell
-.\build\wkview.exe .\benchmark\people_mira-5b8d_q85_yuv444.wk .\photos\people\mira-5b8d.jpg
-```
-
-## Benchmark Workflow
-
-Benchmark utilities now live under `utils/`.
-
-### Run the recursive corpus benchmark
-
-```powershell
-.\utils\benchmark_corpus.ps1 -Quality 75 -Subsampling 444
-```
-
-That pass now walks the full `photos/` tree recursively, so `photos/people/` and `photos/scenery/` are both included automatically.
-
-Explicit `4:2:0` pass:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\utils\benchmark_corpus.ps1 -Quality 75 -Subsampling 420
-```
-
-Lossless pass:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\utils\benchmark_corpus.ps1 -Lossless
-```
-
-JPEG-signature-only pass:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\utils\benchmark_corpus.ps1 -Quality 75 -Subsampling 444 -FormatFilter jpeg
-```
-
-The generated `.wk` outputs and JSON summaries are written under `benchmark/`.
-
-The row summaries now include `relative_path`, `scene_group`, `lighting_bucket`, `declared_format`, `detected_format`, `source_mean_luma`, `y_psnr`, `chroma_psnr`, `weighted_chroma_mae`, and `max_abs_error`.
-
-The runner also writes rollup files such as `benchmark/rollup_q75_yuv444.json` and `benchmark/rollup_q85_yuv444.json`, which aggregate the corpus by scene type and lighting bucket.
-
-### Smoke script
-
-A simple end-to-end smoke path also exists at:
-
-- `utils/test_codec.sh`
-
-That script now resolves the repo root, prefers `photos/people/ember-7f3a.jpg`, and falls back to the first recursive JPEG it finds under `photos/`.
-
-## Current Benchmark Snapshot
-
-The current measured corpus summaries in this tree are:
-
-- `benchmark/summary_q75_yuv444.json`
-- `benchmark/summary_q85_yuv444.json`
-- `benchmark/rollup_q75_yuv444.json`
-- `benchmark/rollup_q85_yuv444.json`
-
-Across the current six-image recursive corpus, the mixed-extension averages are:
-
-The benchmark runner records both `declared_format` and `detected_format`. In the current tree, `solis-2c9e.jpg` has a WebP signature and `horizon-4e2a.jpg` has a PNG signature, so the main `photos/` benchmark should be treated as a mixed extension corpus rather than a pure JPEG corpus.
-
-| Profile | Total WK bytes | Avg PSNR | Avg SSIM |
-| --- | ---: | ---: | ---: |
-| `q75_yuv444` | `1,168,901` | `35.5446` | `0.948752` |
-| `q85_yuv444` | `1,650,520` | `38.4155` | `0.968006` |
-
-The scene-aware rollups make the current shape of the corpus much clearer:
-
-- `people` stays relatively clean at `q75`: `92,659` bytes total, `PSNR 36.2101`, `SSIM 0.969126`
-- `scenery` is much harder at `q75`: `1,076,242` bytes total, `PSNR 34.8792`, `SSIM 0.928377`
-- the bright scenery sample `photos/scenery/horizon-4e2a.jpg` is currently the harshest case: `q75 SSIM 0.883296`, `q85 SSIM 0.909543`
-- the JPEG-only rollups live at `benchmark/rollup_q75_yuv444_srcjpeg.json` and `benchmark/rollup_q85_yuv444_srcjpeg.json`
-
-A concrete example from the current tree:
-
-- `photos/people/mira-5b8d.jpg`: `6,072` bytes
-- `benchmark/people_mira-5b8d_q75_yuv444.wk`: `14,865` bytes, `PSNR 36.8016`, `SSIM 0.972798`
-- `benchmark/people_mira-5b8d_q85_yuv444.wk`: `19,160` bytes, `PSNR 39.5566`, `SSIM 0.985293`
+- advanced HDR output writers and full ICC-aware color-managed display
+- compression efficiency that already competes with mature JPEG/WebP/AVIF
+  encoders
+
+## Perceptual Control Field
+
+The control field (`src/control_field.cpp`) classifies every 8×8 block by
+content — luma classes (Flat, Edge, Textured, Normal) plus, from the tile's
+chroma, content-type classes (Skin, Sky, Foliage, TextUI, FlatGraphics) —
+and lets the encoder treat classes differently. It is off by default and
+enabled with `--control-field` (or `EncoderConfig::use_control_field`).
+
+The first policy built on it is **Skin protection**: blocks classified as
+Skin get quant scale 0.5 (luma-only) through the V7 scale stream. Measured on
+the built encoder over the 6-photo benchmark corpus at q75: file size
++2.46%, Skin-region PSNR +5.7 dB, face/arm-box PSNR +1.4 dB — an equal-SSIM
+cost of +1.9% file for a visible gain on skin. Two honest caveats from the
+same measurement: about 45% of the treated blocks are not human skin
+(false positives such as warm rock and lake reflections), and the SSIM gain
+on actual faces is below the visible threshold even though the PSNR gain is
+large. See `tools/skin_protection_research_2026-11-16.md` for the full
+measurement.
 
 ## CLI Tools
 
 ### `wkenc`
 
-Usage:
-
 ```text
 wkenc [options] <input.{jpg,jpeg,png,ppm}> [output.wk]
 ```
 
-Main options:
+Main options: `--quality N` (0–100, default 75), `--lossless`,
+`--tile-size N` (64–1024, power of two), `--threads N`, `--yuv444`
+(default), `--yuv420`, `--control-field` / `--no-control-field`,
+`--cclm` / `--no-cclm` (CCLM on by default),
+`--adaptive-chroma-subsampling` (on by default) with
+`--chroma-lap-threshold F` (default 2.1) and the p999 safeguards,
+`--import-exif FILE`, `--metrics` (decode the output and report PSNR/SSIM
+vs the source), `--tile-stats`, `--coeff-stats`, `--version`.
 
-- `--quality N`
-- `--lossless`
-- `--tile-size N`
-- `--threads N`
-- `--target-ssimulacra2 N`
-- `--yuv444`
-- `--yuv420`
-- `--import-exif FILE`
-
-Default tile policy:
-
-- lossy still-image encode uses `1024px` tiles by default
-- lossless keeps the legacy `512px` tile header by default
-- `--tile-size N` overrides both behaviors explicitly
+Default tile policy: lossy still-image encode uses 1024 px tiles;
+lossless uses 256 px tiles (since v0.2.8); `--tile-size N` overrides both.
 
 ### `wkdec`
-
-Usage:
 
 ```text
 wkdec [options] <input.wk> [output.{png,ppm}]
 ```
 
-Main options:
-
-- `--info`
-- `--export-meta FILE`
-
-Notes:
-
-- `.png` output is currently limited to 8-bit decoded images
-- higher bit depths should use `.ppm` for now, or fail clearly if unsupported
+Main options: `--info`, `--export-meta FILE`, `--metrics FILE` (decode, then
+report PSNR/SSIM vs a reference image). `.png` output is currently limited
+to 8-bit decoded images; higher bit depths should use `.ppm` for now.
 
 ### `wkmetric`
-
-Usage:
 
 ```text
 wkmetric [options] <reference.{wk,jpg,jpeg,png,ppm}> <candidate.{wk,jpg,jpeg,png,ppm}>
 ```
 
-Main options:
-
-- `--json`
-- `--rgb-only`
-
-Behavior:
-
-- accepts normal images or `.wk` files on either side
-- decodes `.wk` internally before comparing
-- prints file size, `MAE`, `MSE`, `PSNR`, `SSIM`, RGB per-channel metrics, Y/Cb/Cr metrics, and weighted chroma artifact metrics
+Main options: `--json`, `--rgb-only`. Accepts normal images or `.wk` files
+on either side, decodes `.wk` internally, and prints file size, MAE, MSE,
+PSNR, SSIM, RGB per-channel metrics, Y/Cb/Cr metrics, and weighted chroma
+artifact metrics.
 
 ### `wkmeta-dump`
 
@@ -340,132 +344,205 @@ Prints `WKMETA` as JSON.
 
 ### `wkmeta-edit`
 
-Usage:
-
 ```text
 wkmeta-edit [options] <input.wk>
 ```
 
-Main options:
-
-- `--set NS.TAG VALUE`
-- `--delete NS.TAG`
-- `--import-exif FILE`
-- `--export-json`
-- `-o, --output FILE`
+Main options: `--set NS.TAG VALUE`, `--delete NS.TAG`, `--import-exif FILE`,
+`--export-json`, `-o, --output FILE`.
 
 ### `wkview`
 
-Usage:
-
 ```text
-wkview <file.wk> [source.{jpg,jpeg,png,ppm}]
+wkview [options] <file.wk|directory> [source.{jpg,jpeg,png,ppm}|source_directory]
 ```
 
-Behavior:
+With only a `.wk` file it shows the decoded image and `WK` format and file
+details; with a second image path it shows a side-by-side compare (decoded
+`WK` on the left, source on the right). Mode is auto by default: a window
+when a display exists, otherwise the terminal. `--cli` forces the terminal
+renderer (truecolor half-blocks, `--diff` heatmap, `--no-color` for a
+grayscale ramp); `--window` forces a window. It suggests nearby filenames if
+a `.wk` path is mistyped, and browses directories with a file list
+(Left/Right or A/D to move between files).
 
-- with only `.wk`, it shows the decoded image and `WK` format/file details
-- with a second image path, it shows side-by-side compare
-- the left panel is the decoded `WK`
-- the right panel is the source image
-- it displays file size and format details directly inside the window
-- it suggests nearby filenames if the requested `.wk` path is mistyped
+## Demo
+
+Below is a real `wkview` compare screenshot stored in this repo at
+`extra/ember-7f3a_q85_demo.png`. It shows a decoded benchmark output against
+the original JPEG source.
+
+![WK Viewer compare demo](extra/ember-7f3a_q85_demo.png)
+
+The viewer shows the decoded `WK` panel and the original source panel side
+by side, with the filename on each side, file size for both sides, image
+dimensions and bit depth, alpha status, `lossless` vs `lossy`, `WKMETA`,
+`HDR`, tile size, frame count, and `CICP` information for the `.wk` side.
 
 ## Public API
 
 ### C++ API
 
-Headers:
+Headers: `include/wk/wk.hpp`, `include/wk/wkmeta.hpp`.
 
-- `include/wk/wk.hpp`
-- `include/wk/wkmeta.hpp`
-
-Main entry points:
-
-- `wk::encode(...)`
-- `wk::decode(...)`
-- `wk::get_info(...)`
+Main entry points: `wk::encode(...)`, `wk::encode_with_stats(...)`,
+`wk::decode(...)`, `wk::get_info(...)`, `wk::version()` (currently
+`"0.2.8"`). `EncoderConfig` carries quality, lossless, subsampling, tile
+size, `use_control_field`, `use_cclm`, and the adaptive-chroma thresholds.
 
 ### C API
 
-Header:
+Header: `include/wk/wk.h`.
 
-- `include/wk/wk.h`
-
-Main entry points:
-
-- `wk_encode(...)`
-- `wk_decode(...)`
-- `wk_get_info(...)`
-- `wk_free(...)`
-- `wk_version(...)`
+Main entry points: `wk_encode(...)`, `wk_decode(...)`, `wk_get_info(...)`,
+`wk_free(...)`, `wk_version(...)`, `wk_encoder_config_init(...)`.
 
 ## Tests
 
-Current test targets include:
+30 test binaries, run with `ctest --test-dir build --output-on-failure`:
 
-- `rans_test`
-- `dct_test`
-- `roundtrip_test`
-- `container_test`
-- `predict_test`
-- `wkmeta_test`
-- `geo_roundtrip_test`
-- `metrics_test`
+- core: `rans_test`, `dct_test`, `predict_test`, `quantize_test`,
+  `container_test`, `roundtrip_test`, `geo_roundtrip_test`
+- coefficient streams: `mode_stream_test`, `mode_span_rans_test`,
+  `coeff_span_stream_test`, `coeff_table_stream_test`,
+  `coeff_table_bank_stream_test`, `coeff_sign_stream_test`,
+  `coeff_presence_stream_test`, `lossy_coeff_stream_test`
+- features: `cclm_test`, `adaptive_chroma_test`, `control_field_test`,
+  `skin_protection_test`, `superblock_quant_test`, `tile_util_test`,
+  `threading_test`
+- metadata and I/O: `wkmeta_test`, `wkmeta_strict_test`, `exif_gps_test`,
+  `image_io_test`, `metrics_test`, `tool_log_test`
+- API: `c_api_test`, `wk_hpp_test`
 
-The currently validated path includes:
+The validated path includes lossless and lossy round-trips, lossy alpha
+round-trips, malformed entropy-stream and container rejection, metadata
+round-trips, metric correctness checks, and JPEG integration on the bundled
+sample photos.
 
-- lossless round-trip
-- lossy round-trip
-- lossy alpha round-trip
-- malformed entropy stream rejection
-- malformed container rejection
-- metadata round-trip
-- metric correctness checks
-- JPEG integration on Windows using the bundled sample photos
+## Benchmark
 
-Run everything with:
+The reproducible benchmark is `benchmark/rd_bench.py` (image set: the six
+photos under `photos/people/` and `photos/scenery/`):
 
-```powershell
-ctest --test-dir build --output-on-failure
+```bash
+python3 benchmark/rd_bench.py --bin-dir build-linux --qualities 10,25,50,75,85,90,95,100 --out benchmark/results/rd_baseline
 ```
+
+The current snapshot below was measured with the encoder in this tree at
+q75, default settings, against the six-photo corpus
+(`benchmark/results/rd_baseline.md` holds the full q-curve).
+
+| Photo | Dimensions | `.wk` bytes (q75) | PSNR (dB) | SSIM |
+| --- | ---: | ---: | ---: | ---: |
+| ember-7f3a | 225×225 | 18,432 | 40.166 | 0.9906 |
+| mira-5b8d | 217×233 | 9,207 | 44.823 | 0.9915 |
+| solis-2c9e | 663×372 | 31,853 | 41.413 | 0.9777 |
+| horizon-4e2a | 1200×673 | 262,088 | 36.922 | 0.9255 |
+| meadow-6d3b | 935×360 | 157,875 | 40.450 | 0.9849 |
+| noctis-8c1f | 3000×1951 | 577,320 | 41.966 | 0.9769 |
+| **Total / average** | | **1,056,775** | **40.96** | **0.9745** |
+
+RD curve (average over the same six photos, from
+`benchmark/results/rd_baseline.md`):
+
+| Quality | Avg PSNR (dB) | Avg SSIM | Avg bpp | Total bytes |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 28.29 | 0.8090 | 0.4090 | 170,938 |
+| 25 | 31.09 | 0.8834 | 0.7943 | 328,939 |
+| 50 | 34.77 | 0.9354 | 1.2303 | 553,274 |
+| 75 | 40.96 | 0.9745 | 2.0900 | 1,056,775 |
+| 85 | 44.34 | 0.9870 | 3.3325 | 1,809,660 |
+| 90 | 46.93 | 0.9929 | 4.7355 | 2,525,442 |
+| 95 | 49.28 | 0.9967 | 6.0849 | 3,281,049 |
+| 100 | 50.13 | 0.9974 | 6.9318 | 3,888,277 |
+
+Corpus note: the files are a mixed-extension corpus, not pure JPEG —
+`solis-2c9e.jpg` is actually a WebP file and `horizon-4e2a.jpg` is actually a
+PNG. A PowerShell corpus runner also exists at
+`utils/benchmark_corpus.ps1`, and a smoke script at `utils/test_codec.sh`.
+
+## Web
+
+`web/` is a WebAssembly build ("WK Web Codec Studio"): the encoder and
+decoder run entirely in the browser with no server-side processing. It
+decodes `.wk` files to an HTML canvas, encodes PNG/JPEG images into `.wk`,
+and shows file metadata and a luma histogram. Build it with Emscripten (see
+`web/README.md`); a local HTTP server is required because WASM files need
+proper MIME types.
+
+## Platform Notes
+
+Linux is the primary platform: the full workflow — including JPEG, PNG, BMP,
+TGA, and GIF input via `stb_image`/`stb_image_write` v2.32, and the `wkview`
+window — is developed and tested on Linux. Image dimensions are capped at
+65,535 per side and 2^28 pixels total.
+
+Windows still builds (CMake + a C++23 compiler; MinGW was used historically),
+but it is not the validation target: the Linux+Windows same-SHA merge gate is
+suspended, and Windows-specific issues are not chased while the format is
+still stabilizing. The old WIC image-I/O layer has been removed; image I/O is
+the same `stb`-based code on all platforms.
 
 ## Repository Layout
 
 ```text
-include/    public headers
+include/    public headers (wk.hpp, wk.h, wkmeta.hpp)
 src/        codec, container, metadata, image I/O, metrics
-tools/      CLI tools and viewer
-tests/      unit and integration tests
+tools/      CLI tools and viewer (wkenc, wkdec, wkmetric, wkmeta-dump, wkmeta-edit, wkview)
+tests/      unit and integration tests (30 test binaries)
 photos/     sample corpus split into people/ and scenery/
-benchmark/  generated benchmark outputs and summaries
-extra/      screenshots and demo assets
+benchmark/  RD harness (rd_bench.py), baselines, and generated outputs
+extra/      screenshots, demo assets, and the WK logo
 utils/      helper scripts for benchmarking and smoke runs
+web/        WebAssembly build (WK Web Codec Studio)
+ideas/      roadmap and design notes
+graphify-out/ generated dependency graph (snapshot)
 ```
 
 ## Known Limitations
 
 - native `.webp` input/output is not implemented
-- animation structures exist in the format, but animation workflow is not complete yet
-- JPEG/PNG convenience I/O is Windows-first in this repo
+- animation structures exist in the format, but the animation workflow is
+  not complete yet
 - PNG writing is 8-bit only
-- viewer HDR preview is a deterministic 8-bit preview, not full color-managed HDR display
-- compression still needs substantial tuning to become truly competitive on file size
+- viewer HDR preview is a deterministic 8-bit preview, not full color-managed
+  HDR display
+- the control field's content-type classes are heuristic (color and texture
+  rules, not a learned model): pale skin is detected weakly and warm rock,
+  cream fabric, and lake reflections can be classified as skin
+- compression still needs substantial tuning to become truly competitive on
+  file size
 
-## Suggested Next Steps
+## Roadmap
 
-The current roadmap in practice is:
+The direction is the phased plan in `ideas/NEXT_GEN_CODEC_ROADMAP.md`:
 
-1. keep maturing rate-distortion tuning for lossy still images
-2. move into entropy improvements after the current RD work is stable
-3. strengthen the lossless path after that
-4. continue viewer inspection tooling once the codec core is further stabilized
-5. only then expand deeper into parity features such as animation and broader interchange support
+1. Syntax efficiency (done — V1–V11 layouts, rANS streams)
+2. Content-aware perceptual control field (in progress — classifier live,
+   Skin protection built; multi-scale waits until the field is proven)
+3. Adaptive quantization and local modeling (partial — per-block V7 scales,
+   adaptive chroma)
+4. Multi-scale representation
+5. Variable transform and partition system
+6. Perceptual post-processing
+7. Non-photo tools
+8. Modern imaging (HDR/WCG, alpha, metadata)
+9. Animation and layering
+10. ROI and parallelism
+11. Lossless architecture
+12. SIMD optimization, last — it improves speed, not compression ratio
+
+The goal is a next-generation codec: strong lossy and lossless, SDR/HDR/WCG,
+alpha, modern metadata, mixed content, and progressive streaming — with the
+perceptual control field as its differentiator.
 
 ## Reference Docs
 
-For deeper reference, see:
-
-- `SPEC.md` for the bitstream/container format
-- `META_GUIDE.md` for metadata usage
-- `BENCHMARK.md` for benchmark and testing notes
+- `SPEC.md` — bitstream and container format (v0.2.8)
+- `META_GUIDE.md` — metadata usage
+- `BENCHMARK.md` — benchmark and testing notes
+- `web/README.md` — WebAssembly build
+- `ideas/NEXT_GEN_CODEC_ROADMAP.md` — phased roadmap
+- `ideas/PERCEPTUAL_CONTROL_FIELD.md` — control-field design
+- `graphify-out/GRAPH_REPORT.md` — generated dependency graph (snapshot)
+- `tools/skin_protection_research_2026-11-16.md` — Skin protection measurement

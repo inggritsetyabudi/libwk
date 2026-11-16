@@ -153,7 +153,7 @@ void print_usage() {
         << "  -h, --help              Show this help\n\n"
         << "Defaults:\n"
         << "  Lossy encode uses 1024px tiles unless --tile-size is set\n"
-        << "  Lossless encode keeps the legacy 512px tile header unless overridden\n";
+        << "  Lossless encode uses 256px tiles unless --tile-size is set\n";
 }
 
 }

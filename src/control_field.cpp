@@ -30,10 +30,31 @@ constexpr float kTexturedVarianceMin = 400.0f;  // std > 20
 constexpr float kEdgeGradientMin = 48.0f;
 constexpr float kEdgeMeanGradientMax = 12.0f;  // concentrated step, not texture
 
+// Content-type thresholds on full-range BT.709 YCbCr (0..255).
+// Calibrated from colour-cluster probes on the benchmark photos; the
+// skin box follows Chai & Ngan (1999) Cb 77..127 / Cr 133..173
+// (studio-swing BT.601), re-centred to full-range BT.709.
+constexpr double kSkinCbLo = 95, kSkinCbHi = 130;
+constexpr double kSkinCrLo = 131, kSkinCrHi = 175;
+constexpr double kSkinHueLo = -75, kSkinHueHi = -15;  // atan2(Cb-128, Cr-128)
+constexpr double kSkinYLo = 50, kSkinYHi = 220;
+constexpr double kSkinChromaStdMin = 2.0;  // uniformity gate: the only
+// thing separating skin from a perfectly uniform beige wall (std ~1).
+constexpr double kSkyCbMin = 138, kSkyCrMax = 128;
+constexpr double kSkyYMin = 140, kSkyVarMax = 100;
+constexpr double kFoliageCbMax = 110;
+constexpr double kFoliageHueLo = -140, kFoliageHueHi = -65;
+constexpr double kFoliageSatMin = 20, kFoliageVarMin = 25;
+constexpr double kFlatGraphicsVarMax = 25, kFlatGraphicsSatMin = 35,
+                 kFlatGraphicsChromaStdMax = 10;
+constexpr double kTextChromaStdMax = 8, kTextVarMin = 100;
+
 }  // namespace
 
 std::vector<BlockControl> analyze_control_field(
-    const int16_t* tile_luma, uint32_t tw, uint32_t th) {
+    const int16_t* tile_luma, uint32_t tw, uint32_t th,
+    const int16_t* tile_cb, const int16_t* tile_cr) {
+    const bool use_color = tile_cb != nullptr && tile_cr != nullptr;
     const uint32_t blocks_per_row = (tw + 7) / 8;
     const uint32_t blocks_per_col = (th + 7) / 8;
     std::vector<BlockControl> field;
@@ -112,6 +133,111 @@ std::vector<BlockControl> analyze_control_field(
             } else {
                 bc.content = BlockContent::Normal;
                 bc.quant_scale_index = kScaleIdentity;
+            }
+
+            if (use_color) {
+                // Colour features over the 8x8 block, coordinates
+                // clamped to the tile bounds (same edge policy as the
+                // research diagnostic: a tile that is the whole image
+                // reproduces its classification exactly). This is a
+                // second pass over the block's pixels, deliberately
+                // separate from the luma pass above so the v1
+                // arithmetic — and its results — stay untouched.
+                double sum_y = 0.0, sum_yy = 0.0;
+                double sum_cb = 0.0, sum_cb2 = 0.0;
+                double sum_cr = 0.0, sum_cr2 = 0.0;
+                double sum_sat = 0.0;
+                double grad_sum = 0.0;
+                size_t grad_count = 0;
+                double max_grad = 0.0;
+                auto at = [&](const int16_t* plane, int x, int y) -> double {
+                    x = std::clamp(x, 0, static_cast<int>(tw) - 1);
+                    y = std::clamp(y, 0, static_cast<int>(th) - 1);
+                    return plane[static_cast<size_t>(y) * tw + x];
+                };
+                for (uint32_t r = 0; r < 8; ++r) {
+                    for (uint32_t c = 0; c < 8; ++c) {
+                        const int x = static_cast<int>(x0 + c);
+                        const int yy = static_cast<int>(y0 + r);
+                        const double yv = at(tile_luma, x, yy);
+                        const double cbv = at(tile_cb, x, yy);
+                        const double crv = at(tile_cr, x, yy);
+                        sum_y += yv;
+                        sum_yy += yv * yv;
+                        sum_cb += cbv;
+                        sum_cb2 += cbv * cbv;
+                        sum_cr += crv;
+                        sum_cr2 += crv * crv;
+                        sum_sat += std::sqrt((cbv - 128.0) * (cbv - 128.0) +
+                                             (crv - 128.0) * (crv - 128.0));
+                        if (c < 7) {
+                            const double d = std::abs(at(tile_luma, x + 1, yy) - yv);
+                            grad_sum += d;
+                            ++grad_count;
+                            max_grad = std::max(max_grad, d);
+                        }
+                        if (r < 7) {
+                            const double d = std::abs(at(tile_luma, x, yy + 1) - yv);
+                            grad_sum += d;
+                            ++grad_count;
+                            max_grad = std::max(max_grad, d);
+                        }
+                    }
+                }
+                const double n = 64.0;
+                const double y_mean = sum_y / n;
+                const double y_var =
+                    std::max(0.0, sum_yy / n - y_mean * y_mean);
+                const double mean_grad =
+                    grad_count == 0 ? 0.0 : grad_sum / static_cast<double>(grad_count);
+                const double cb_mean = sum_cb / n;
+                const double cr_mean = sum_cr / n;
+                const double cb_std = std::sqrt(
+                    std::max(0.0, sum_cb2 / n - cb_mean * cb_mean));
+                const double cr_std = std::sqrt(
+                    std::max(0.0, sum_cr2 / n - cr_mean * cr_mean));
+                const double sat_mean = sum_sat / n;
+                const double hue =
+                    std::atan2(cb_mean - 128.0, cr_mean - 128.0) * 180.0 / M_PI;
+                const bool skin_color =
+                    cr_mean >= kSkinCrLo && cr_mean <= kSkinCrHi &&
+                    cb_mean >= kSkinCbLo && cb_mean <= kSkinCbHi &&
+                    hue >= kSkinHueLo && hue <= kSkinHueHi &&
+                    y_mean >= kSkinYLo && y_mean <= kSkinYHi;
+                const bool skin_uniform_ok =
+                    cb_std > kSkinChromaStdMin || cr_std > kSkinChromaStdMin;
+
+                // Priority (first match wins): Skin, TextUI, Sky,
+                // Foliage, FlatGraphics, then the luma class above.
+                // Skin is checked first: text is black/white/red/blue
+                // and never passes the skin colour box, so it costs
+                // text nothing and recovers face blocks whose edges
+                // would otherwise read as TextUI.
+                if (skin_color && skin_uniform_ok) {
+                    bc.content = BlockContent::Skin;
+                } else if (max_grad > kEdgeGradientMin &&
+                           mean_grad < kEdgeMeanGradientMax &&
+                           cb_std < kTextChromaStdMax &&
+                           cr_std < kTextChromaStdMax &&
+                           y_var >= kTextVarMin) {
+                    bc.content = BlockContent::TextUI;
+                } else if (cb_mean >= kSkyCbMin && cr_mean <= kSkyCrMax &&
+                           y_mean >= kSkyYMin && y_var < kSkyVarMax) {
+                    bc.content = BlockContent::Sky;
+                } else if (cb_mean <= kFoliageCbMax &&
+                           hue >= kFoliageHueLo && hue <= kFoliageHueHi &&
+                           sat_mean >= kFoliageSatMin &&
+                           y_var >= kFoliageVarMin) {
+                    bc.content = BlockContent::Foliage;
+                } else if (y_var < kFlatGraphicsVarMax &&
+                           sat_mean >= kFlatGraphicsSatMin &&
+                           cb_std < kFlatGraphicsChromaStdMax &&
+                           cr_std < kFlatGraphicsChromaStdMax) {
+                    bc.content = BlockContent::FlatGraphics;
+                }
+                // Otherwise the luma class stands. quant_scale_index
+                // is deliberately left as the luma class set it: the
+                // content-type classes are informational only.
             }
             field.push_back(bc);
         }
