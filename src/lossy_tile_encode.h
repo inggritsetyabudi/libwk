@@ -48,6 +48,10 @@ Result<TileEncodeResult> encode_lossy_tile(
     bool use_control_field,
     bool use_cclm,
     bool adaptive_chroma_subsampling,
-    TileStats* stats = nullptr);
+    TileStats* stats = nullptr,
+    // Frame-indexed skin drop mask from skin_false_positive_mask
+    // (nullptr = no drops, the SKIN_A behaviour). Indexed by the
+    // block's position in the whole frame, not in this tile.
+    const uint8_t* skin_drop_mask = nullptr);
 
 }  // namespace wk

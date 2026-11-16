@@ -166,7 +166,9 @@ namespace wk
         // such as Skin) and applies the skin policy: quant scale 0.5
         // on Skin blocks only, luma-only, via the V7 scale stream
         // (measured: +1.92% file at equal SSIM for a visible gain on
-        // skin). The superblock quant policy stays disabled: since
+        // skin). The W+C3 false-positive rule drops Skin blocks in
+        // wide flat components or with high chroma gradient (+0.76%
+        // file at equal SSIM). The superblock quant policy stays disabled: since
         // 2026-11-14 every superblock is identity (the >=75%
         // textured -> 1.25 boost cost meadow -0.97 dB).
         // Default off.

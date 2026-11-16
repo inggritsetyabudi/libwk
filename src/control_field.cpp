@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <queue>
 
 namespace wk {
 namespace {
@@ -48,6 +49,14 @@ constexpr double kFoliageSatMin = 20, kFoliageVarMin = 25;
 constexpr double kFlatGraphicsVarMax = 25, kFlatGraphicsSatMin = 35,
                  kFlatGraphicsChromaStdMax = 10;
 constexpr double kTextChromaStdMax = 8, kTextVarMin = 100;
+
+// Skin false-positive rule (#skin-fp), measured 2026-11-16: a Skin
+// block is dropped from the skin treatment when its component is
+// wide and flat, or its chroma gradient is high (see
+// skin_false_positive_mask below).
+constexpr uint32_t kSkinFpMinCompWidth = 40;
+constexpr double kSkinFpMinAspect = 2.0;
+constexpr float kSkinFpMinChromaGrad = 3.0f;
 
 }  // namespace
 
@@ -150,6 +159,7 @@ std::vector<BlockControl> analyze_control_field(
                 double grad_sum = 0.0;
                 size_t grad_count = 0;
                 double max_grad = 0.0;
+                double cgrad_sum = 0.0;
                 auto at = [&](const int16_t* plane, int x, int y) -> double {
                     x = std::clamp(x, 0, static_cast<int>(tw) - 1);
                     y = std::clamp(y, 0, static_cast<int>(th) - 1);
@@ -175,12 +185,16 @@ std::vector<BlockControl> analyze_control_field(
                             grad_sum += d;
                             ++grad_count;
                             max_grad = std::max(max_grad, d);
+                            cgrad_sum += std::abs(at(tile_cb, x + 1, yy) - cbv) +
+                                         std::abs(at(tile_cr, x + 1, yy) - crv);
                         }
                         if (r < 7) {
                             const double d = std::abs(at(tile_luma, x, yy + 1) - yv);
                             grad_sum += d;
                             ++grad_count;
                             max_grad = std::max(max_grad, d);
+                            cgrad_sum += std::abs(at(tile_cb, x, yy + 1) - cbv) +
+                                         std::abs(at(tile_cr, x, yy + 1) - crv);
                         }
                     }
                 }
@@ -190,6 +204,12 @@ std::vector<BlockControl> analyze_control_field(
                     std::max(0.0, sum_yy / n - y_mean * y_mean);
                 const double mean_grad =
                     grad_count == 0 ? 0.0 : grad_sum / static_cast<double>(grad_count);
+                // Mean chroma gradient over the same adjacent pairs
+                // (diagnostic definition: mean of |dCb|+|dCr| / 2).
+                bc.chroma_grad = static_cast<float>(
+                    grad_count == 0
+                        ? 0.0
+                        : cgrad_sum / (2.0 * static_cast<double>(grad_count)));
                 const double cb_mean = sum_cb / n;
                 const double cr_mean = sum_cr / n;
                 const double cb_std = std::sqrt(
@@ -243,6 +263,75 @@ std::vector<BlockControl> analyze_control_field(
         }
     }
     return field;
+}
+
+std::vector<uint8_t> skin_false_positive_mask(
+    const std::vector<BlockControl>& field, uint32_t blocks_per_row,
+    uint32_t blocks_per_col) {
+    std::vector<uint8_t> mask(field.size(), 0);
+    if (field.empty() || blocks_per_row == 0 || blocks_per_col == 0 ||
+        field.size() != static_cast<size_t>(blocks_per_row) * blocks_per_col)
+        return mask;
+
+    // 8-connected components over the Skin mask (same connectivity as
+    // the research diagnostic). A component is described by its
+    // bounding box only: the rule cares about width and aspect.
+    struct CompBox {
+        uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    };
+    std::vector<int32_t> comp(field.size(), -1);
+    std::vector<CompBox> boxes;
+    const int dx8[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+    const int dy8[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
+    for (uint32_t y0 = 0; y0 < blocks_per_col; ++y0) {
+        for (uint32_t x0 = 0; x0 < blocks_per_row; ++x0) {
+            const size_t i0 = static_cast<size_t>(y0) * blocks_per_row + x0;
+            if (field[i0].content != BlockContent::Skin || comp[i0] >= 0)
+                continue;
+            CompBox box{x0, y0, x0, y0};
+            std::queue<size_t> q;
+            q.push(i0);
+            comp[i0] = static_cast<int32_t>(boxes.size());
+            while (!q.empty()) {
+                const size_t i = q.front();
+                q.pop();
+                const uint32_t cx = static_cast<uint32_t>(i % blocks_per_row);
+                const uint32_t cy = static_cast<uint32_t>(i / blocks_per_row);
+                box.x0 = std::min(box.x0, cx);
+                box.x1 = std::max(box.x1, cx);
+                box.y0 = std::min(box.y0, cy);
+                box.y1 = std::max(box.y1, cy);
+                for (int d = 0; d < 8; ++d) {
+                    const int nx = static_cast<int>(cx) + dx8[d];
+                    const int ny = static_cast<int>(cy) + dy8[d];
+                    if (nx < 0 || ny < 0 || nx >= static_cast<int>(blocks_per_row) ||
+                        ny >= static_cast<int>(blocks_per_col))
+                        continue;
+                    const size_t ni =
+                        static_cast<size_t>(ny) * blocks_per_row + nx;
+                    if (field[ni].content == BlockContent::Skin && comp[ni] < 0) {
+                        comp[ni] = static_cast<int32_t>(boxes.size());
+                        q.push(ni);
+                    }
+                }
+            }
+            boxes.push_back(box);
+        }
+    }
+
+    for (size_t i = 0; i < field.size(); ++i) {
+        if (field[i].content != BlockContent::Skin || comp[i] < 0) continue;
+        const CompBox& box = boxes[static_cast<size_t>(comp[i])];
+        const uint32_t w = box.x1 - box.x0 + 1;
+        const uint32_t h = box.y1 - box.y0 + 1;
+        const bool wide_flat =
+            w >= kSkinFpMinCompWidth &&
+            static_cast<double>(w) / static_cast<double>(h) >= kSkinFpMinAspect;
+        const bool rough_chroma =
+            field[i].chroma_grad >= kSkinFpMinChromaGrad;
+        mask[i] = (wide_flat || rough_chroma) ? 1 : 0;
+    }
+    return mask;
 }
 
 }  // namespace wk
