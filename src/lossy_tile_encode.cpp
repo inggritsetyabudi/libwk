@@ -388,7 +388,8 @@ Result<TileEncodeResult> encode_lossy_tile(
     bool use_control_field,
     bool use_cclm,
     bool adaptive_chroma_subsampling,
-    TileStats* stats) {
+    TileStats* stats,
+    const uint8_t* skin_drop_mask) {
 
     if (has_alpha && alpha_plane == nullptr) {
         return std::unexpected(Error{ErrorCode::InvalidParameter, "alpha plane missing"});
@@ -545,6 +546,11 @@ Result<TileEncodeResult> encode_lossy_tile(
 
     std::vector<int16_t> reconstructed_y(tw * th, 0);
 
+    // Frame block-grid width, for indexing the skin drop mask (the
+    // mask is frame-indexed; a tile's blocks start at
+    // tile_x * (tile_size / 8)).
+    const uint32_t frame_blocks_x = (image_width + 7) / 8;
+
     for (uint32_t by = 0; by < blocks_y; ++by) {
         for (uint32_t bx = 0; bx < blocks_x; ++bx) {
             int16_t original_block[64] = {};
@@ -596,9 +602,19 @@ Result<TileEncodeResult> encode_lossy_tile(
             // per-block wins when non-identity, else the block's
             // superblock scale. A Skin block gets quant scale 0.5
             // (index 0, luma-only); a block that is both skin and
-            // seed takes the finer skin scale.
+            // seed takes the finer skin scale. The W+C3 drop mask
+            // refines this: a Skin block the mask flags as a
+            // false positive (wide flat component, or high chroma
+            // gradient) keeps the identity scale instead.
+            const size_t global_bx =
+                static_cast<size_t>(tile_x) * (tile_size / 8) + bx;
+            const size_t global_by =
+                static_cast<size_t>(tile_y) * (tile_size / 8) + by;
+            const bool skin_dropped =
+                skin_drop_mask != nullptr &&
+                skin_drop_mask[global_by * frame_blocks_x + global_bx] != 0;
             const bool is_skin_block =
-                use_control_field &&
+                use_control_field && !skin_dropped &&
                 control_field[by * blocks_x + bx].content == BlockContent::Skin;
             const uint8_t per_block_scale_index =
                 is_skin_block ? 0

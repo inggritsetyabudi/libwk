@@ -120,12 +120,18 @@ TEST(SkinProtectionTest, SkinRegionImprovesWithFlagOn) {
     // more bytes.
     const uint32_t w = 32, h = 32;
     std::vector<int16_t> y(w * h, 128), cb(w * h, 128), cr(w * h, 128);
+    // Chroma is a smooth sine, not a checkerboard: real skin is
+    // chroma-smooth (cgrad ~0.5 < 3.0), so the block stays treated;
+    // a per-pixel checkerboard has cgrad 10 and is dropped by the
+    // false-positive rule. Cr std 2.9 still passes the uniformity gate.
     for (uint32_t r = 0; r < 8; ++r)
         for (uint32_t c = 0; c < 8; ++c) {
             const bool alt = ((r + c) % 2 == 0);
             y[r * w + c] = alt ? 140 : 160;
-            cb[r * w + c] = alt ? 110 : 120;
-            cr[r * w + c] = alt ? 140 : 150;
+            cb[r * w + c] = static_cast<int16_t>(
+                std::lround(112.0 + 4.0 * std::sin(2.0 * 3.141592653589793 * c / 16.0)));
+            cr[r * w + c] = static_cast<int16_t>(
+                std::lround(145.0 + 4.0 * std::cos(2.0 * 3.141592653589793 * r / 16.0)));
         }
     Image img(w, h, BitDepth::Bits8, false);
     ycbcr_to_rgb(img.pixels().data(), y.data(), cb.data(), cr.data(),

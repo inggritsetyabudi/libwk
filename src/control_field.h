@@ -45,6 +45,12 @@ struct BlockControl {
     BlockContent content = BlockContent::Normal;
     float activity = 0.0f;       // normalized texture/activity, 0..1
     float edge_strength = 0.0f;  // normalized edge strength, 0..1
+    // Mean chroma gradient over the block's adjacent pixel pairs
+    // (mean of |dCb|+|dCr| / 2, same pairs as the luma gradient).
+    // Only measured when chroma planes are supplied; 0 otherwise.
+    // Real skin is chroma-smooth (p50 0.91); rock/reflection is not
+    // (p50 2.50/1.70) — see the skin false-positive research.
+    float chroma_grad = 0.0f;
     // Quant scale index into QuantTable::kQuantScaleFactors (4 = identity).
     // Set by the field; the encoder may override it (e.g. seed boost).
     uint8_t quant_scale_index = 4;
@@ -66,5 +72,20 @@ struct BlockControl {
 std::vector<BlockControl> analyze_control_field(
     const int16_t* tile_luma, uint32_t tw, uint32_t th,
     const int16_t* tile_cb = nullptr, const int16_t* tile_cr = nullptr);
+
+// Skin false-positive mask (#skin-fp) over a whole-frame field:
+// one byte per block (raster order, blocks_per_row * blocks_per_col),
+// 1 = drop the skin treatment for that Skin block. A Skin block is
+// dropped when it belongs to a wide, flat Skin component (a lake
+// reflection or sunlit peak, not a face) or its chroma gradient is
+// high (rock, not skin). Non-Skin blocks are always 0. The rule is
+// measured, not guessed: (component width >= 40 AND aspect >= 2.0)
+// OR chroma_grad >= 3.0 cuts 46.6% of the SKIN_A file cost at ~zero
+// GT loss (2026-11-16). Components are 8-connected over the Skin
+// mask of the whole frame — a single tile cannot see them, so the
+// caller classifies the frame once and hands the mask to the tiles.
+std::vector<uint8_t> skin_false_positive_mask(
+    const std::vector<BlockControl>& field, uint32_t blocks_per_row,
+    uint32_t blocks_per_col);
 
 }  // namespace wk

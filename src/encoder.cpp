@@ -326,6 +326,21 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
         uint32_t num_tx = fhdr.tiles_x();
         uint32_t num_ty = fhdr.tiles_y();
 
+        // Skin false-positive pre-pass (#skin-fp): the W+C3 rule needs
+        // the Skin components of the whole frame, so the frame is
+        // classified once here and a per-block drop mask is handed to
+        // the tiles. The mask only refines which Skin blocks get the
+        // 0.5 scale; the per-tile field stays the authority for what
+        // counts as Skin. Runs only when the flag is on.
+        std::vector<uint8_t> skin_drop_mask;
+        if (config.use_control_field) {
+            const std::vector<BlockControl> frame_field = analyze_control_field(
+                y_plane.data(), width, height,
+                classify_cb_plane, classify_cr_plane);
+            skin_drop_mask = skin_false_positive_mask(
+                frame_field, (width + 7) / 8, (height + 7) / 8);
+        }
+
         ThreadPool pool(config.threads);
         std::vector<std::future<Result<TileEncodeResult>>> futures;
 
@@ -372,7 +387,8 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
                         config.use_control_field,
                         config.use_cclm,
                         use_adaptive_chroma,
-                        tile_stats_ptr);
+                        tile_stats_ptr,
+                        skin_drop_mask.empty() ? nullptr : skin_drop_mask.data());
                 });
                 futures.push_back(std::move(future));
             }
