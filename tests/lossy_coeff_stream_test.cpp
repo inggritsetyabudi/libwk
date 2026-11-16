@@ -247,6 +247,56 @@ TEST(LossyCoeffStreamTest, TableClusterSelectionShrinksBankedPlanePayload) {
     expect_blocks_equal(*decoded, blocks);
 }
 
+TEST(LossyCoeffStreamTest, PooledBandTableShrinksBankedPlanePayload) {
+    // Positions 32..63 share one log-frequency band, but each position
+    // uses a distinct symbol (besides the common 0/1): no other
+    // position's table can support it, so plain cluster reuse is
+    // rejected everywhere, while one pooled band table supports all
+    // of them and collapses 32 bank entries into one.
+    std::array<DctBlockI16, 32> blocks{};
+    for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+        for (int pos = 32; pos < 64; ++pos) {
+            int16_t value = 0;
+            if (block_index % 16 == 0) {
+                value = 1;
+            } else if (block_index % 16 == 1) {
+                value = static_cast<int16_t>(pos - 30);
+            }
+            blocks[block_index][static_cast<size_t>(pos)] = value;
+        }
+    }
+    const std::array<uint8_t, 32> spans = {
+        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64
+    };
+
+    const LossyCoeffStreamConfig base_config{
+        .use_plane_max_coeff_span = false,
+        .adaptive_coefficient_tables = true,
+        .split_magnitude_signs = false,
+        .use_table_bank = true,
+    };
+    const LossyCoeffStreamConfig cluster_config{
+        .use_plane_max_coeff_span = false,
+        .adaptive_coefficient_tables = true,
+        .split_magnitude_signs = false,
+        .use_table_bank = true,
+        .use_table_cluster_selection = true,
+    };
+
+    auto base_payload = encode_lossy_plane_payload(blocks, spans, 64, base_config);
+    ASSERT_TRUE(base_payload.has_value()) << base_payload.error().message;
+    auto cluster_payload = encode_lossy_plane_payload(blocks, spans, 64, cluster_config);
+    ASSERT_TRUE(cluster_payload.has_value()) << cluster_payload.error().message;
+
+    EXPECT_LT(cluster_payload->size(), base_payload->size());
+
+    ByteReader reader(*cluster_payload);
+    auto decoded = decode_lossy_plane_payload(reader, spans, 64, cluster_config);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    expect_blocks_equal(*decoded, blocks);
+}
+
 TEST(LossyCoeffStreamTest, SingleSymbolStreamElisionShrinksSplitMagnitudePayload) {
     const std::array<DctBlockI16, 5> blocks = {
         make_block({{0, 3}, {1, -2}}),
