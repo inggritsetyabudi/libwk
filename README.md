@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="extra/WK_logo_only.png" />
+    <!-- <source media="(prefers-color-scheme: dark)" srcset="extra/WK_logo_only.png" /> -->
     <img src="extra/WK_logo_transparent.png" alt="WK logo" width="256" />
   </picture>
 </p>
