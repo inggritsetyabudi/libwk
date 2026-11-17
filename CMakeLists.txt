@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.28)
-project(wk VERSION 0.2.8 LANGUAGES CXX)
+project(wk VERSION 0.2.8 LANGUAGES C CXX)
 
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -38,11 +40,16 @@ endif()
 
 # Layout: src/core/ is the portable codec, src/arch/<target>/
 # holds per-target code (generic fallback + wasm today; x86_64,
-# aarch64 and arm when they gain real content), src/stb/ is vendored
-# third-party. The split is explicit here: core is always compiled,
-# arch is selected by target, nothing relies on a recursive glob.
+# aarch64 and arm when they gain real content), src/stb/ and src/webp/
+# are vendored third-party (stb image I/O, libwebp decode-only). The
+# split is explicit here: core is always compiled, arch is selected by
+# target, nothing relies on a recursive glob.
 file(GLOB WK_CORE_SOURCES CONFIGURE_DEPENDS src/core/*.cpp)
 file(GLOB WK_STB_SOURCES CONFIGURE_DEPENDS src/stb/*.cpp)
+# libwebp 1.3.2 decode-only, vendored (see src/webp/README.md). The
+# vendored sources include each other as "src/...", so src/webp is an
+# include dir for the whole target (below).
+file(GLOB WK_WEBP_SOURCES CONFIGURE_DEPENDS src/webp/src/dec/*.c src/webp/src/dsp/*.c src/webp/src/utils/*.c)
 
 if(EMSCRIPTEN)
     set(WK_ARCH_DIR wasm)
@@ -63,9 +70,9 @@ if(NOT WK_ARCH_DIR STREQUAL "generic")
     list(APPEND WK_ARCH_SOURCES ${WK_ARCH_TARGET_SOURCES})
 endif()
 
-add_library(wk STATIC ${WK_CORE_SOURCES} ${WK_STB_SOURCES} ${WK_ARCH_SOURCES})
+add_library(wk STATIC ${WK_CORE_SOURCES} ${WK_STB_SOURCES} ${WK_WEBP_SOURCES} ${WK_ARCH_SOURCES})
 target_include_directories(wk PUBLIC include)
-target_include_directories(wk PRIVATE src)
+target_include_directories(wk PRIVATE src src/webp)
 
 add_executable(wkenc tools/wkenc.cpp)
 target_link_libraries(wkenc PRIVATE wk)

@@ -23,9 +23,73 @@ $exported_functions = @(
     '_free'
 ) -join ','
 
+# Vendored libwebp 1.3.2 decode-only C sources (see src/webp/README.md):
+# compiled with emcc (C), not em++ — em++ would compile them as C++ and
+# libwebp is C. Listed explicitly, keep in sync with src/webp/.
+# The objects are linked by em++ below, then removed.
+$webpSources = @(
+  '../src/webp/src/dec/alpha_dec.c',
+  '../src/webp/src/dec/buffer_dec.c',
+  '../src/webp/src/dec/frame_dec.c',
+  '../src/webp/src/dec/idec_dec.c',
+  '../src/webp/src/dec/io_dec.c',
+  '../src/webp/src/dec/quant_dec.c',
+  '../src/webp/src/dec/tree_dec.c',
+  '../src/webp/src/dec/vp8_dec.c',
+  '../src/webp/src/dec/vp8l_dec.c',
+  '../src/webp/src/dec/webp_dec.c',
+  '../src/webp/src/dsp/alpha_processing.c',
+  '../src/webp/src/dsp/alpha_processing_neon.c',
+  '../src/webp/src/dsp/alpha_processing_sse2.c',
+  '../src/webp/src/dsp/alpha_processing_sse41.c',
+  '../src/webp/src/dsp/cpu.c',
+  '../src/webp/src/dsp/dec.c',
+  '../src/webp/src/dsp/dec_clip_tables.c',
+  '../src/webp/src/dsp/dec_neon.c',
+  '../src/webp/src/dsp/dec_sse2.c',
+  '../src/webp/src/dsp/dec_sse41.c',
+  '../src/webp/src/dsp/filters.c',
+  '../src/webp/src/dsp/filters_neon.c',
+  '../src/webp/src/dsp/filters_sse2.c',
+  '../src/webp/src/dsp/lossless.c',
+  '../src/webp/src/dsp/lossless_neon.c',
+  '../src/webp/src/dsp/lossless_sse2.c',
+  '../src/webp/src/dsp/lossless_sse41.c',
+  '../src/webp/src/dsp/rescaler.c',
+  '../src/webp/src/dsp/rescaler_neon.c',
+  '../src/webp/src/dsp/rescaler_sse2.c',
+  '../src/webp/src/dsp/upsampling.c',
+  '../src/webp/src/dsp/upsampling_neon.c',
+  '../src/webp/src/dsp/upsampling_sse2.c',
+  '../src/webp/src/dsp/upsampling_sse41.c',
+  '../src/webp/src/dsp/yuv.c',
+  '../src/webp/src/dsp/yuv_neon.c',
+  '../src/webp/src/dsp/yuv_sse2.c',
+  '../src/webp/src/dsp/yuv_sse41.c',
+  '../src/webp/src/utils/bit_reader_utils.c',
+  '../src/webp/src/utils/color_cache_utils.c',
+  '../src/webp/src/utils/filters_utils.c',
+  '../src/webp/src/utils/huffman_utils.c',
+  '../src/webp/src/utils/quant_levels_dec_utils.c',
+  '../src/webp/src/utils/quant_levels_utils.c',
+  '../src/webp/src/utils/random_utils.c',
+  '../src/webp/src/utils/rescaler_utils.c',
+  '../src/webp/src/utils/thread_utils.c',
+  '../src/webp/src/utils/utils.c'
+)
+$webpObjDir = New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ("wk-webp-" + [guid]::NewGuid().ToString('N'))) -Force
+$webpObjs = @()
+foreach ($src in $webpSources) {
+  $obj = Join-Path $webpObjDir.FullName ((Split-Path (Split-Path $src -Parent) -Leaf) + '_' + (Split-Path $src -LeafBase) + '.o')
+  emcc -I../src/webp -O3 -c $src -o $obj
+  if ($LASTEXITCODE -ne 0) { throw "emcc failed for $src" }
+  $webpObjs += $obj
+}
+
 em++ `
   -I../include `
   -I../src `
+  -I../src/webp `
   ../src/core/adaptive_chroma.cpp `
   ../src/core/cclm.cpp `
   ../src/core/coeff_presence_stream.cpp `
@@ -54,7 +118,9 @@ em++ `
   ../src/core/superblock_quant.cpp `
   threading_stub.cpp `
   ../src/core/tile_util.cpp `
+  ../src/core/webp_decode.cpp `
   ../src/core/wkmeta.cpp `
+  $webpObjs `
   wk_wasm.cpp `
   -o wk.js `
   -s WASM=1 `
@@ -65,3 +131,5 @@ em++ `
   -std=c++2b `
   -s MODULARIZE=1 `
   -s EXPORT_NAME="WkModule"
+
+Remove-Item -Recurse -Force $webpObjDir
