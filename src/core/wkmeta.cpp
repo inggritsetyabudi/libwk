@@ -13,13 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <wk/wkmeta.hpp>
-#include "common.h"
 #include "exif_import.h"
-#include <algorithm>
 #include <cmath>
 #include <cstdlib>
-#include <cstring>
 #include <ctime>
 #include <map>
 #include <charconv>

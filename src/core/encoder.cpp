@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "common.h"
 #include "adaptive_chroma.h"
 #include "container.h"
 #include "control_field.h"
@@ -21,15 +20,8 @@
 #include "lossless.h"
 #include "lossy_tile_encode.h"
 #include "threading.h"
-#include <wk/wk.hpp>
 #include <wk/wk.h>
-#include <wk/wkmeta.hpp>
-#include <cstring>
 #include <cstdlib>
-#include <algorithm>
-#include <exception>
-#include <new>
-#include <optional>
 
 namespace wk {
 

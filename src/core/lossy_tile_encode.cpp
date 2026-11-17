@@ -13,21 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "common.h"
 #include "lossy_tile_encode.h"
 #include "coeff_span_stream.h"
 #include "cclm.h"
-#include "control_field.h"
 #include "superblock_quant.h"
-#include "dct.h"
-#include "lossy_coeff_stream.h"
 #include "mode_span_rans.h"
 #include "mode_stream.h"
-#include "quantize.h"
-#include "predict.h"
-#include <cstring>
-#include <cmath>
-#include <algorithm>
 
 namespace wk {
 

@@ -13,22 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <wk/wk.hpp>
-#include <wk/wkmeta.hpp>
-#include "../src/core/common.h"
 #include "../src/core/container.h"
 #include "../src/core/exif_import.h"
 #include "../src/core/image_io.h"
 #include "../src/core/metrics.h"
-#include <cmath>
-#include <cstdio>
 #include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <vector>
 #include "tool_common.h"
 #include "tool_log.h"
 

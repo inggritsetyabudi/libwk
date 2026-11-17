@@ -14,7 +14,6 @@
 // limitations under the License.
 #pragma once
 
-#include "common.h"
 #include <wk/wk.hpp>
 #include <cstdint>
 #include <span>

@@ -1,7 +1,6 @@
 // CCLM implementation. See cclm.h.
 #include "cclm.h"
 
-#include <algorithm>
 
 namespace wk {
 namespace {
