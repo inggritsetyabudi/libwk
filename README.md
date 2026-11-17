@@ -265,13 +265,13 @@ What is in a good working state right now:
 - PNG output for 8-bit decode
 - side-by-side compare viewer with file and format information
 - C and C++ public APIs, and a WebAssembly build under `web/`
-- 30 test binaries passing in the current tree (Release and ASan/UBSan)
+- 33 test binaries passing in the current tree (Release and ASan/UBSan)
 
 What is intentionally not claimed as finished yet:
 
 - full animation encode/decode, even though the spec and container already
   have animation structures
-- native `.webp` input/output support
+- native `.webp` output support
 - advanced HDR output writers and full ICC-aware color-managed display
 - compression efficiency that already competes with mature JPEG/WebP/AVIF
   encoders
@@ -300,7 +300,7 @@ measurement.
 ### `wkenc`
 
 ```text
-wkenc [options] <input.{jpg,jpeg,png,ppm}> [output.wk]
+wkenc [options] <input.{jpg,jpeg,png,ppm,webp}> [output.wk]
 ```
 
 Main options: `--quality N` (0–100, default 75), `--lossless`,
@@ -328,7 +328,7 @@ to 8-bit decoded images; higher bit depths should use `.ppm` for now.
 ### `wkmetric`
 
 ```text
-wkmetric [options] <reference.{wk,jpg,jpeg,png,ppm}> <candidate.{wk,jpg,jpeg,png,ppm}>
+wkmetric [options] <reference.{wk,jpg,jpeg,png,ppm,webp}> <candidate.{wk,jpg,jpeg,png,ppm,webp}>
 ```
 
 Main options: `--json`, `--rgb-only`. Accepts normal images or `.wk` files
@@ -352,7 +352,7 @@ Main options: `--set NS.TAG VALUE`, `--delete NS.TAG`, `--import-exif FILE`,
 ### `wkview`
 
 ```text
-wkview [options] <file.wk|directory> [source.{jpg,jpeg,png,ppm}|source_directory]
+wkview [options] <file.wk|directory> [source.{jpg,jpeg,png,ppm,webp}|source_directory]
 ```
 
 With only a `.wk` file it shows the decoded image and `WK` format and file
@@ -397,7 +397,7 @@ Main entry points: `wk_encode(...)`, `wk_decode(...)`, `wk_get_info(...)`,
 
 ## Tests
 
-30 test binaries, run with `ctest --test-dir build --output-on-failure`:
+33 test binaries, run with `ctest --test-dir build --output-on-failure`:
 
 - core: `rans_test`, `dct_test`, `predict_test`, `quantize_test`,
   `container_test`, `roundtrip_test`, `geo_roundtrip_test`
@@ -487,7 +487,7 @@ the same `stb`-based code on all platforms.
 include/    public headers (wk.hpp, wk.h, wkmeta.hpp)
 src/        core/ (portable codec), arch/ (per-target code), stb/ (vendored image I/O)
 tools/      CLI tools and viewer (wkenc, wkdec, wkmetric, wkmeta-dump, wkmeta-edit, wkview)
-tests/      unit and integration tests (32 test binaries)
+tests/      unit and integration tests (33 test binaries)
 photos/     sample corpus split into people/ and scenery/
 benchmark/  RD harness (rd_bench.py), baselines, and generated outputs
 extra/      screenshots, demo assets, and the WK logo
@@ -499,7 +499,7 @@ graphify-out/ generated dependency graph (snapshot)
 
 ## Known Limitations
 
-- native `.webp` input/output is not implemented
+- native `.webp` output is not implemented (input is supported)
 - animation structures exist in the format, but the animation workflow is
   not complete yet
 - PNG writing is 8-bit only

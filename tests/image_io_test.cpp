@@ -217,3 +217,134 @@ TEST(ImageIoTest, LoadRejectsUnsupportedExtension) {
     remove_temp(path);
     ASSERT_FALSE(loaded.has_value());
 }
+
+std::filesystem::path write_temp_bytes(const std::string& name,
+                                       const std::vector<uint8_t>& bytes) {
+    auto path = std::filesystem::temp_directory_path() / name;
+    std::ofstream file(path, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+    file.close();
+    return path;
+}
+
+std::vector<uint8_t> read_file_bytes(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    const auto size = file.tellg();
+    std::vector<uint8_t> bytes(static_cast<size_t>(size));
+    file.seekg(0, std::ios::beg);
+    file.read(reinterpret_cast<char*>(bytes.data()), size);
+    return bytes;
+}
+
+// Tiny 4x4 lossless WebP (PIL, lossless=True), embedded as bytes so the
+// test needs no binary fixture file (snapshot pushes are UTF-8 only).
+// Row-major pixels:
+//   (255,0,0) (0,255,0) (0,0,255) (255,255,0)
+//   (0,255,255) (255,0,255) (128,128,128) (0,0,0)
+//   (255,255,255) (10,20,30) (40,50,60) (70,80,90)
+//   (1,2,3) (4,5,6) (7,8,9) (250,240,230)
+const std::vector<uint8_t> kTinyLosslessWebp = {
+    0x52, 0x49, 0x46, 0x46, 0x60, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
+    0x56, 0x50, 0x38, 0x4c, 0x54, 0x00, 0x00, 0x00, 0x2f, 0x03, 0xc0, 0x00,
+    0x00, 0x7f, 0x60, 0xa6, 0x6d, 0x9b, 0x4c, 0x79, 0x87, 0xa1, 0x18, 0x06,
+    0x6d, 0xfc, 0x9f, 0xd2, 0x30, 0x90, 0xb6, 0x4d, 0xf8, 0x7c, 0x4c, 0xc8,
+    0xa5, 0xdd, 0xfc, 0xcd, 0xb4, 0x91, 0x72, 0x0f, 0x58, 0x60, 0xfd, 0x11,
+    0x69, 0xf8, 0x77, 0xf0, 0xf3, 0x1f, 0x20, 0xa2, 0x00, 0xe1, 0x31, 0x80,
+    0x28, 0x38, 0xc3, 0x34, 0xd3, 0x36, 0x2b, 0xb5, 0xd4, 0x6e, 0xcf, 0xdf,
+    0x03, 0x41, 0x00, 0xc4, 0x81, 0x1b, 0x01, 0x56, 0x54, 0x39, 0x31, 0xa3,
+    0x44, 0x49, 0x44, 0xff, 0x83, 0x32, 0xba, 0x1c};
+
+const std::vector<std::array<uint8_t, 3>> kTinyLosslessPixels = {
+    {255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 0},
+    {0, 255, 255}, {255, 0, 255}, {128, 128, 128}, {0, 0, 0},
+    {255, 255, 255}, {10, 20, 30}, {40, 50, 60}, {70, 80, 90},
+    {1, 2, 3}, {4, 5, 6}, {7, 8, 9}, {250, 240, 230}};
+
+TEST(ImageIoTest, LoadWebpLoadsSolisJpgExactly) {
+    // photos/people/solis-2c9e.jpg is secretly a WebP file (RIFF/WEBP
+    // magic, .jpg extension): wkenc used to fail it with "unknown image
+    // type". The pixels below are the exact reference decode (the PPM
+    // in libwk-exp-e decodes to these values; lossy WebP decode is
+    // deterministic, so exact equality is required, not a tolerance).
+    auto loaded = io::load_image_file((photos_root() / "people" / "solis-2c9e.jpg").string());
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 663u);
+    EXPECT_EQ(loaded->height(), 372u);
+    EXPECT_FALSE(loaded->has_alpha());
+    EXPECT_EQ(pixel_rgb(*loaded, 0, 0), (std::array<uint8_t, 3>{192, 179, 160}));
+    EXPECT_EQ(pixel_rgb(*loaded, 100, 100), (std::array<uint8_t, 3>{3, 3, 3}));
+    EXPECT_EQ(pixel_rgb(*loaded, 331, 186), (std::array<uint8_t, 3>{92, 29, 7}));
+    EXPECT_EQ(pixel_rgb(*loaded, 662, 371), (std::array<uint8_t, 3>{229, 222, 208}));
+    EXPECT_EQ(pixel_rgb(*loaded, 0, 371), (std::array<uint8_t, 3>{151, 133, 114}));
+    EXPECT_EQ(pixel_rgb(*loaded, 662, 0), (std::array<uint8_t, 3>{216, 204, 190}));
+    EXPECT_EQ(pixel_rgb(*loaded, 200, 50), (std::array<uint8_t, 3>{32, 22, 28}));
+}
+
+TEST(ImageIoTest, LoadWebpLoadsPureWebpFile) {
+    // Same decoder through a genuine .webp extension; lossless, so
+    // every pixel must match exactly.
+    auto path = write_temp_bytes("wk_tiny.webp", kTinyLosslessWebp);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 4u);
+    EXPECT_EQ(loaded->height(), 4u);
+    EXPECT_FALSE(loaded->has_alpha());
+    for (uint32_t y = 0; y < 4; ++y) {
+        for (uint32_t x = 0; x < 4; ++x) {
+            EXPECT_EQ(pixel_rgb(*loaded, x, y), kTinyLosslessPixels[y * 4 + x])
+                << "pixel (" << x << ", " << y << ")";
+        }
+    }
+}
+
+TEST(ImageIoTest, LoadWebpFallsBackForJpegNamedWebp) {
+    // The extension can lie the other way too: a JPEG named .webp has
+    // no WebP magic, so it falls through to stb (which sniffs content).
+    const auto jpg_bytes = read_file_bytes(photos_root() / "people" / "ember-7f3a.jpg");
+    auto path = write_temp_bytes("wk_jpeg_named_webp.webp", jpg_bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 225u);
+    EXPECT_EQ(loaded->height(), 225u);
+    const auto pixel = pixel_rgb(*loaded, 0, 0);
+    EXPECT_LE(std::abs(static_cast<int>(pixel[0]) - 42), 3);
+    EXPECT_LE(std::abs(static_cast<int>(pixel[1]) - 51), 3);
+    EXPECT_LE(std::abs(static_cast<int>(pixel[2]) - 84), 3);
+}
+
+TEST(ImageIoTest, LoadWebpRejectsTruncated) {
+    const auto solis_bytes = read_file_bytes(photos_root() / "people" / "solis-2c9e.jpg");
+    const std::vector<uint8_t> truncated(solis_bytes.begin(), solis_bytes.begin() + 100);
+    auto path = write_temp_bytes("wk_truncated.webp", truncated);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+}
+
+TEST(ImageIoTest, LoadWebpRejectsGarbageWithWebpMagic) {
+    // Valid RIFF/WEBP magic, garbage payload: the decoder must reject
+    // it cleanly, not crash.
+    std::vector<uint8_t> garbage = {0x52, 0x49, 0x46, 0x46, 0x40, 0x00, 0x00, 0x00,
+                                    0x57, 0x45, 0x42, 0x50};
+    for (int i = 0; i < 64; ++i) {
+        garbage.push_back(static_cast<uint8_t>(i * 37 + 11));
+    }
+    auto path = write_temp_bytes("wk_garbage_magic.webp", garbage);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+}
+
+TEST(ImageIoTest, LoadWebpRejectsRandomBytesAsWebp) {
+    std::vector<uint8_t> bytes;
+    for (int i = 0; i < 64; ++i) {
+        bytes.push_back(static_cast<uint8_t>(i * 53 + 7));
+    }
+    auto path = write_temp_bytes("wk_random.webp", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+}

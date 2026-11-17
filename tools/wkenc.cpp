@@ -157,7 +157,7 @@ wk::Result<std::vector<uint8_t>> apply_exif_metadata(std::span<const uint8_t> en
 
 void print_usage() {
     std::cerr
-        << "Usage: wkenc [options] <input.{jpg,jpeg,png,ppm}> [output.wk]\n\n"
+        << "Usage: wkenc [options] <input.{jpg,jpeg,png,ppm,webp}> [output.wk]\n\n"
         << "Options:\n"
         << "  --quality N             Lossy quality 0..100 (default: 75)\n"
         << "  --lossless              Encode losslessly\n"
