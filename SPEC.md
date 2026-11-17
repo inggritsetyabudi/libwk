@@ -449,7 +449,23 @@ Chroma subsampling: YUV420 stores chroma at half resolution in each dimension (a
 
 ### 9.3 HDR Pipeline
 
-All HDR data stored as uint16_t. PQ/HLG EOTF applied to linearize before color transform; OETF applied after reconstruction.
+All HDR data stored as uint16_t. The codec works in the
+nonlinear (PQ/HLG code-value) domain: YCbCr is computed from the
+PQ/HLG-encoded code values directly, and the transfer function is
+only signalled (CICP), never applied inside the codec — the EOTF /
+OETF live at the display, not in the bitstream. This is what every
+production HDR codec does (HEVC, VVC, AV1, AVIF, JPEG XL).
+
+A linearise-first pipeline was measured and rejected (slice 0,
+2026-11-17): quantising linear light uniformly at 10 bits alone
+already costs PSNR 21–28 dB (max error up to 251 codes) before the
+codec runs, and the full pipeline scores PSNR 14–19 dB vs 35–63 dB
+for the nonlinear pipeline, with worse banding. The EOTF / OETF
+functions (§9.2) stay in the codebase for the tone-mapping preview
+and conversion tools, not for the codec core.
+
+No bitstream change: the transfer is only signalled either way, so
+files written before and after this amendment decode identically.
 
 ---
 

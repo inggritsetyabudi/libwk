@@ -93,6 +93,16 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
         return std::unexpected(Error{ErrorCode::InvalidParameter, "zero dimensions"});
     }
 
+    // The config bit depth is the claim about the pixel data's sample
+    // size (rgb_to_ycbcr reads uint16 samples above 8-bit): a
+    // mismatch would read the buffer at the wrong stride, past its
+    // end. The C API validates this too; the C++ entry point must
+    // not trust the caller either.
+    if (config.bit_depth != image.bit_depth()) {
+        return std::unexpected(Error{ErrorCode::InvalidParameter,
+            "config bit depth does not match image bit depth"});
+    }
+
     // The decoder rejects CICP values the converter does not implement
     // (see parse_fhdr), so the encoder must not produce them either.
     if (config.cicp.matrix != 1 && config.cicp.matrix != 5 && config.cicp.matrix != 6 && config.cicp.matrix != 9) {
@@ -326,9 +336,9 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
         if (config.use_control_field) {
             const std::vector<BlockControl> frame_field = analyze_control_field(
                 y_plane.data(), width, height,
-                classify_cb_plane, classify_cr_plane);
+                classify_cb_plane, classify_cr_plane, fhdr.bit_depth);
             skin_drop_mask = skin_false_positive_mask(
-                frame_field, (width + 7) / 8, (height + 7) / 8);
+                frame_field, (width + 7) / 8, (height + 7) / 8, fhdr.bit_depth);
         }
 
         ThreadPool pool(config.threads);
@@ -348,7 +358,16 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
                     if (use_adaptive_chroma) {
                         // Per-tile decision from the source chroma
                         // (cb_plane is full-resolution here, since the
-                        // image is not image-wide 420).
+                        // image is not image-wide 420). The thresholds
+                        // are calibrated in 8-bit code values, but the
+                        // Laplacian stats grow with the code-value
+                        // range, so the thresholds scale with it (x4
+                        // at 10-bit, x16 at 12-bit) — measured slice
+                        // 0: unscaled thresholds waste 171,943 B
+                        // (10.9%) on the corpus by keeping 444 where
+                        // the oracle says 420.
+                        const double thr_scale = static_cast<double>(
+                            1 << std::max(0, static_cast<int>(fhdr.bit_depth) - 8));
                         const uint32_t x0 = tx * tile_size;
                         const uint32_t y0 = ty * tile_size;
                         const uint32_t tw = std::min(tile_size, width - x0);
@@ -356,9 +375,9 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
                         tile_subsampling = should_subsample_chroma_420(
                             cb_plane.data(), cr_plane.data(), width, height,
                             x0, y0, tw, th,
-                            static_cast<double>(config.adaptive_chroma_laplacian_threshold),
-                            static_cast<double>(config.adaptive_chroma_lap_p999_threshold),
-                            static_cast<double>(config.adaptive_chroma_lap_sat_p999_threshold),
+                            static_cast<double>(config.adaptive_chroma_laplacian_threshold) * thr_scale,
+                            static_cast<double>(config.adaptive_chroma_lap_p999_threshold) * thr_scale,
+                            static_cast<double>(config.adaptive_chroma_lap_sat_p999_threshold) * thr_scale,
                             fhdr.bit_depth)
                             ? ChromaSubsampling::YUV420 : ChromaSubsampling::YUV444;
                         if (tile_subsampling == ChromaSubsampling::YUV420) {

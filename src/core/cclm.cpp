@@ -17,7 +17,8 @@ CclmParams derive_cclm_params(const int16_t* luma_above,
                               const int16_t* chroma_left,
                               int16_t above_left_luma,
                               int16_t above_left_chroma,
-                              bool has_above, bool has_left) {
+                              bool has_above, bool has_left,
+                              int16_t max_val) {
     // Collect neighbour pairs. The corner (above-left) is included
     // once, as part of the above row's first sample's neighbour set is
     // not needed -- use the 8 above + 8 left + corner = 17 pairs max.
@@ -43,9 +44,12 @@ CclmParams derive_cclm_params(const int16_t* luma_above,
     CclmParams params;
     if (n == 0) {
         // No neighbours at all (top-left corner block): slope 0 and
-        // offset = mid chroma (128 in Q8), i.e. predict flat mid-grey.
+        // offset = mid chroma, i.e. predict flat mid-grey. The mid
+        // scales with bit depth ((max_val + 1) / 2: 128 at 8-bit,
+        // 512 at 10-bit); the old hardcoded 128 was 4x too dark at
+        // 10-bit (slice 0 B3).
         params.a = 0;
-        params.b = 128 * 256;
+        params.b = ((max_val + 1) / 2) * 256;
         return params;
     }
     // Least squares: a = cov/var, b = mean_c - a*mean_l.
@@ -189,7 +193,7 @@ void predict_chroma_block_cclm(const int16_t* luma_plane, uint32_t tw,
     const CclmParams params = derive_cclm_params(
         has_above ? luma_above : nullptr, has_above ? chroma_above : nullptr,
         has_left ? luma_left : nullptr, has_left ? chroma_left : nullptr,
-        above_left_luma, above_left_chroma, has_above, has_left);
+        above_left_luma, above_left_chroma, has_above, has_left, max_val);
     predict_cclm(luma_8, params, pred, max_val);
 }
 

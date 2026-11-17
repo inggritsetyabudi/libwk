@@ -41,14 +41,17 @@ struct CclmParams {
 // (plus the corner, which is shared). A null pointer means that side
 // has no neighbour; at least one side must be present. When the
 // neighbour luma variance is ~0 the slope is 0 and b is the neighbour
-// chroma mean (in Q8).
+// chroma mean (in Q8). With no neighbours at all the model is flat
+// mid-grey: b = mid * 256, where mid is the bit-depth mid
+// ((max_val + 1) / 2: 128 at 8-bit, 512 at 10-bit).
 CclmParams derive_cclm_params(const int16_t* luma_above,
                               const int16_t* chroma_above,
                               const int16_t* luma_left,
                               const int16_t* chroma_left,
                               int16_t above_left_luma,
                               int16_t above_left_chroma,
-                              bool has_above, bool has_left);
+                              bool has_above, bool has_left,
+                              int16_t max_val = 255);
 
 // Applies the model to a co-located reconstructed luma 8x8 block:
 // pred[i] = clamp((a * luma_recon[i] + b) >> 8, 0, max_val).

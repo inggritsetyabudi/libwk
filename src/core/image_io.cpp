@@ -141,8 +141,26 @@ Result<Image> load_ppm(std::string_view path) {
     if (*width == 0 || *height == 0) {
         return std::unexpected(Error{ErrorCode::InvalidHeader, "PPM dimensions must be non-zero"});
     }
-    if (*max_value != 255) {
-        return std::unexpected(Error{ErrorCode::UnsupportedFeature, "PPM max value must be 255"});
+    // Same caps as the container and the stb path (65535 per side,
+    // 2^28 pixels): without them a huge width/height overflows the
+    // payload-size arithmetic below.
+    if (*width > 65535 || *height > 65535 ||
+        static_cast<uint64_t>(*width) * static_cast<uint64_t>(*height) > (1u << 28)) {
+        return std::unexpected(Error{ErrorCode::InvalidHeader, "PPM dimensions out of range"});
+    }
+    // 16-bit PPM (maxval 1023/4095) is the HDR input path: the
+    // raster is big-endian uint16 per the PPM spec, stored
+    // native-endian in the Image like every other 16-bit source.
+    BitDepth bit_depth;
+    if (*max_value == 255) {
+        bit_depth = BitDepth::Bits8;
+    } else if (*max_value == 1023) {
+        bit_depth = BitDepth::Bits10;
+    } else if (*max_value == 4095) {
+        bit_depth = BitDepth::Bits12;
+    } else {
+        return std::unexpected(Error{ErrorCode::UnsupportedFeature,
+                                     "PPM max value must be 255, 1023 or 4095"});
     }
 
     // The raster follows a single whitespace delimiter after maxval.
@@ -159,19 +177,31 @@ Result<Image> load_ppm(std::string_view path) {
         }
     }
 
-    const size_t rgb_size = static_cast<size_t>(*width) * *height * 3;
+    const size_t bytes_per_sample = (bit_depth == BitDepth::Bits8) ? 1 : 2;
+    const size_t rgb_size = static_cast<size_t>(*width) * *height * 3 * bytes_per_sample;
     if (file_bytes->size() - offset != rgb_size) {
         return std::unexpected(Error{ErrorCode::InvalidChunkSize, "PPM payload size does not match dimensions"});
     }
 
-    Image image(*width, *height, BitDepth::Bits8, false);
-    std::copy(file_bytes->begin() + static_cast<std::ptrdiff_t>(offset), file_bytes->end(), image.pixels().begin());
+    Image image(*width, *height, bit_depth, false);
+    if (bit_depth == BitDepth::Bits8) {
+        std::copy(file_bytes->begin() + static_cast<std::ptrdiff_t>(offset), file_bytes->end(), image.pixels().begin());
+        return image;
+    }
+    // Big-endian raster -> native-endian uint16 samples.
+    uint16_t* out = reinterpret_cast<uint16_t*>(image.pixels().data());
+    const uint8_t* src = file_bytes->data() + offset;
+    for (size_t i = 0; i < static_cast<size_t>(*width) * *height * 3; ++i) {
+        out[i] = static_cast<uint16_t>((static_cast<uint16_t>(src[2 * i]) << 8) |
+                                       static_cast<uint16_t>(src[2 * i + 1]));
+    }
     return image;
 }
 
 Result<void> save_ppm(std::string_view path, const Image& image) {
-    if (image.bit_depth() != BitDepth::Bits8) {
-        return std::unexpected(Error{ErrorCode::UnsupportedFeature, "PPM output only supports 8-bit images"});
+    if (image.bit_depth() != BitDepth::Bits8 && image.bit_depth() != BitDepth::Bits10 &&
+        image.bit_depth() != BitDepth::Bits12) {
+        return std::unexpected(Error{ErrorCode::UnsupportedFeature, "PPM output only supports 8/10/12-bit images"});
     }
 
     std::ofstream file(std::string(path), std::ios::binary);
@@ -179,18 +209,33 @@ Result<void> save_ppm(std::string_view path, const Image& image) {
         return std::unexpected(Error{ErrorCode::IoError, "failed to open output file"});
     }
 
-    file << "P6\n" << image.width() << ' ' << image.height() << "\n255\n";
+    const uint16_t maxval = static_cast<uint16_t>((1u << static_cast<unsigned>(image.bit_depth())) - 1u);
+    file << "P6\n" << image.width() << ' ' << image.height() << "\n" << maxval << "\n";
     const size_t pixel_count = static_cast<size_t>(image.width()) * image.height();
     const auto pixels = image.pixels();
 
-    if (image.has_alpha()) {
-        for (size_t i = 0; i < pixel_count; ++i) {
-            file.put(static_cast<char>(pixels[i * 4 + 0]));
-            file.put(static_cast<char>(pixels[i * 4 + 1]));
-            file.put(static_cast<char>(pixels[i * 4 + 2]));
+    if (image.bit_depth() == BitDepth::Bits8) {
+        if (image.has_alpha()) {
+            for (size_t i = 0; i < pixel_count; ++i) {
+                file.put(static_cast<char>(pixels[i * 4 + 0]));
+                file.put(static_cast<char>(pixels[i * 4 + 1]));
+                file.put(static_cast<char>(pixels[i * 4 + 2]));
+            }
+        } else {
+            file.write(reinterpret_cast<const char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
         }
     } else {
-        file.write(reinterpret_cast<const char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
+        // Big-endian uint16 raster per the PPM spec; alpha is dropped
+        // like on the 8-bit path (PPM has no alpha channel).
+        const uint16_t* samples = reinterpret_cast<const uint16_t*>(pixels.data());
+        const size_t stride = image.has_alpha() ? 4 : 3;
+        for (size_t i = 0; i < pixel_count; ++i) {
+            for (size_t c = 0; c < 3; ++c) {
+                const uint16_t v = samples[i * stride + c];
+                file.put(static_cast<char>(v >> 8));
+                file.put(static_cast<char>(v & 0xff));
+            }
+        }
     }
     // ofstream buffers silently: a full disk or broken pipe only shows
     // up when the stream is flushed, so check before reporting success.

@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -61,6 +62,43 @@ wk::Result<uint8_t> parse_tile_size(std::string_view text) {
         ++log2;
     }
     return log2;
+}
+
+// "P/T/M", e.g. 9/16/9 for BT.2020/PQ. The encoder validates matrix
+// and transfer; primaries are signalled, not validated (like the
+// library: primaries validation is a later slice, not this one).
+wk::Result<wk::CICP> parse_cicp(std::string_view text) {
+    auto parse_part = [](std::string_view part) -> wk::Result<uint8_t> {
+        if (part.empty()) {
+            return std::unexpected(wk::Error{wk::ErrorCode::InvalidParameter, "CICP value is empty"});
+        }
+        uint32_t value = 0;
+        try {
+            value = static_cast<uint32_t>(std::stoul(std::string(part)));
+        } catch (...) {
+            return std::unexpected(wk::Error{wk::ErrorCode::InvalidParameter, "CICP value must be an integer"});
+        }
+        if (value > 255) {
+            return std::unexpected(wk::Error{wk::ErrorCode::InvalidParameter, "CICP value must be 0..255"});
+        }
+        return static_cast<uint8_t>(value);
+    };
+
+    const size_t slash1 = text.find('/');
+    const size_t slash2 = slash1 == std::string_view::npos
+        ? std::string_view::npos : text.find('/', slash1 + 1);
+    if (slash1 == std::string_view::npos || slash2 == std::string_view::npos ||
+        text.find('/', slash2 + 1) != std::string_view::npos) {
+        return std::unexpected(wk::Error{wk::ErrorCode::InvalidParameter,
+            "--cicp expects P/T/M, e.g. 9/16/9"});
+    }
+    auto primaries = parse_part(text.substr(0, slash1));
+    if (!primaries) return std::unexpected(primaries.error());
+    auto transfer = parse_part(text.substr(slash1 + 1, slash2 - slash1 - 1));
+    if (!transfer) return std::unexpected(transfer.error());
+    auto matrix = parse_part(text.substr(slash2 + 1));
+    if (!matrix) return std::unexpected(matrix.error());
+    return wk::CICP{*primaries, *transfer, *matrix, true};
 }
 
 void merge_metadata(wk::meta::MetaBlock& destination, const wk::meta::MetaBlock& source) {
@@ -123,6 +161,10 @@ void print_usage() {
         << "Options:\n"
         << "  --quality N             Lossy quality 0..100 (default: 75)\n"
         << "  --lossless              Encode losslessly\n"
+        << "  --bit-depth N           Encode bit depth: 8 or 10 (default: input image's bit depth;\n"
+        << "                          12 is API/test-only in v1)\n"
+        << "  --cicp P/T/M            CICP primaries/transfer/matrix, e.g. 9/16/9 for BT.2020/PQ\n"
+        << "                          (default: 1/1/1)\n"
         << "  --tile-size N           Explicit tile size in pixels (64..1024, power of two)\n"
         << "  --threads N             Thread count (0 = auto)\n"
         << "  --yuv444                Use 4:4:4 chroma base (adaptive still applies)\n"
@@ -226,6 +268,8 @@ int main(int argc, char* argv[]) {
     std::string input_path;
     std::string output_path;
     std::string exif_source_path;
+    std::optional<uint8_t> bit_depth_flag;
+    std::optional<wk::CICP> cicp_flag;
     bool tile_stats = false;
     bool coeff_stats = false;
     bool metrics = false;
@@ -250,6 +294,34 @@ int main(int argc, char* argv[]) {
             }
         } else if (arg == "--lossless") {
             config.lossless = true;
+        } else if (arg == "--bit-depth") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --bit-depth requires a value\n";
+                return 1;
+            }
+            uint32_t value = 0;
+            try {
+                value = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } catch (...) {
+                std::cerr << "Error: invalid bit depth\n";
+                return 1;
+            }
+            if (value != 8 && value != 10) {
+                std::cerr << "Error: --bit-depth accepts 8 or 10 (12 is API/test-only in v1)\n";
+                return 1;
+            }
+            bit_depth_flag = static_cast<uint8_t>(value);
+        } else if (arg == "--cicp") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --cicp requires a value\n";
+                return 1;
+            }
+            auto cicp = parse_cicp(argv[++i]);
+            if (!cicp) {
+                std::cerr << "Error: " << cicp.error().message << '\n';
+                return 1;
+            }
+            cicp_flag = *cicp;
         } else if (arg == "--tile-size") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --tile-size requires a value\n";
@@ -378,8 +450,31 @@ int main(int argc, char* argv[]) {
     wk::tool::log_info("loaded " + input_path + " (" + std::to_string(image->width()) + "x" +
                        std::to_string(image->height()) + ", " +
                        (image->has_alpha() ? "RGBA" : "RGB") + ")");
+    // Bit depth comes from the input unless --bit-depth says
+    // otherwise; a flag that disagrees with the input is an error,
+    // not an upscale (the encoder reads samples at the config's
+    // depth, so a mismatch would misread the pixels).
+    if (bit_depth_flag.has_value()) {
+        const auto flag_depth = *bit_depth_flag == 10 ? wk::BitDepth::Bits10 : wk::BitDepth::Bits8;
+        if (flag_depth != image->bit_depth()) {
+            wk::tool::log_error("--bit-depth " + std::to_string(*bit_depth_flag) +
+                                " does not match the input image's bit depth (" +
+                                std::to_string(static_cast<unsigned>(image->bit_depth())) + ")");
+            return 1;
+        }
+        config.bit_depth = flag_depth;
+    } else {
+        config.bit_depth = image->bit_depth();
+    }
+    if (cicp_flag.has_value()) {
+        config.cicp = *cicp_flag;
+    }
     wk::tool::log_debug(std::string("encoding: ") + (config.lossless ? "lossless" : "lossy") +
                         (config.lossless ? "" : " q" + std::to_string(static_cast<int>(config.quality))) +
+                        ", " + std::to_string(static_cast<unsigned>(config.bit_depth)) + "-bit" +
+                        ", CICP " + std::to_string(config.cicp.primaries) + "/" +
+                        std::to_string(config.cicp.transfer) + "/" +
+                        std::to_string(config.cicp.matrix) +
                         ", tile " + (config.tile_size_log2 == 0
                                          ? std::string("auto")
                                          : std::to_string(1u << config.tile_size_log2) + "px") +
