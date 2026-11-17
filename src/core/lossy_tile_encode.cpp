@@ -424,9 +424,9 @@ Result<TileEncodeResult> encode_lossy_tile(
     chroma_quality = std::min(chroma_quality, quality + max_chroma_boost);
 
     int qp = quality_to_qp(luma_quality);
-    float lambda = qp_to_lambda(qp);
+    float lambda = qp_to_lambda(qp, bit_depth);
     const int chroma_qp = quality_to_qp(chroma_quality);
-    const float chroma_lambda = qp_to_lambda(chroma_qp);
+    const float chroma_lambda = qp_to_lambda(chroma_qp, bit_depth);
 
     uint32_t blocks_x = (tw + 7) / 8;
     uint32_t blocks_y = (th + 7) / 8;
@@ -484,7 +484,8 @@ Result<TileEncodeResult> encode_lossy_tile(
     const std::vector<BlockControl> control_field =
         use_control_field
             ? analyze_control_field(tile_y_data.data(), tw, th,
-                                    tile_cb_full.data(), tile_cr_full.data())
+                                    tile_cb_full.data(), tile_cr_full.data(),
+                                    bit_depth)
             : std::vector<BlockControl>{};
     const std::vector<uint8_t> superblock_scales =
         use_control_field

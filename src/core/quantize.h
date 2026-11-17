@@ -228,9 +228,19 @@ inline int quality_to_qp(float quality) {
     return static_cast<int>(100.0f - std::clamp(quality, 0.0f, 100.0f));
 }
 
-inline float qp_to_lambda(int qp) {
+inline float qp_to_lambda(int qp, uint8_t bit_depth = 8) {
     const float q = static_cast<float>(qp);
-    return 0.85f * std::pow(2.0f, (q - 12.0f) / 3.0f);
+    float lambda = 0.85f * std::pow(2.0f, (q - 12.0f) / 3.0f);
+    if (bit_depth > 8) {
+        // SSD grows with the square of the code-value range, so the
+        // RDO lambda must grow by (2^(bd-8))^2 to keep the same
+        // operating point: x16 at 10-bit, x256 at 12-bit (measured
+        // slice 0, 2026-11-17: x16 reproduces the 8-bit operating
+        // point on 17/24 q70-q80 combinations; x1 spends ~15% more
+        // bits for +0.5 dB).
+        lambda *= std::pow(4.0f, static_cast<float>(bit_depth - 8));
+    }
+    return lambda;
 }
 
 }

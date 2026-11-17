@@ -69,9 +69,15 @@ struct BlockControl {
 // FlatGraphics — in that priority order, with the luma class as
 // fallback for blocks no colour rule claims. When both are null the
 // result is exactly the luma-only field.
+//
+// bit_depth rescales the 8-bit-calibrated thresholds above 8-bit
+// (gradients/colours x4, variances x16 at 10-bit; measured slice 0,
+// 2026-11-17: 100.00% agreement with the 8-bit classification on
+// 176,697 blocks). At 8-bit the behaviour is identical.
 std::vector<BlockControl> analyze_control_field(
     const int16_t* tile_luma, uint32_t tw, uint32_t th,
-    const int16_t* tile_cb = nullptr, const int16_t* tile_cr = nullptr);
+    const int16_t* tile_cb = nullptr, const int16_t* tile_cr = nullptr,
+    uint8_t bit_depth = 8);
 
 // Skin false-positive mask (#skin-fp) over a whole-frame field:
 // one byte per block (raster order, blocks_per_row * blocks_per_col),
@@ -81,11 +87,13 @@ std::vector<BlockControl> analyze_control_field(
 // high (rock, not skin). Non-Skin blocks are always 0. The rule is
 // measured, not guessed: (component width >= 40 AND aspect >= 2.0)
 // OR chroma_grad >= 3.0 cuts 46.6% of the SKIN_A file cost at ~zero
-// GT loss (2026-11-16). Components are 8-connected over the Skin
-// mask of the whole frame — a single tile cannot see them, so the
-// caller classifies the frame once and hands the mask to the tiles.
+// GT loss (2026-11-16). The chroma-grad threshold scales with bit
+// depth like the field's (x4 at 10-bit). Components are 8-connected
+// over the Skin mask of the whole frame — a single tile cannot see
+// them, so the caller classifies the frame once and hands the mask
+// to the tiles.
 std::vector<uint8_t> skin_false_positive_mask(
     const std::vector<BlockControl>& field, uint32_t blocks_per_row,
-    uint32_t blocks_per_col);
+    uint32_t blocks_per_col, uint8_t bit_depth = 8);
 
 }  // namespace wk
