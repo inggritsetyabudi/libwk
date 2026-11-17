@@ -33,7 +33,6 @@ WEBP_C_SOURCES="
 ../src/webp/src/dec/alpha_dec.c
 ../src/webp/src/dec/buffer_dec.c
 ../src/webp/src/dec/frame_dec.c
-../src/webp/src/dec/idec_dec.c
 ../src/webp/src/dec/io_dec.c
 ../src/webp/src/dec/quant_dec.c
 ../src/webp/src/dec/tree_dec.c
@@ -70,10 +69,8 @@ WEBP_C_SOURCES="
 ../src/webp/src/dsp/yuv_sse41.c
 ../src/webp/src/utils/bit_reader_utils.c
 ../src/webp/src/utils/color_cache_utils.c
-../src/webp/src/utils/filters_utils.c
 ../src/webp/src/utils/huffman_utils.c
 ../src/webp/src/utils/quant_levels_dec_utils.c
-../src/webp/src/utils/quant_levels_utils.c
 ../src/webp/src/utils/random_utils.c
 ../src/webp/src/utils/rescaler_utils.c
 ../src/webp/src/utils/thread_utils.c

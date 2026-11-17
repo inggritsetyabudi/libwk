@@ -15,7 +15,6 @@
 
 #include "webp_decode.h"
 #include "src/webp/decode.h"
-#include <algorithm>
 #include <cstring>
 
 namespace wk::webp {
