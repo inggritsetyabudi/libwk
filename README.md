@@ -278,7 +278,7 @@ What is intentionally not claimed as finished yet:
 
 ## Perceptual Control Field
 
-The control field (`src/control_field.cpp`) classifies every 8×8 block by
+The control field (`src/core/control_field.cpp`) classifies every 8×8 block by
 content — luma classes (Flat, Edge, Textured, Normal) plus, from the tile's
 chroma, content-type classes (Skin, Sky, Foliage, TextUI, FlatGraphics) —
 and lets the encoder treat classes differently. It is off by default and
@@ -485,9 +485,9 @@ the same `stb`-based code on all platforms.
 
 ```text
 include/    public headers (wk.hpp, wk.h, wkmeta.hpp)
-src/        codec, container, metadata, image I/O, metrics
+src/        core/ (portable codec), arch/ (per-target code), stb/ (vendored image I/O)
 tools/      CLI tools and viewer (wkenc, wkdec, wkmetric, wkmeta-dump, wkmeta-edit, wkview)
-tests/      unit and integration tests (30 test binaries)
+tests/      unit and integration tests (32 test binaries)
 photos/     sample corpus split into people/ and scenery/
 benchmark/  RD harness (rd_bench.py), baselines, and generated outputs
 extra/      screenshots, demo assets, and the WK logo
