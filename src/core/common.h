@@ -385,6 +385,21 @@ namespace wk
     constexpr uint16_t FHDR_FLAG_HAS_C2PA = 0x0040;
     constexpr uint16_t FHDR_FLAG_FULL_RANGE = 0x0080;
 
+    // ITU-T H.273 Table 2 entries only: 0 Reserved, 1 BT.709,
+    // 2 Unspecified, 4 BT.470M, 5 BT.601 625, 6 BT.601 525,
+    // 7 SMPTE 240M, 8 Generic film, 9 BT.2020, 10 XYZ, 11 SMPTE 431,
+    // 12 Display P3, 22 EBU Tech 3213. Anything else has no entry
+    // in the table. Single source of truth: parse_fhdr checks it and
+    // the encoder rejects it, so the encoder can never write a file
+    // its own decoder rejects.
+    [[nodiscard]] inline bool cicp_primaries_is_defined(uint8_t primaries)
+    {
+        return primaries == 0 || primaries == 1 || primaries == 2 || primaries == 4 ||
+               primaries == 5 || primaries == 6 || primaries == 7 || primaries == 8 ||
+               primaries == 9 || primaries == 10 || primaries == 11 || primaries == 12 ||
+               primaries == 22;
+    }
+
     struct FrameHeader
     {
         uint32_t width = 0;
