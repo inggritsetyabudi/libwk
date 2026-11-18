@@ -275,6 +275,97 @@ TEST(ContainerTest, InvalidBitDepth) {
     EXPECT_FALSE(parsed.has_value());
 }
 
+// B5: cicp_primaries must have an entry in ITU-T H.273 Table 2
+// (0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 22). Anything else has no
+// entry in the table and must be rejected, not silently accepted.
+TEST(ContainerTest, ParseFhdrRejectsUnknownPrimaries) {
+    for (uint8_t primaries : {99, 255}) {
+        FrameHeader hdr = make_test_header();
+        hdr.cicp_primaries = primaries;
+        auto parsed = parse_fhdr(serialize_fhdr(hdr));
+        ASSERT_FALSE(parsed.has_value())
+            << "primaries=" << static_cast<int>(primaries);
+        EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+    }
+}
+
+TEST(ContainerTest, ParseFhdrAcceptsTable2Primaries) {
+    // 0=Reserved, 2=Unspecified, 5=BT.601 625, 22=EBU Tech 3213: all
+    // have a Table 2 entry, so they are accepted (the value is only
+    // signalled, never used in conversion).
+    for (uint8_t primaries : {0, 2, 5, 22}) {
+        FrameHeader hdr = make_test_header();
+        hdr.cicp_primaries = primaries;
+        auto parsed = parse_fhdr(serialize_fhdr(hdr));
+        ASSERT_TRUE(parsed.has_value())
+            << "primaries=" << static_cast<int>(primaries)
+            << (parsed ? "" : parsed.error().message);
+        EXPECT_EQ(parsed->cicp_primaries, primaries);
+    }
+}
+
+// B6: the HDR flag (bit 3) must be set exactly when bit_depth > 8 or
+// the transfer is PQ (16) / HLG (18). A file that disagrees is
+// mislabelled and must be rejected, not decoded as the wrong kind.
+TEST(ContainerTest, ParseFhdrRejectsHdrFlagMismatch) {
+    // 10-bit, flag clear.
+    {
+        FrameHeader hdr = make_test_header();
+        hdr.bit_depth = 10;
+        hdr.cicp_primaries = 9;
+        hdr.cicp_transfer = 16;
+        hdr.cicp_matrix = 9;
+        auto parsed = parse_fhdr(serialize_fhdr(hdr));
+        ASSERT_FALSE(parsed.has_value());
+        EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+    }
+    // 8-bit BT.709, flag set.
+    {
+        FrameHeader hdr = make_test_header();
+        hdr.flags |= FHDR_FLAG_HDR;
+        auto parsed = parse_fhdr(serialize_fhdr(hdr));
+        ASSERT_FALSE(parsed.has_value());
+        EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+    }
+    // 8-bit PQ, flag clear.
+    {
+        FrameHeader hdr = make_test_header();
+        hdr.cicp_primaries = 9;
+        hdr.cicp_transfer = 16;
+        hdr.cicp_matrix = 9;
+        auto parsed = parse_fhdr(serialize_fhdr(hdr));
+        ASSERT_FALSE(parsed.has_value());
+        EXPECT_EQ(parsed.error().code, ErrorCode::InvalidHeader);
+    }
+}
+
+TEST(ContainerTest, ParseFhdrAcceptsHdrFlagAgreement) {
+    // 8-bit PQ, flag set.
+    {
+        FrameHeader hdr = make_test_header();
+        hdr.cicp_primaries = 9;
+        hdr.cicp_transfer = 16;
+        hdr.cicp_matrix = 9;
+        hdr.flags |= FHDR_FLAG_HDR;
+        auto parsed = parse_fhdr(serialize_fhdr(hdr));
+        ASSERT_TRUE(parsed.has_value())
+            << (parsed ? "" : parsed.error().message);
+        EXPECT_TRUE(parsed->is_hdr());
+    }
+    // 8-bit HLG, flag set.
+    {
+        FrameHeader hdr = make_test_header();
+        hdr.cicp_primaries = 9;
+        hdr.cicp_transfer = 18;
+        hdr.cicp_matrix = 9;
+        hdr.flags |= FHDR_FLAG_HDR;
+        auto parsed = parse_fhdr(serialize_fhdr(hdr));
+        ASSERT_TRUE(parsed.has_value())
+            << (parsed ? "" : parsed.error().message);
+        EXPECT_TRUE(parsed->is_hdr());
+    }
+}
+
 TEST(ContainerTest, TileCount) {
     FrameHeader hdr;
     hdr.width = 1920;
@@ -545,9 +636,13 @@ TEST(ContainerTest, ParseFhdrRejectsUnknownCicpTransfer) {
 
 TEST(ContainerTest, ParseFhdrAcceptsKnownCicpValues) {
     // Control: every matrix/transfer the converter implements is accepted.
+    // Transfer 16 (PQ) is HDR, so the HDR flag must be set for the
+    // header to agree (B6): an 8-bit PQ header with the flag clear is
+    // mislabelled and rejected.
     FrameHeader hdr = make_test_header();
     hdr.cicp_matrix = 9;
     hdr.cicp_transfer = 16;
+    hdr.flags |= FHDR_FLAG_HDR;
     auto parsed = parse_fhdr(serialize_fhdr(hdr));
     ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
     EXPECT_EQ(parsed->cicp_matrix, 9);

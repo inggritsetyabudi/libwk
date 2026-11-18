@@ -123,7 +123,7 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
     fhdr.flags = 0;
     if (config.lossless) fhdr.flags |= wk::FHDR_FLAG_LOSSLESS;
     if (source_has_alpha) fhdr.flags |= wk::FHDR_FLAG_ALPHA;
-    if (config.bit_depth != BitDepth::Bits8) fhdr.flags |= wk::FHDR_FLAG_HDR;
+    if (fhdr.hdr_flag_expected()) fhdr.flags |= wk::FHDR_FLAG_HDR;
     if (config.cicp.full_range) fhdr.flags |= wk::FHDR_FLAG_FULL_RANGE;
     fhdr.flags |= FHDR_FLAG_TILED;
 

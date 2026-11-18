@@ -129,6 +129,31 @@ namespace wk
             return std::unexpected(Error{ErrorCode::InvalidHeader,
                                          "unknown CICP transfer characteristic"});
         }
+        // ITU-T H.273 Table 2 entries only: 0 Reserved, 1 BT.709,
+        // 2 Unspecified, 4 BT.470M, 5 BT.601 625, 6 BT.601 525,
+        // 7 SMPTE 240M, 8 Generic film, 9 BT.2020, 10 XYZ, 11 SMPTE 431,
+        // 12 Display P3, 22 EBU Tech 3213. Anything else has no entry
+        // in the table. The value is only signalled, never used in
+        // conversion, but a wrong label on an HDR file is exactly the
+        // kind of silent error the validation exists to catch.
+        if (hdr.cicp_primaries != 0 && hdr.cicp_primaries != 1 && hdr.cicp_primaries != 2 &&
+            hdr.cicp_primaries != 4 && hdr.cicp_primaries != 5 && hdr.cicp_primaries != 6 &&
+            hdr.cicp_primaries != 7 && hdr.cicp_primaries != 8 && hdr.cicp_primaries != 9 &&
+            hdr.cicp_primaries != 10 && hdr.cicp_primaries != 11 && hdr.cicp_primaries != 12 &&
+            hdr.cicp_primaries != 22)
+        {
+            return std::unexpected(Error{ErrorCode::InvalidHeader,
+                                         "unknown CICP primaries"});
+        }
+        // The HDR flag must agree with bit_depth/transfer: set exactly
+        // when the frame is HDR (see FrameHeader::hdr_flag_expected).
+        // A file that disagrees is mislabelled: the flag is wrong, not
+        // the frame.
+        if (hdr.is_hdr() != hdr.hdr_flag_expected())
+        {
+            return std::unexpected(Error{ErrorCode::InvalidHeader,
+                                         "HDR flag disagrees with bit_depth/transfer"});
+        }
         if (hdr.tile_size_log2 < 6 || hdr.tile_size_log2 > 10)
         {
             return std::unexpected(Error{ErrorCode::InvalidHeader,
