@@ -476,6 +476,38 @@ TEST(HdrTest, EncoderSetsHdrFlagFromBitDepthAndTransfer) {
     EXPECT_TRUE(encode_and_read_flag(img10, BitDepth::Bits10, CICP{9, 16, 9, true}));
 }
 
+// The encoder must reject CICP primaries with no entry in ITU-T
+// H.273 Table 2, with the same rule the decoder checks (B5): an
+// encoder that writes primaries=99 produces a file its own decoder
+// rejects, so the failure must happen at encode time, not at decode.
+TEST(HdrTest, EncoderRejectsUnknownPrimaries) {
+    const Image img10 = make_gradient_texture(16, 16, BitDepth::Bits10);
+    const Image img8 = scale_down_4x(img10);
+
+    for (uint8_t primaries : {99, 255}) {
+        EncoderConfig cfg;
+        cfg.quality = 75;
+        cfg.bit_depth = BitDepth::Bits8;
+        cfg.cicp = CICP{primaries, 1, 1, true};
+        auto enc = encode(img8, cfg);
+        ASSERT_FALSE(enc.has_value()) << "primaries=" << static_cast<int>(primaries);
+        EXPECT_EQ(enc.error().code, ErrorCode::InvalidParameter);
+    }
+
+    // Every Table 2 value still encodes and round-trips.
+    for (uint8_t primaries : {0, 2, 5, 9, 22}) {
+        EncoderConfig cfg;
+        cfg.quality = 75;
+        cfg.bit_depth = BitDepth::Bits8;
+        cfg.cicp = CICP{primaries, 1, 1, true};
+        auto enc = encode(img8, cfg);
+        ASSERT_TRUE(enc.has_value())
+            << "primaries=" << static_cast<int>(primaries)
+            << (enc ? "" : enc.error().message);
+        EXPECT_TRUE(decode(*enc).has_value()) << "round-trip must decode";
+    }
+}
+
 // Lambda RDO must scale with the square of the code-value range:
 // x16 at 10-bit, x256 at 12-bit (slice 0 Section 3.4). 8-bit is untouched.
 TEST(HdrTest, LambdaScalesWithBitDepth) {

@@ -103,6 +103,12 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
     if (config.cicp.transfer != 1 && config.cicp.transfer != 13 && config.cicp.transfer != 16 && config.cicp.transfer != 18) {
         return std::unexpected(Error{ErrorCode::InvalidParameter, "unknown CICP transfer characteristic"});
     }
+    // Same rule as the decoder (see parse_fhdr): primaries with no
+    // ITU-T H.273 Table 2 entry must fail here, not produce a file
+    // the decoder rejects.
+    if (!cicp_primaries_is_defined(config.cicp.primaries)) {
+        return std::unexpected(Error{ErrorCode::InvalidParameter, "unknown CICP primaries (no H.273 Table 2 entry)"});
+    }
 
     auto tile_size_log2 = resolve_tile_size_log2(config);
     if (!tile_size_log2) {
