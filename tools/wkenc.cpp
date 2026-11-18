@@ -71,9 +71,9 @@ wk::Result<uint16_t> parse_max_luminance(std::string_view text, const char* flag
     return static_cast<uint16_t>(value);
 }
 
-// "P/T/M", e.g. 9/16/9 for BT.2020/PQ. The encoder validates matrix
-// and transfer; primaries are signalled, not validated (like the
-// library: primaries validation is a later slice, not this one).
+// "P/T/M", e.g. 9/16/9 for BT.2020/PQ. The encoder validates matrix,
+// transfer, and primaries (H.273 Table 2); this parser only checks
+// the 0..255 range.
 wk::Result<wk::CICP> parse_cicp(std::string_view text) {
     auto parse_part = [](std::string_view part) -> wk::Result<uint8_t> {
         if (part.empty()) {
