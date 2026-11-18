@@ -36,6 +36,11 @@ Result<Image> decode(std::span<const uint8_t> bytes) {
     if (WebPGetFeatures(bytes.data(), bytes.size(), &features) != VP8_STATUS_OK) {
         return std::unexpected(Error{ErrorCode::InvalidHeader, "invalid WebP header"});
     }
+    // The one-shot decode API cannot handle animation: reject it with an
+    // explicit error instead of a generic decode failure.
+    if (features.has_animation != 0) {
+        return std::unexpected(Error{ErrorCode::InvalidHeader, "animated WebP not supported"});
+    }
     // Same caps as the container and the stb path (65535 per side,
     // 2^28 pixels): probe dimensions before any raster allocation so
     // a file claiming a huge size is rejected up front.

@@ -23,8 +23,9 @@ namespace wk::webp {
 // RIFF....WEBP magic: 12 bytes, "RIFF" at 0, "WEBP" at 8.
 bool has_webp_magic(std::span<const uint8_t> bytes);
 
-// Decode an 8-bit WebP (lossy or lossless; animated: first frame) into
-// an 8-bit Image. Fails cleanly on malformed input (no crash/UB).
+// Decode an 8-bit still WebP (lossy or lossless) into an 8-bit Image.
+// Animated WebP is not supported and is rejected. Fails cleanly on
+// malformed input (no crash/UB).
 Result<Image> decode(std::span<const uint8_t> bytes);
 
 }  // namespace wk::webp

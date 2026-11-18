@@ -403,6 +403,15 @@ namespace wk
         [[nodiscard]] bool is_animated() const { return flags & FHDR_FLAG_ANIMATED; }
         [[nodiscard]] bool has_alpha() const { return flags & FHDR_FLAG_ALPHA; }
         [[nodiscard]] bool is_hdr() const { return flags & FHDR_FLAG_HDR; }
+        // The HDR flag (SPEC Section 2.1, bit 3) is set exactly when the
+        // frame is HDR: bit depth above 8, or a PQ (16) / HLG (18)
+        // transfer. Single source of truth for the rule: parse_fhdr
+        // checks it and the encoder sets it, so the encoder can never
+        // write a file its own decoder rejects.
+        [[nodiscard]] bool hdr_flag_expected() const
+        {
+            return bit_depth > 8 || cicp_transfer == 16 || cicp_transfer == 18;
+        }
         [[nodiscard]] bool is_tiled() const { return flags & FHDR_FLAG_TILED; }
         [[nodiscard]] bool has_wkmeta() const { return flags & FHDR_FLAG_HAS_WKMETA; }
         [[nodiscard]] bool full_range() const { return flags & FHDR_FLAG_FULL_RANGE; }

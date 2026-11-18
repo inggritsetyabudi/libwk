@@ -28,6 +28,7 @@
 #include "../src/core/adaptive_chroma.h"
 #include "../src/core/cclm.h"
 #include "../src/core/colorspace.h"
+#include "../src/core/container.h"
 #include "../src/core/control_field.h"
 #include "../src/core/image_io.h"
 #include "../src/core/metrics.h"
@@ -258,7 +259,7 @@ std::vector<uint8_t> make_ppm16(uint32_t w, uint32_t h, uint16_t maxval,
 // H3 repro (audit): 128x128 gradient+texture, BT.2020/PQ, q75, was
 // 15,744 B / PSNR 37.00 / SSIM 0.99030 on the unpatched library
 // (lambda x1). The slice-1 lambda fix (x16 at 10-bit) deliberately
-// moves the operating point to the 8-bit one (slice 0 §3.4) —
+// moves the operating point to the 8-bit one (slice 0 Section 3.4) —
 // measured post-fix: 13,159 B / 36.58 dB / 0.98898, vs the same
 // scene at 8-bit 13,467 B / 36.50 dB / 0.98552. So the floors below
 // are the post-fix operating point (above the 8-bit point, with
@@ -276,7 +277,7 @@ TEST(HdrTest, Roundtrip10BitGradientTextureQ75) {
 // are near-degenerate for RDO (SSD ~ 0), so the lambda fix barely
 // moves them; tex and wcg carry the lambda tradeoff. The floors are
 // set from the post-fix operating point, which must match or beat
-// the 8-bit point at the same q (slice 0 §3.4 criterion) — wcg
+// the 8-bit point at the same q (slice 0 Section 3.4 criterion) — wcg
 // post-fix 54.69 dB / 0.99448 vs 8-bit 51.83 dB / 0.98792; tex256
 // post-fix 36.57 dB / 0.98909 vs 8-bit 36.58 dB / 0.98599 — not
 // from the pre-fix lambda-x1 numbers (ramp 60.66, skin 49.01, wcg
@@ -322,7 +323,7 @@ TEST(HdrTest, Roundtrip12BitGradientTextureQ75SpotCheck) {
 }
 
 // HLG is signalled and round-tripped in v1, not fully measured:
-// same content with transfer 18 must behave like PQ (slice 0 §2.5:
+// same content with transfer 18 must behave like PQ (slice 0 Section 2.5:
 // identical size/PSNR/SSIM on ramp q75, because pipeline A never
 // calls the EOTF).
 TEST(HdrTest, Roundtrip10BitHlgMatchesPq) {
@@ -334,7 +335,7 @@ TEST(HdrTest, Roundtrip10BitHlgMatchesPq) {
     EXPECT_DOUBLE_EQ(hlg.ssim, pq.ssim);
 }
 
-// Adaptive-chroma oracle (slice 0 §5.2): the scaled thresholds
+// Adaptive-chroma oracle (slice 0 Section 5.2): the scaled thresholds
 // (8.4/316/400 at 10-bit) must reproduce the 8-bit decision
 // (2.1/79/100) on the same content scaled x4.
 TEST(HdrTest, AdaptiveChromaScaledThresholdsReproduce8BitDecision) {
@@ -394,7 +395,7 @@ TEST(HdrTest, AdaptiveChromaScaledThresholdsReproduce8BitDecision) {
     EXPECT_EQ(edge10, edge8);
 }
 
-// Encoder-level adaptive check (slice 0 §5.2: unscaled thresholds
+// Encoder-level adaptive check (slice 0 Section 5.2: unscaled thresholds
 // waste 171,943 B = 10.9% on the corpus by keeping 444 where the
 // oracle says 420). On the smooth-chroma scene above, adaptive ON
 // must beat OFF at 10-bit; the 8-bit pair is the control.
@@ -438,8 +439,45 @@ TEST(HdrTest, EncodeRejectsBitDepthMismatch) {
     EXPECT_FALSE(enc.has_value()) << "8-bit pixels with a 10-bit config must fail";
 }
 
+// B6: the encoder must set the HDR flag by the same rule the decoder
+// checks (set exactly when bit_depth > 8 or transfer is PQ/HLG), or
+// its own output would fail the decoder's agreement check. Before
+// this fix the encoder only looked at bit_depth, so an 8-bit PQ file
+// came out with the flag clear.
+TEST(HdrTest, EncoderSetsHdrFlagFromBitDepthAndTransfer) {
+    auto encode_and_read_flag = [](const Image& img, BitDepth bd, CICP cicp) {
+        EncoderConfig cfg;
+        cfg.quality = 75;
+        cfg.bit_depth = bd;
+        cfg.cicp = cicp;
+        auto enc = encode(img, cfg);
+        EXPECT_TRUE(enc.has_value()) << (enc ? "" : enc.error().message);
+        if (!enc) return false;
+        auto file = parse_container(*enc);
+        EXPECT_TRUE(file.has_value()) << (file ? "" : file.error().message);
+        if (!file) return false;
+        EXPECT_TRUE(decode(*enc).has_value()) << "round-trip must decode";
+        return file->header.is_hdr();
+    };
+
+    // 8-bit images come from the 10-bit generator via scale_down_4x:
+    // make_gradient_texture writes uint16 samples, so it must never be
+    // called with Bits8 (that overflows the 3-byte-per-pixel buffer).
+    const Image img10 = make_gradient_texture(16, 16, BitDepth::Bits10);
+    const Image img8 = scale_down_4x(img10);
+
+    // 8-bit BT.709: flag clear.
+    EXPECT_FALSE(encode_and_read_flag(img8, BitDepth::Bits8, CICP{1, 1, 1, true}));
+    // 8-bit PQ: flag set.
+    EXPECT_TRUE(encode_and_read_flag(img8, BitDepth::Bits8, CICP{9, 16, 9, true}));
+    // 8-bit HLG: flag set.
+    EXPECT_TRUE(encode_and_read_flag(img8, BitDepth::Bits8, CICP{9, 18, 9, true}));
+    // 10-bit PQ: flag set.
+    EXPECT_TRUE(encode_and_read_flag(img10, BitDepth::Bits10, CICP{9, 16, 9, true}));
+}
+
 // Lambda RDO must scale with the square of the code-value range:
-// x16 at 10-bit, x256 at 12-bit (slice 0 §3.4). 8-bit is untouched.
+// x16 at 10-bit, x256 at 12-bit (slice 0 Section 3.4). 8-bit is untouched.
 TEST(HdrTest, LambdaScalesWithBitDepth) {
     const float l8 = qp_to_lambda(25);
     EXPECT_NEAR(l8, 17.135f, 0.01f) << "q75 lambda is unchanged at 8-bit";
@@ -469,7 +507,7 @@ TEST(HdrTest, CclmFallbackMidScalesWithBitDepth) {
     EXPECT_EQ(dflt.b, 128 * 256);
 }
 
-// Control-field equivalence (slice 0 §4.3): the recalibrated 10-bit
+// Control-field equivalence (slice 0 Section 4.3): the recalibrated 10-bit
 // field must reproduce the 8-bit classification exactly on the same
 // content scaled x4 (100.00% on 176,697 blocks in slice 0).
 TEST(HdrTest, ControlField10BitReproduces8Bit) {

@@ -32,7 +32,7 @@ constexpr size_t kTableClusterMaxPasses = 2;
 // Log-frequency band bounds for pooled coefficient tables: positions
 // sharing a band pool their counts into one table, so a tile's bank
 // holds ~6 tables instead of up to 64. Bounds match the research
-// coder (var_transform 2026-11-16 §7): {0}, {1..3}, {4..7}, {8..15},
+// coder (var_transform 2026-11-16 Section 7): {0}, {1..3}, {4..7}, {8..15},
 // {16..31}, {32..63}, ... — each band spans one octave of positions.
 constexpr int kCoeffBandBounds[] = {0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
 
