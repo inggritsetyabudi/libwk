@@ -124,6 +124,8 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
     fhdr.cicp_primaries = config.cicp.primaries;
     fhdr.cicp_transfer = config.cicp.transfer;
     fhdr.cicp_matrix = config.cicp.matrix;
+    fhdr.max_cll = config.max_cll;
+    fhdr.max_fall = config.max_fall;
     fhdr.tile_size_log2 = *tile_size_log2;
 
     fhdr.flags = 0;
@@ -525,6 +527,8 @@ void wk_encoder_config_init(wk_encoder_config_t* config) {
     config->adaptive_chroma_laplacian_threshold = 2.1f;
     config->adaptive_chroma_lap_p999_threshold = 79.0f;
     config->adaptive_chroma_lap_sat_p999_threshold = 100.0f;
+    config->max_cll = 0;
+    config->max_fall = 0;
 }
 
 wk_error_t wk_encode(
@@ -600,6 +604,8 @@ wk_error_t wk_encode(
         wk::Subsampling::YUV420 : wk::Subsampling::YUV444;
     enc_config.cicp = {config->cicp_primaries, config->cicp_transfer,
                        config->cicp_matrix, config->full_range != 0};
+    enc_config.max_cll = config->max_cll;
+    enc_config.max_fall = config->max_fall;
     enc_config.tile_size_log2 = config->tile_size_log2;
     enc_config.threads = config->threads;
     enc_config.target_ssimulacra2 = config->target_ssimulacra2;
