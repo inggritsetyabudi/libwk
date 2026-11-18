@@ -508,6 +508,49 @@ TEST(HdrTest, EncoderRejectsUnknownPrimaries) {
     }
 }
 
+// B7: the encoder must carry HDR mastering metadata into FHDR:
+// EncoderConfig.max_cll/max_fall are written as-is (0 = unspecified,
+// the default). Metadata only -- the values never touch pixels.
+TEST(HdrTest, EncoderSetsMaxCllMaxFall) {
+    const Image img10 = make_gradient_texture(16, 16, BitDepth::Bits10);
+    const Image img8 = scale_down_4x(img10);
+
+    auto encode_and_read_header = [](const Image& img, uint16_t max_cll, uint16_t max_fall) {
+        EncoderConfig cfg;
+        cfg.quality = 75;
+        cfg.bit_depth = BitDepth::Bits8;
+        cfg.max_cll = max_cll;
+        cfg.max_fall = max_fall;
+        auto enc = encode(img, cfg);
+        EXPECT_TRUE(enc.has_value()) << (enc ? "" : enc.error().message);
+        if (!enc) return FrameHeader{};
+        auto file = parse_container(*enc);
+        EXPECT_TRUE(file.has_value()) << (file ? "" : file.error().message);
+        if (!file) return FrameHeader{};
+        EXPECT_TRUE(decode(*enc).has_value()) << "round-trip must decode";
+        return file->header;
+    };
+
+    // Set values survive the round-trip.
+    {
+        const FrameHeader hdr = encode_and_read_header(img8, 1000, 400);
+        EXPECT_EQ(hdr.max_cll, 1000);
+        EXPECT_EQ(hdr.max_fall, 400);
+    }
+    // uint16 bounds are accepted.
+    {
+        const FrameHeader hdr = encode_and_read_header(img8, 65535, 65535);
+        EXPECT_EQ(hdr.max_cll, 65535);
+        EXPECT_EQ(hdr.max_fall, 65535);
+    }
+    // Default is 0/0, as before.
+    {
+        const FrameHeader hdr = encode_and_read_header(img8, 0, 0);
+        EXPECT_EQ(hdr.max_cll, 0);
+        EXPECT_EQ(hdr.max_fall, 0);
+    }
+}
+
 // Lambda RDO must scale with the square of the code-value range:
 // x16 at 10-bit, x256 at 12-bit (slice 0 Section 3.4). 8-bit is untouched.
 TEST(HdrTest, LambdaScalesWithBitDepth) {

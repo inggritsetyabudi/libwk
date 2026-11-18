@@ -158,6 +158,11 @@ namespace wk
         BitDepth bit_depth = BitDepth::Bits8;
         Subsampling subsampling = Subsampling::YUV444;
         CICP cicp = {};
+        // HDR mastering metadata (#hdr): MaxCLL/MaxFALL in nits,
+        // written to FHDR as-is (0 = unspecified, the default).
+        // Metadata only -- the values never touch pixels.
+        uint16_t max_cll = 0;
+        uint16_t max_fall = 0;
         uint8_t tile_size_log2 = 0;
         uint32_t threads = 0;
         // Phase 2 perceptual control field: when true, the encoder

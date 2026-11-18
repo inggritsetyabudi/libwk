@@ -53,6 +53,24 @@ wk::Result<uint8_t> parse_tile_size(std::string_view text) {
     return log2;
 }
 
+// MaxCLL/MaxFALL in nits: a uint16, so the CLI range is 0..65535
+// (0 = unspecified, the default). Follows the parse_tile_size
+// conventions: stoul with a clean error, never a raw exception.
+wk::Result<uint16_t> parse_max_luminance(std::string_view text, const char* flag) {
+    uint32_t value = 0;
+    try {
+        value = static_cast<uint32_t>(std::stoul(std::string(text)));
+    } catch (...) {
+        return std::unexpected(wk::Error{wk::ErrorCode::InvalidParameter,
+            std::string(flag) + " must be an integer"});
+    }
+    if (value > 65535) {
+        return std::unexpected(wk::Error{wk::ErrorCode::InvalidParameter,
+            std::string(flag) + " must be 0..65535"});
+    }
+    return static_cast<uint16_t>(value);
+}
+
 // "P/T/M", e.g. 9/16/9 for BT.2020/PQ. The encoder validates matrix
 // and transfer; primaries are signalled, not validated (like the
 // library: primaries validation is a later slice, not this one).
@@ -154,6 +172,8 @@ void print_usage() {
         << "                          12 is API/test-only in v1)\n"
         << "  --cicp P/T/M            CICP primaries/transfer/matrix, e.g. 9/16/9 for BT.2020/PQ\n"
         << "                          (default: 1/1/1)\n"
+        << "  --max-cll N             MaxCLL in nits, 0..65535 (default: 0 = unspecified)\n"
+        << "  --max-fall N            MaxFALL in nits, 0..65535 (default: 0 = unspecified)\n"
         << "  --tile-size N           Explicit tile size in pixels (64..1024, power of two)\n"
         << "  --threads N             Thread count (0 = auto)\n"
         << "  --yuv444                Use 4:4:4 chroma base (adaptive still applies)\n"
@@ -311,6 +331,28 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             cicp_flag = *cicp;
+        } else if (arg == "--max-cll") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --max-cll requires a value\n";
+                return 1;
+            }
+            auto max_cll = parse_max_luminance(argv[++i], "--max-cll");
+            if (!max_cll) {
+                std::cerr << "Error: " << max_cll.error().message << '\n';
+                return 1;
+            }
+            config.max_cll = *max_cll;
+        } else if (arg == "--max-fall") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --max-fall requires a value\n";
+                return 1;
+            }
+            auto max_fall = parse_max_luminance(argv[++i], "--max-fall");
+            if (!max_fall) {
+                std::cerr << "Error: " << max_fall.error().message << '\n';
+                return 1;
+            }
+            config.max_fall = *max_fall;
         } else if (arg == "--tile-size") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --tile-size requires a value\n";
