@@ -254,6 +254,60 @@ std::vector<uint8_t> make_ppm16(uint32_t w, uint32_t h, uint16_t maxval,
     return out;
 }
 
+// Independent CTA-861 expectation, computed straight from the source
+// pixels with pq::eotf: per pixel max(R,G,B) in linear light (nits);
+// MaxCLL is the max, MaxFALL the mean. Tolerance is ±1 nit for
+// rounding; the absolute cases in the tests below (all-white,
+// all-black) are exact.
+std::pair<uint16_t, uint16_t> expected_pq_max_luminance(const Image& img) {
+    const uint32_t max_code = (1u << static_cast<unsigned>(img.bit_depth())) - 1u;
+    const bool is_16bit = img.bit_depth() != BitDepth::Bits8;
+    const size_t bpp = img.bytes_per_pixel();
+    const uint8_t* px = img.pixels().data();
+    const size_t count = static_cast<size_t>(img.width()) * img.height();
+    double peak = 0.0;
+    double sum = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        double m = 0.0;
+        if (is_16bit) {
+            const uint16_t* p = reinterpret_cast<const uint16_t*>(px + i * bpp);
+            for (int c = 0; c < 3; ++c) {
+                m = std::max(m, pq::eotf(static_cast<double>(p[c]) / max_code));
+            }
+        } else {
+            const uint8_t* p = px + i * bpp;
+            for (int c = 0; c < 3; ++c) {
+                m = std::max(m, pq::eotf(static_cast<double>(p[c]) / max_code));
+            }
+        }
+        peak = std::max(peak, m);
+        sum += m;
+    }
+    return {static_cast<uint16_t>(std::lround(peak)),
+            static_cast<uint16_t>(std::lround(sum / static_cast<double>(count)))};
+}
+
+// Encode and read back the FHDR MaxCLL/MaxFALL.
+std::pair<uint16_t, uint16_t> encode_and_read_max(const Image& img, BitDepth bd, CICP cicp,
+                                                  uint16_t cll, uint16_t fall,
+                                                  bool lossless = false) {
+    EncoderConfig cfg;
+    cfg.quality = 75;
+    cfg.lossless = lossless;
+    cfg.bit_depth = bd;
+    cfg.cicp = cicp;
+    cfg.max_cll = cll;
+    cfg.max_fall = fall;
+    auto enc = encode(img, cfg);
+    EXPECT_TRUE(enc.has_value()) << (enc ? "" : enc.error().message);
+    if (!enc) return {0, 0};
+    auto file = parse_container(*enc);
+    EXPECT_TRUE(file.has_value()) << (file ? "" : file.error().message);
+    if (!file) return {0, 0};
+    EXPECT_TRUE(decode(*enc).has_value()) << "round-trip must decode";
+    return {file->header.max_cll, file->header.max_fall};
+}
+
 }  // namespace
 
 // H3 repro (audit): 128x128 gradient+texture, BT.2020/PQ, q75, was
@@ -505,6 +559,103 @@ TEST(HdrTest, EncoderRejectsUnknownPrimaries) {
             << "primaries=" << static_cast<int>(primaries)
             << (enc ? "" : enc.error().message);
         EXPECT_TRUE(decode(*enc).has_value()) << "round-trip must decode";
+    }
+}
+
+// Auto-compute MaxCLL/MaxFALL (#hdr): PQ only, and only for fields the
+// caller left unset (0). CTA-861: per pixel max(R,G,B) in linear light
+// via the PQ EOTF; MaxCLL is the max, MaxFALL the mean over the frame.
+TEST(HdrTest, AutoMaxCllMaxFallPq) {
+    // All-white 10-bit PQ: every code is 1023 -> 10000 nits, exact.
+    {
+        Image img(4, 4, BitDepth::Bits10, false);
+        auto px = px16(img);
+        std::fill(px, px + 4 * 4 * 3, static_cast<uint16_t>(1023));
+        const auto got = encode_and_read_max(img, BitDepth::Bits10, CICP{9, 16, 9, true}, 0, 0);
+        EXPECT_EQ(got.first, 10000);
+        EXPECT_EQ(got.second, 10000);
+    }
+    // All-black (a fresh Image is zeroed): 0/0.
+    {
+        Image img(4, 4, BitDepth::Bits10, false);
+        const auto got = encode_and_read_max(img, BitDepth::Bits10, CICP{9, 16, 9, true}, 0, 0);
+        EXPECT_EQ(got.first, 0);
+        EXPECT_EQ(got.second, 0);
+    }
+    // 10-bit gradient: matches the independent expectation within ±1 nit.
+    {
+        const Image img10 = make_gradient_texture(16, 16, BitDepth::Bits10);
+        const auto want = expected_pq_max_luminance(img10);
+        const auto got = encode_and_read_max(img10, BitDepth::Bits10, CICP{9, 16, 9, true}, 0, 0);
+        EXPECT_NEAR(got.first, want.first, 1);
+        EXPECT_NEAR(got.second, want.second, 1);
+        // The gradient reaches full code in R, so MaxCLL is 10000.
+        EXPECT_EQ(got.first, 10000);
+    }
+    // 8-bit PQ: same definition, normalized by 255.
+    {
+        const Image img8 = scale_down_4x(make_gradient_texture(16, 16, BitDepth::Bits10));
+        const auto want = expected_pq_max_luminance(img8);
+        const auto got = encode_and_read_max(img8, BitDepth::Bits8, CICP{9, 16, 9, true}, 0, 0);
+        EXPECT_NEAR(got.first, want.first, 1);
+        EXPECT_NEAR(got.second, want.second, 1);
+    }
+    // Lossless 8-bit PQ: the FHDR is written before the lossless branch,
+    // so auto-compute applies there too.
+    {
+        const Image img8 = scale_down_4x(make_gradient_texture(16, 16, BitDepth::Bits10));
+        const auto want = expected_pq_max_luminance(img8);
+        const auto got = encode_and_read_max(img8, BitDepth::Bits8, CICP{9, 16, 9, true}, 0, 0, true);
+        EXPECT_NEAR(got.first, want.first, 1);
+        EXPECT_NEAR(got.second, want.second, 1);
+    }
+}
+
+// A manual value always wins over auto-compute, per field.
+TEST(HdrTest, ManualMaxCllMaxFallWinsOverAuto) {
+    const Image img10 = make_gradient_texture(16, 16, BitDepth::Bits10);
+    const auto want = expected_pq_max_luminance(img10);
+    // Both manual.
+    {
+        const auto got = encode_and_read_max(img10, BitDepth::Bits10, CICP{9, 16, 9, true}, 1000, 400);
+        EXPECT_EQ(got.first, 1000);
+        EXPECT_EQ(got.second, 400);
+    }
+    // Only MaxCLL manual: MaxFALL still auto-computed.
+    {
+        const auto got = encode_and_read_max(img10, BitDepth::Bits10, CICP{9, 16, 9, true}, 1000, 0);
+        EXPECT_EQ(got.first, 1000);
+        EXPECT_NEAR(got.second, want.second, 1);
+    }
+    // Only MaxFALL manual: MaxCLL still auto-computed.
+    {
+        const auto got = encode_and_read_max(img10, BitDepth::Bits10, CICP{9, 16, 9, true}, 0, 400);
+        EXPECT_NEAR(got.first, want.first, 1);
+        EXPECT_EQ(got.second, 400);
+    }
+}
+
+// Other transfers never auto-compute: HLG and SDR stay 0/0 unless set.
+TEST(HdrTest, NoAutoMaxCllMaxFallForNonPq) {
+    const Image img10 = make_gradient_texture(16, 16, BitDepth::Bits10);
+    const Image img8 = scale_down_4x(img10);
+    // BT.709 10-bit.
+    {
+        const auto got = encode_and_read_max(img10, BitDepth::Bits10, CICP{1, 1, 1, true}, 0, 0);
+        EXPECT_EQ(got.first, 0);
+        EXPECT_EQ(got.second, 0);
+    }
+    // HLG 10-bit: relative, needs a peak assumption — out of scope.
+    {
+        const auto got = encode_and_read_max(img10, BitDepth::Bits10, CICP{9, 18, 9, true}, 0, 0);
+        EXPECT_EQ(got.first, 0);
+        EXPECT_EQ(got.second, 0);
+    }
+    // sRGB 8-bit.
+    {
+        const auto got = encode_and_read_max(img8, BitDepth::Bits8, CICP{1, 13, 1, true}, 0, 0);
+        EXPECT_EQ(got.first, 0);
+        EXPECT_EQ(got.second, 0);
     }
 }
 

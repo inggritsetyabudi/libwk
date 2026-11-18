@@ -21,6 +21,8 @@
 #include "lossy_tile_encode.h"
 #include "threading.h"
 #include <wk/wk.h>
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 
 namespace wk {
@@ -48,6 +50,49 @@ static Result<uint8_t> resolve_tile_size_log2(const EncoderConfig& config) {
     }
 
     return static_cast<uint8_t>(10);
+}
+
+// Auto-compute MaxCLL/MaxFALL from the source RGB (#hdr): PQ only, and
+// only for fields the caller left unset (0). CTA-861: per pixel the max
+// of R/G/B in linear light (PQ EOTF, nits); MaxCLL is the max, MaxFALL
+// the mean over the frame. Manual values always win (see encode_impl).
+// Alpha is ignored: luminance comes from R/G/B only.
+struct PqMaxLuminance {
+    uint16_t max_cll;
+    uint16_t max_fall;
+};
+
+static PqMaxLuminance compute_pq_max_luminance(const Image& image) {
+    const uint32_t max_code = (1u << static_cast<unsigned>(image.bit_depth())) - 1u;
+    // One EOTF evaluation per code value, not per pixel: the table is
+    // exact (same input gives the same output) and keeps the scan cheap
+    // on large images.
+    std::vector<double> lut(max_code + 1);
+    for (uint32_t code = 0; code <= max_code; ++code) {
+        lut[code] = apply_eotf(static_cast<double>(code) / static_cast<double>(max_code), 16);
+    }
+    const bool is_16bit = image.bit_depth() != BitDepth::Bits8;
+    const size_t bpp = image.bytes_per_pixel();
+    const uint8_t* px = image.pixels().data();
+    const size_t count = static_cast<size_t>(image.width()) * image.height();
+    double peak = 0.0;
+    double sum = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        double m = 0.0;
+        if (is_16bit) {
+            const uint16_t* p = reinterpret_cast<const uint16_t*>(px + i * bpp);
+            m = std::max(lut[p[0]], std::max(lut[p[1]], lut[p[2]]));
+        } else {
+            const uint8_t* p = px + i * bpp;
+            m = std::max(lut[p[0]], std::max(lut[p[1]], lut[p[2]]));
+        }
+        peak = std::max(peak, m);
+        sum += m;
+    }
+    const auto to_nits = [](double v) {
+        return static_cast<uint16_t>(std::clamp(std::lround(v), 0L, 65535L));
+    };
+    return {to_nits(peak), to_nits(sum / static_cast<double>(count))};
 }
 
 
@@ -110,6 +155,16 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
         return std::unexpected(Error{ErrorCode::InvalidParameter, "unknown CICP primaries (no H.273 Table 2 entry)"});
     }
 
+    // Auto-compute MaxCLL/MaxFALL (#hdr): PQ only, and only for fields
+    // left unset (0). Manual values always win, per field.
+    uint16_t max_cll = config.max_cll;
+    uint16_t max_fall = config.max_fall;
+    if (config.cicp.transfer == 16 && (max_cll == 0 || max_fall == 0)) {
+        const PqMaxLuminance computed = compute_pq_max_luminance(image);
+        if (max_cll == 0) max_cll = computed.max_cll;
+        if (max_fall == 0) max_fall = computed.max_fall;
+    }
+
     auto tile_size_log2 = resolve_tile_size_log2(config);
     if (!tile_size_log2) {
         return std::unexpected(tile_size_log2.error());
@@ -124,8 +179,8 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
     fhdr.cicp_primaries = config.cicp.primaries;
     fhdr.cicp_transfer = config.cicp.transfer;
     fhdr.cicp_matrix = config.cicp.matrix;
-    fhdr.max_cll = config.max_cll;
-    fhdr.max_fall = config.max_fall;
+    fhdr.max_cll = max_cll;
+    fhdr.max_fall = max_fall;
     fhdr.tile_size_log2 = *tile_size_log2;
 
     fhdr.flags = 0;
