@@ -196,9 +196,39 @@
                 wasm._free(outH);
                 wasm._free(outBpp);
                 wasm._free(outPx);
+
+                // FHDR facts for the display path: the real bit depth
+                // and CICP transfer (PQ/HLG/SDR), plus MaxCLL/MaxFALL
+                // for the info panel. wk_wasm_get_info writes 15
+                // uint32s (see web/wk_wasm.cpp for the layout). The
+                // decoder alone cannot tell us the transfer, and
+                // guessing it from bpp would tone-map SDR as HDR.
+                // get_info re-reads the same buffer, so it succeeds
+                // whenever decode did; if it does not, fail loudly
+                // instead of showing a wrong picture.
+                var infoPtr = wasm._malloc(60);
+                var infoErr = wasm._wk_wasm_get_info(dataPtr, buf.length, infoPtr);
+                var info = null;
+                if (infoErr === 0) {
+                    var iv = heapU32();
+                    var base = infoPtr >> 2;
+                    info = {
+                        width: iv[base],
+                        height: iv[base + 1],
+                        bitDepth: iv[base + 2],
+                        primaries: iv[base + 3],
+                        transfer: iv[base + 4],
+                        matrix: iv[base + 5],
+                        maxCll: iv[base + 8],
+                        maxFall: iv[base + 9],
+                        isHdr: iv[base + 13]
+                    };
+                }
+                wasm._free(infoPtr);
                 wasm._wk_wasm_free(dataPtr);
 
                 if (err !== 0) throw new Error("Decode error (code " + err + ")");
+                if (!info) throw new Error("Could not read file info (code " + infoErr + ")");
 
                 canvas.width = w;
                 canvas.height = h;
@@ -220,16 +250,34 @@
                         imgData.data[d + 2] = pixelsCopy[s + 2];
                         imgData.data[d + 3] = 255;
                     }
+                } else if (bpp === 6 || bpp === 8) {
+                    // 16-bit samples, little-endian (the layout
+                    // wk_decode writes). Same Reinhard geometric-mean
+                    // tone-map as native wkview (tools/tonemap.h),
+                    // so the web viewer shows the same picture;
+                    // 16-bit SDR keeps the linear downscale.
+                    var channels = bpp === 8 ? 4 : 3;
+                    var rgba = WkDisplay.convert16ToRGBA(
+                        pixelsCopy, w, h, channels, info.bitDepth, info.transfer
+                    );
+                    imgData.data.set(rgba);
+                } else {
+                    throw new Error("Unsupported pixel format (bpp " + bpp + ")");
                 }
 
                 ctx.putImageData(imgData, 0, 0);
                 drawHistogram(imgData);
 
+                var channelsLabel = bpp === 4 ? "RGBA" : bpp === 3 ? "RGB" :
+                    bpp === 8 ? "RGBA 16-bit" : "RGB 16-bit";
                 infoGrid.innerHTML =
                     infoRow("Filename", file.name) +
                     infoRow("Dimensions", w + " x " + h) +
-                    infoRow("Channels", bpp === 4 ? "RGBA" : "RGB") +
-                    infoRow("Bit Depth", (bpp * 8) + " bpp") +
+                    infoRow("Channels", channelsLabel) +
+                    infoRow("Bit Depth", info.bitDepth + " bit") +
+                    infoRow("Transfer", WkDisplay.transferName(info.transfer)) +
+                    infoRow("MaxCLL", info.maxCll ? info.maxCll + " nits" : "unspecified") +
+                    infoRow("MaxFALL", info.maxFall ? info.maxFall + " nits" : "unspecified") +
                     infoRow("File Size", formatBytes(file.size));
 
                 encodeInfo.classList.add("hidden");

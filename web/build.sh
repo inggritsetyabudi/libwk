@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-EXPORTED_FUNCTIONS="['_wk_wasm_alloc','_wk_wasm_free','_wk_wasm_decode','_wk_wasm_encode','_wk_wasm_version','_malloc','_free']"
+EXPORTED_FUNCTIONS="['_wk_wasm_alloc','_wk_wasm_free','_wk_wasm_decode','_wk_wasm_encode','_wk_wasm_version','_wk_wasm_get_info','_malloc','_free']"
 EXPORTED_RUNTIME="['wasmMemory']"
 
 # Source list: every src/core/*.cpp plus the stb implementation
