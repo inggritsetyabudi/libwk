@@ -19,6 +19,7 @@ $exported_functions = @(
     '_wk_wasm_decode',
     '_wk_wasm_encode',
     '_wk_wasm_version',
+    '_wk_wasm_get_info',
     '_malloc',
     '_free'
 ) -join ','

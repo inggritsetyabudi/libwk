@@ -54,6 +54,45 @@ int wk_wasm_decode(
     return (int)err;
 }
 
+// FHDR facts for the JS display path (web/app.js): bit depth + CICP
+// + MaxCLL/MaxFALL, so JS can pick the right EOTF and label the
+// panel with the real bit depth instead of guessing from bpp.
+// Writes 15 uint32s into the caller-allocated buffer (60 bytes):
+//   [0] width, [1] height, [2] bit_depth, [3] cicp_primaries,
+//   [4] cicp_transfer, [5] cicp_matrix, [6] flags,
+//   [7] tile_size_log2, [8] max_cll, [9] max_fall,
+//   [10] has_alpha, [11] is_lossless, [12] is_animated,
+//   [13] is_hdr, [14] frame_count.
+// Fields are written one by one (not a struct copy) so no packing
+// assumption crosses the wasm/JS boundary. Returns wk_error_t.
+EMSCRIPTEN_KEEPALIVE
+int wk_wasm_get_info(
+    const uint8_t* data, size_t size,
+    uint32_t* out_info
+) {
+    wk_image_info_t info;
+    wk_error_t err = wk_get_info(data, size, &info);
+    if (err != WK_OK) {
+        return (int)err;
+    }
+    out_info[0] = info.width;
+    out_info[1] = info.height;
+    out_info[2] = info.bit_depth;
+    out_info[3] = info.cicp_primaries;
+    out_info[4] = info.cicp_transfer;
+    out_info[5] = info.cicp_matrix;
+    out_info[6] = info.flags;
+    out_info[7] = info.tile_size_log2;
+    out_info[8] = info.max_cll;
+    out_info[9] = info.max_fall;
+    out_info[10] = info.has_alpha;
+    out_info[11] = info.is_lossless;
+    out_info[12] = info.is_animated;
+    out_info[13] = info.is_hdr;
+    out_info[14] = info.frame_count;
+    return (int)WK_OK;
+}
+
 EMSCRIPTEN_KEEPALIVE
 int wk_wasm_encode(
     const uint8_t* pixels, uint32_t width, uint32_t height,
