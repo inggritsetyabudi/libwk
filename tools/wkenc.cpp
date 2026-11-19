@@ -164,14 +164,15 @@ wk::Result<std::vector<uint8_t>> apply_exif_metadata(std::span<const uint8_t> en
 
 void print_usage() {
     std::cerr
-        << "Usage: wkenc [options] <input.{jpg,jpeg,png,ppm,webp}> [output.wk]\n\n"
+        << "Usage: wkenc [options] <input.{jpg,jpeg,png,ppm,webp,avif}> [output.wk]\n\n"
         << "Options:\n"
         << "  --quality N             Lossy quality 0..100 (default: 75)\n"
         << "  --lossless              Encode losslessly\n"
         << "  --bit-depth N           Encode bit depth: 8 or 10 (default: input image's bit depth;\n"
         << "                          12 is API/test-only in v1)\n"
         << "  --cicp P/T/M            CICP primaries/transfer/matrix, e.g. 9/16/9 for BT.2020/PQ\n"
-        << "                          (default: 1/1/1)\n"
+        << "                          (default: the input file's embedded CICP when present,\n"
+        << "                          e.g. AVIF, else 1/1/1)\n"
         << "  --max-cll N             MaxCLL in nits, 0..65535 (default: 0 = unspecified)\n"
         << "  --max-fall N            MaxFALL in nits, 0..65535 (default: 0 = unspecified)\n"
         << "  --tile-size N           Explicit tile size in pixels (64..1024, power of two)\n"
@@ -499,6 +500,12 @@ int main(int argc, char* argv[]) {
     }
     if (cicp_flag.has_value()) {
         config.cicp = *cicp_flag;
+    } else {
+        // The input file's embedded CICP (AVIF) wins over the 1/1/1
+        // default; formats without embedded CICP (PPM, JPEG, ...) carry
+        // the default, so their behaviour is unchanged. An explicit
+        // --cicp flag always wins over the embedded value.
+        config.cicp = image->info().cicp;
     }
     wk::tool::log_debug(std::string("encoding: ") + (config.lossless ? "lossless" : "lossy") +
                         (config.lossless ? "" : " q" + std::to_string(static_cast<int>(config.quality))) +

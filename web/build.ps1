@@ -84,11 +84,119 @@ foreach ($src in $webpSources) {
   $webpObjs += $obj
 }
 
+# Vendored libavif 1.4.2 decode-only C sources (see src/avif/README.md):
+# compiled with emcc (C), not em++ — em++ would compile them as C++
+# and libavif is C. AVIF_CODEC_DAV1D registers the dav1d decoder.
+# Listed explicitly, keep in sync with src/avif/libavif/src/.
+$avifSources = @(
+  '../src/avif/libavif/src/alpha.c',,
+  '../src/avif/libavif/src/avif.c',,
+  '../src/avif/libavif/src/codec_dav1d.c',,
+  '../src/avif/libavif/src/colr.c',,
+  '../src/avif/libavif/src/colrconvert.c',,
+  '../src/avif/libavif/src/diag.c',,
+  '../src/avif/libavif/src/exif.c',,
+  '../src/avif/libavif/src/gainmap.c',,
+  '../src/avif/libavif/src/io.c',,
+  '../src/avif/libavif/src/mem.c',,
+  '../src/avif/libavif/src/obu.c',,
+  '../src/avif/libavif/src/properties.c',,
+  '../src/avif/libavif/src/rawdata.c',,
+  '../src/avif/libavif/src/read.c',,
+  '../src/avif/libavif/src/reformat.c',,
+  '../src/avif/libavif/src/reformat_libsharpyuv.c',,
+  '../src/avif/libavif/src/reformat_libyuv.c',,
+  '../src/avif/libavif/src/sampletransform.c',,
+  '../src/avif/libavif/src/scale.c',,
+  '../src/avif/libavif/src/stream.c',,
+  '../src/avif/libavif/src/utils.c',,
+  '../src/avif/libavif/src/write.c',
+)
+$avifObjDir = New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ("wk-avif-" + [guid]::NewGuid().ToString('N'))) -Force
+$avifObjs = @()
+foreach ($src in $avifSources) {
+  $obj = Join-Path $avifObjDir.FullName ((Split-Path (Split-Path $src -Parent) -Leaf) + '_' + (Split-Path $src -LeafBase) + '.o')
+  emcc -I../src/avif/libavif/include -I../src/avif/libavif/third_party/libyuv/include -I../src/avif/dav1d/include -DAVIF_CODEC_DAV1D -std=c11 -O3 -c $src -o $obj
+  if ($LASTEXITCODE -ne 0) { throw "emcc failed for $src" }
+  $avifObjs += $obj
+}
+
+# Vendored dav1d 1.5.5 decode-only C sources (see src/avif/README.md):
+# C-only build (no asm; nasm is unavailable), same defines as the
+# meson build. The vendored config.h carries a __EMSCRIPTEN__
+# override that turns the x86 arch flags off for wasm.
+# The 13 *_tmpl.c files are compiled TWICE, once per bitdepth
+# (-DBITDEPTH=8 and -DBITDEPTH=16) — meson does the same
+# (libdav1d_bitdepth_8/16). Listed explicitly, keep in sync with
+# src/avif/dav1d/src/.
+$dav1dSources = @(
+  '../src/avif/dav1d/src/cdf.c',,
+  '../src/avif/dav1d/src/cpu.c',,
+  '../src/avif/dav1d/src/ctx.c',,
+  '../src/avif/dav1d/src/data.c',,
+  '../src/avif/dav1d/src/decode.c',,
+  '../src/avif/dav1d/src/dequant_tables.c',,
+  '../src/avif/dav1d/src/getbits.c',,
+  '../src/avif/dav1d/src/intra_edge.c',,
+  '../src/avif/dav1d/src/itx_1d.c',,
+  '../src/avif/dav1d/src/lf_mask.c',,
+  '../src/avif/dav1d/src/lib.c',,
+  '../src/avif/dav1d/src/log.c',,
+  '../src/avif/dav1d/src/mem.c',,
+  '../src/avif/dav1d/src/msac.c',,
+  '../src/avif/dav1d/src/obu.c',,
+  '../src/avif/dav1d/src/pal.c',,
+  '../src/avif/dav1d/src/picture.c',,
+  '../src/avif/dav1d/src/qm.c',,
+  '../src/avif/dav1d/src/ref.c',,
+  '../src/avif/dav1d/src/refmvs.c',,
+  '../src/avif/dav1d/src/scan.c',,
+  '../src/avif/dav1d/src/tables.c',,
+  '../src/avif/dav1d/src/thread_task.c',,
+  '../src/avif/dav1d/src/warpmv.c',,
+  '../src/avif/dav1d/src/wedge.c',
+)
+$dav1dObjDir = New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ("wk-dav1d-" + [guid]::NewGuid().ToString('N'))) -Force
+$dav1dObjs = @()
+foreach ($src in $dav1dSources) {
+  $obj = Join-Path $dav1dObjDir.FullName ((Split-Path (Split-Path $src -Parent) -Leaf) + '_' + (Split-Path $src -LeafBase) + '.o')
+  emcc -I../src/avif/dav1d -I../src/avif/dav1d/include -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -ffast-math -O3 -c $src -o $obj
+  if ($LASTEXITCODE -ne 0) { throw "emcc failed for $src" }
+  $dav1dObjs += $obj
+}
+$dav1dTmplSources = @(
+  '../src/avif/dav1d/src/cdef_apply_tmpl.c',,
+  '../src/avif/dav1d/src/cdef_tmpl.c',,
+  '../src/avif/dav1d/src/fg_apply_tmpl.c',,
+  '../src/avif/dav1d/src/filmgrain_tmpl.c',,
+  '../src/avif/dav1d/src/ipred_prepare_tmpl.c',,
+  '../src/avif/dav1d/src/ipred_tmpl.c',,
+  '../src/avif/dav1d/src/itx_tmpl.c',,
+  '../src/avif/dav1d/src/lf_apply_tmpl.c',,
+  '../src/avif/dav1d/src/loopfilter_tmpl.c',,
+  '../src/avif/dav1d/src/looprestoration_tmpl.c',,
+  '../src/avif/dav1d/src/lr_apply_tmpl.c',,
+  '../src/avif/dav1d/src/mc_tmpl.c',,
+  '../src/avif/dav1d/src/recon_tmpl.c',
+)
+foreach ($bitdepth in 8, 16) {
+  foreach ($src in $dav1dTmplSources) {
+    $obj = Join-Path $dav1dObjDir.FullName ((Split-Path (Split-Path $src -Parent) -Leaf) + '_' + (Split-Path $src -LeafBase) + '_' + $bitdepth + '.o')
+    emcc -I../src/avif/dav1d -I../src/avif/dav1d/include -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -DBITDEPTH=$bitdepth -ffast-math -O3 -c $src -o $obj
+    if ($LASTEXITCODE -ne 0) { throw "emcc failed for $src" }
+    $dav1dObjs += $obj
+  }
+}
+
 em++ `
   -I../include `
   -I../src `
   -I../src/webp `
+  -I../src/avif/libavif/include `
+  -I../src/avif/dav1d `
+  -I../src/avif/dav1d/include `
   ../src/core/adaptive_chroma.cpp `
+  ../src/core/avif_decode.cpp `
   ../src/core/cclm.cpp `
   ../src/core/coeff_presence_stream.cpp `
   ../src/core/coeff_sign_stream.cpp `
@@ -119,6 +227,9 @@ em++ `
   ../src/core/webp_decode.cpp `
   ../src/core/wkmeta.cpp `
   $webpObjs `
+  $avifObjs `
+  $libyuvObjs `
+  $dav1dObjs `
   wk_wasm.cpp `
   -o wk.js `
   -s WASM=1 `
@@ -131,3 +242,6 @@ em++ `
   -s EXPORT_NAME="WkModule"
 
 Remove-Item -Recurse -Force $webpObjDir
+Remove-Item -Recurse -Force $avifObjDir
+Remove-Item -Recurse -Force $libyuvObjDir
+Remove-Item -Recurse -Force $dav1dObjDir

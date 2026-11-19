@@ -136,6 +136,10 @@ namespace wk
         [[nodiscard]] bool has_alpha() const { return info_.has_alpha; }
         [[nodiscard]] const ImageInfo &info() const { return info_; }
 
+        // Set the embedded CICP (used by decoders for formats that
+        // carry colour info, e.g. AVIF); the default is 1/1/1.
+        void set_cicp(CICP cicp) { info_.cicp = cicp; }
+
         [[nodiscard]] std::span<uint8_t> pixels() { return pixels_; }
         [[nodiscard]] std::span<const uint8_t> pixels() const { return pixels_; }
 

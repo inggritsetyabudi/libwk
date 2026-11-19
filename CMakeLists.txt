@@ -40,16 +40,73 @@ endif()
 
 # Layout: src/core/ is the portable codec, src/arch/<target>/
 # holds per-target code (generic fallback + wasm today; x86_64,
-# aarch64 and arm when they gain real content), src/stb/ and src/webp/
-# are vendored third-party (stb image I/O, libwebp decode-only). The
-# split is explicit here: core is always compiled, arch is selected by
-# target, nothing relies on a recursive glob.
+# aarch64 and arm when they gain real content), src/stb/, src/webp/
+# and src/avif/ are vendored third-party (stb image I/O, libwebp
+# decode-only, libavif + dav1d decode-only). The split is explicit
+# here: core is always compiled, arch is selected by target, nothing
+# relies on a recursive glob.
 file(GLOB WK_CORE_SOURCES CONFIGURE_DEPENDS src/core/*.cpp)
 file(GLOB WK_STB_SOURCES CONFIGURE_DEPENDS src/stb/*.cpp)
 # libwebp 1.3.2 decode-only, vendored (see src/webp/README.md). The
 # vendored sources include each other as "src/...", so src/webp is an
 # include dir for the whole target (below).
 file(GLOB WK_WEBP_SOURCES CONFIGURE_DEPENDS src/webp/src/dec/*.c src/webp/src/dsp/*.c src/webp/src/utils/*.c)
+# libavif 1.4.2 + dav1d 1.5.5 decode-only, vendored (see
+# src/avif/README.md). libavif sources include each other as
+# "avif/...", dav1d sources as "src/...", "common/..." and
+# "dav1d/..."; the include dirs below make all of those resolve.
+# reformat_libyuv.c and reformat_libsharpyuv.c are compiled but
+# internally stubbed (libyuv/sharpyuv off, libavif's own conversion).
+# The bundled libyuv subset (third_party/libyuv) is compiled too:
+# libavif's own CMake does the same when AVIF_LIBYUV is off — it is
+# only used for image scaling (avifImageScale), never for the
+# YUV<->RGB conversion.
+file(GLOB WK_AVIF_SOURCES CONFIGURE_DEPENDS src/avif/libavif/src/*.c)
+file(GLOB WK_LIBYUV_SOURCES CONFIGURE_DEPENDS src/avif/libavif/third_party/libyuv/source/*.c)
+# dav1d splits its sources the way meson does: 25 plain .c files
+# plus 13 *_tmpl.c files that are compiled TWICE — once per
+# bitdepth (8 and 16), with -DBITDEPTH=8/16. The templates use the
+# BITDEPTH macro to stamp out the 8-bit and 16-bit DSP variants, so
+# compiling them once (without the define) fails. The two object
+# libraries below mirror meson's libdav1d_bitdepth_8/16.
+file(GLOB WK_DAV1D_SOURCES CONFIGURE_DEPENDS
+    src/avif/dav1d/src/cdf.c src/avif/dav1d/src/cpu.c src/avif/dav1d/src/ctx.c
+    src/avif/dav1d/src/data.c src/avif/dav1d/src/decode.c src/avif/dav1d/src/dequant_tables.c
+    src/avif/dav1d/src/getbits.c src/avif/dav1d/src/intra_edge.c src/avif/dav1d/src/itx_1d.c
+    src/avif/dav1d/src/lf_mask.c src/avif/dav1d/src/lib.c src/avif/dav1d/src/log.c
+    src/avif/dav1d/src/mem.c src/avif/dav1d/src/msac.c src/avif/dav1d/src/obu.c
+    src/avif/dav1d/src/pal.c src/avif/dav1d/src/picture.c src/avif/dav1d/src/qm.c
+    src/avif/dav1d/src/ref.c src/avif/dav1d/src/refmvs.c src/avif/dav1d/src/scan.c
+    src/avif/dav1d/src/tables.c src/avif/dav1d/src/thread_task.c src/avif/dav1d/src/warpmv.c
+    src/avif/dav1d/src/wedge.c)
+file(GLOB WK_DAV1D_TMPL_SOURCES CONFIGURE_DEPENDS
+    src/avif/dav1d/src/cdef_apply_tmpl.c src/avif/dav1d/src/cdef_tmpl.c
+    src/avif/dav1d/src/fg_apply_tmpl.c src/avif/dav1d/src/filmgrain_tmpl.c
+    src/avif/dav1d/src/ipred_prepare_tmpl.c src/avif/dav1d/src/ipred_tmpl.c
+    src/avif/dav1d/src/itx_tmpl.c src/avif/dav1d/src/lf_apply_tmpl.c
+    src/avif/dav1d/src/loopfilter_tmpl.c src/avif/dav1d/src/looprestoration_tmpl.c
+    src/avif/dav1d/src/lr_apply_tmpl.c src/avif/dav1d/src/mc_tmpl.c
+    src/avif/dav1d/src/recon_tmpl.c)
+foreach(_bitdepth 8 16)
+    add_library(dav1d_bitdepth_${_bitdepth} OBJECT ${WK_DAV1D_TMPL_SOURCES})
+    target_compile_definitions(dav1d_bitdepth_${_bitdepth} PRIVATE
+        BITDEPTH=${_bitdepth} _FILE_OFFSET_BITS=64 _GNU_SOURCE)
+    target_compile_options(dav1d_bitdepth_${_bitdepth} PRIVATE -ffast-math)
+    target_include_directories(dav1d_bitdepth_${_bitdepth} PRIVATE
+        src/avif/dav1d src/avif/dav1d/include)
+endforeach()
+# The dav1d decoder registers in libavif only when AVIF_CODEC_DAV1D
+# is defined; the dav1d sources need the same defines as the meson
+# build (_FILE_OFFSET_BITS=64, _GNU_SOURCE). libavif needs C11
+# (io.c uses static_assert); the repo default stays C99, so the
+# standard is raised for the libavif sources only — as a compile
+# option, which lands after the target-wide -std=gnu99 and wins.
+set_source_files_properties(${WK_AVIF_SOURCES} PROPERTIES
+    COMPILE_DEFINITIONS AVIF_CODEC_DAV1D
+    COMPILE_OPTIONS "-std=c11")
+set_source_files_properties(${WK_DAV1D_SOURCES} PROPERTIES
+    COMPILE_DEFINITIONS "_FILE_OFFSET_BITS=64;_GNU_SOURCE"
+    COMPILE_OPTIONS "-ffast-math")
 
 if(EMSCRIPTEN)
     set(WK_ARCH_DIR wasm)
@@ -70,9 +127,9 @@ if(NOT WK_ARCH_DIR STREQUAL "generic")
     list(APPEND WK_ARCH_SOURCES ${WK_ARCH_TARGET_SOURCES})
 endif()
 
-add_library(wk STATIC ${WK_CORE_SOURCES} ${WK_STB_SOURCES} ${WK_WEBP_SOURCES} ${WK_ARCH_SOURCES})
+add_library(wk STATIC ${WK_CORE_SOURCES} ${WK_STB_SOURCES} ${WK_WEBP_SOURCES} ${WK_AVIF_SOURCES} ${WK_LIBYUV_SOURCES} ${WK_DAV1D_SOURCES} $<TARGET_OBJECTS:dav1d_bitdepth_8> $<TARGET_OBJECTS:dav1d_bitdepth_16> ${WK_ARCH_SOURCES})
 target_include_directories(wk PUBLIC include)
-target_include_directories(wk PRIVATE src src/webp)
+target_include_directories(wk PRIVATE src src/webp src/avif/libavif/include src/avif/libavif/third_party/libyuv/include src/avif/dav1d src/avif/dav1d/include)
 
 add_executable(wkenc tools/wkenc.cpp)
 target_link_libraries(wkenc PRIVATE wk)
