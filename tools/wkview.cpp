@@ -14,6 +14,7 @@
 // limitations under the License.
 #include "../src/core/common.h"
 #include "../src/core/image_io.h"
+#include "tonemap.h"
 #ifdef WK_VIEWER_GUI
 #include <MiniFB.h>
 #endif
@@ -126,6 +127,9 @@ struct ViewerState {
     bool show_list = true;
     bool show_details = true;
     bool compare_requested = true;
+    // Slice 3: --linear disables HDR tone-mapping (linear 16-bit
+    // downscale, the pre-slice behaviour) for comparison.
+    bool linear_display = false;
     uint32_t list_scroll = 0;
     bool dirty = true;
     unsigned last_window_width = 0;
@@ -624,7 +628,7 @@ DisplayBuffer make_placeholder_image(uint32_t width, uint32_t height, uint32_t b
     return image;
 }
 
-DisplayBuffer rasterize(const wk::Image& image) {
+DisplayBuffer rasterize(const wk::Image& image, uint8_t cicp_transfer, bool linear_display) {
     DisplayBuffer display;
     display.width = image.width();
     display.height = image.height();
@@ -634,6 +638,7 @@ DisplayBuffer rasterize(const wk::Image& image) {
     const bool has_alpha = image.has_alpha();
 
     if (image.bit_depth() == wk::BitDepth::Bits8) {
+        // SDR 8-bit: bytes are copied directly, never tone-mapped.
         const size_t bytes_per_pixel = has_alpha ? 4u : 3u;
         for (size_t i = 0; i < display.pixels.size(); ++i) {
             const uint8_t* pixel = source.data() + i * bytes_per_pixel;
@@ -644,6 +649,44 @@ DisplayBuffer rasterize(const wk::Image& image) {
     }
 
     const size_t bytes_per_pixel = has_alpha ? 8u : 6u;
+    const uint16_t max_value =
+        static_cast<uint16_t>((1u << static_cast<unsigned>(image.bit_depth())) - 1u);
+
+    if (!linear_display && wkview::is_hdr_transfer(cicp_transfer)) {
+        // Slice 3 tone-map (viewer-only): PQ/HLG -> linear light via
+        // the EOTF -> Reinhard with a geometric-mean key value ->
+        // sRGB OETF -> 8-bit. The key value needs one pre-pass over
+        // the frame's linear luminance. Alpha stays linear, it is
+        // not light.
+        std::vector<double> luminance(display.pixels.size());
+        for (size_t i = 0; i < display.pixels.size(); ++i) {
+            const uint8_t* pixel = source.data() + i * bytes_per_pixel;
+            const double r = wkview::tonemap_linear_rel(read_u16_le(pixel + 0), max_value,
+                                                        cicp_transfer);
+            const double g = wkview::tonemap_linear_rel(read_u16_le(pixel + 2), max_value,
+                                                        cicp_transfer);
+            const double b = wkview::tonemap_linear_rel(read_u16_le(pixel + 4), max_value,
+                                                        cicp_transfer);
+            luminance[i] = wkview::tonemap_luminance(r, g, b);
+        }
+        const double key_scale =
+            wkview::tonemap_key_scale(wkview::tonemap_geometric_mean(luminance.data(),
+                                                                     luminance.size()));
+        for (size_t i = 0; i < display.pixels.size(); ++i) {
+            const uint8_t* pixel = source.data() + i * bytes_per_pixel;
+            const uint8_t r = wkview::tonemap_to_u8(read_u16_le(pixel + 0), max_value,
+                                                    cicp_transfer, key_scale);
+            const uint8_t g = wkview::tonemap_to_u8(read_u16_le(pixel + 2), max_value,
+                                                    cicp_transfer, key_scale);
+            const uint8_t b = wkview::tonemap_to_u8(read_u16_le(pixel + 4), max_value,
+                                                    cicp_transfer, key_scale);
+            const uint8_t a = has_alpha ? scale_to_u8(read_u16_le(pixel + 6), image.bit_depth())
+                                        : 255;
+            display.pixels[i] = pack_rgba(r, g, b, a);
+        }
+        return display;
+    }
+
     for (size_t i = 0; i < display.pixels.size(); ++i) {
         const uint8_t* pixel = source.data() + i * bytes_per_pixel;
         const uint8_t r = scale_to_u8(read_u16_le(pixel + 0), image.bit_depth());
@@ -1025,7 +1068,7 @@ wk::Result<std::pair<std::vector<ViewerItem>, size_t>> build_playlist(std::strin
     return std::make_pair(std::move(items), current_index);
 }
 
-ViewerDocument load_document(const ViewerItem& item) {
+ViewerDocument load_document(const ViewerItem& item, bool linear_display) {
     ViewerDocument document;
     document.wk_path = item.wk_path;
 
@@ -1072,7 +1115,10 @@ ViewerDocument load_document(const ViewerItem& item) {
     }
 
     document.info = *info;
-    document.decoded_panel.image = rasterize(*decoded);
+    // The decoded wk::Image does not carry CICP (its constructor
+    // defaults it), so the transfer comes from the FHDR header read
+    // above. No public struct changes for this.
+    document.decoded_panel.image = rasterize(*decoded, info->cicp.transfer, linear_display);
     document.decoded_panel.label = "WK: " + item.wk_path.filename().string();
     document.decoded_panel.info_lines = make_wk_info_lines(item.wk_path.generic_string(),
                                                            file_size_or_zero(item.wk_path.generic_string()),
@@ -1101,7 +1147,12 @@ ViewerDocument load_document(const ViewerItem& item) {
     }
 
     ViewerPanel source_panel;
-    source_panel.image = rasterize(*source_image);
+    // A source file carries no CICP (PPM has none; stb loaders do not
+    // set it), so its own transfer is BT.709 by default and a 16-bit
+    // source stays linear, as before. Only the decoded panel is
+    // tone-mapped, from the FHDR transfer.
+    source_panel.image = rasterize(*source_image, source_image->info().cicp.transfer,
+                                   linear_display);
     source_panel.label = "SOURCE: " + item.source_path.filename().string();
     source_panel.info_lines = make_source_info_lines(item.source_path.generic_string(),
                                                      file_size_or_zero(item.source_path.generic_string()),
@@ -1428,7 +1479,7 @@ void ensure_selection_visible(ViewerState& state) {
 }
 
 void load_current_document(ViewerState& state) {
-    state.document = load_document(state.items[state.current_index]);
+    state.document = load_document(state.items[state.current_index], state.linear_display);
     state.dirty = true;
 }
 
@@ -1891,6 +1942,7 @@ void print_usage() {
         << "  --width N             Terminal output width in cells (default: terminal width)\n"
         << "  --diff                Heatmap of decoded-vs-source difference (needs a source)\n"
         << "  --no-color            Grayscale brightness ramp instead of truecolor\n"
+        << "  --linear              Disable HDR tone-mapping (linear 16-bit downscale)\n"
         << "\nControls (window mode):\n"
         << "  Left/Right or A/D   Previous or next WK file\n"
         << "  Up/Down             Move selection in the file list\n"
@@ -1909,6 +1961,7 @@ int main(int argc, char* argv[]) {
     enum class ViewMode { Auto, Cli, Window };
     ViewMode mode = ViewMode::Auto;
     TerminalViewOptions terminal_options;
+    bool linear_display = false;
     std::vector<std::string> positional;
 
     for (int i = 1; i < argc; ++i) {
@@ -1923,6 +1976,10 @@ int main(int argc, char* argv[]) {
         }
         if (arg == "--window" || arg == "--gui") {
             mode = ViewMode::Window;
+            continue;
+        }
+        if (arg == "--linear") {
+            linear_display = true;
             continue;
         }
         if (arg == "--diff") {
@@ -1974,7 +2031,8 @@ int main(int argc, char* argv[]) {
     state.current_index = playlist->second;
     state.show_list = state.items.size() > 1;
     state.compare_requested = state.items[state.current_index].has_source;
-    state.document = load_document(state.items[state.current_index]);
+    state.linear_display = linear_display;
+    state.document = load_document(state.items[state.current_index], state.linear_display);
 
     // Smart default: a window when a display exists, otherwise the
     // terminal. --cli forces the terminal, --window forces a window.
