@@ -17,65 +17,30 @@
 EXPORTED_FUNCTIONS="['_wk_wasm_alloc','_wk_wasm_free','_wk_wasm_decode','_wk_wasm_encode','_wk_wasm_version','_wk_wasm_get_info','_malloc','_free']"
 EXPORTED_RUNTIME="['wasmMemory']"
 
-# Source list: every src/core/*.cpp plus the stb implementation
-# unit. src/arch/generic/threading.cpp is deliberately excluded:
-# under __EMSCRIPTEN__ src/core/threading.h provides the inline
-# single-threaded ThreadPool from src/arch/wasm, and the real pool in
-# generic/threading.cpp would conflict with it. Keep this list in
-# sync with src/ when modules are added.
-# em++ (not emcc): the engine is C++ and the link needs the C++
-# standard library (operator new/delete, std::string).
+# Source list: ../cmake/wk_sources.txt is the single source of truth
+# for every compilable source file. Nothing below lists a source by
+# hand; wk_sources <section> prints that section's paths, one per
+# line, relative to the repository root. The web build reads the
+# [core], [stb], [webp], [avif], [dav1d] and [dav1d_tmpl] sections.
+# It does NOT read [libyuv]: the AVIF decoder is unreachable from
+# the wasm exports, so it is dropped by DCE either way, and the
+# libyuv objects are not needed to link. It does NOT read the
+# [arch_*] sections: src/arch/generic/threading.cpp is deliberately
+# excluded — under __EMSCRIPTEN__ src/core/threading.h provides the
+# inline single-threaded ThreadPool from src/arch/wasm, and the real
+# pool in generic/threading.cpp would conflict with it.
+WK_SOURCES_FILE="../cmake/wk_sources.txt"
+wk_sources() {
+  awk -v section="[$1]" '
+    /^\[/ { current = $0 }
+    current == section && NF && $1 !~ /^#/ && $1 !~ /^\[/ { print $1 }
+  ' "${WK_SOURCES_FILE:-../cmake/wk_sources.txt}"
+}
+
 # Vendored libwebp 1.3.2 decode-only C sources (see src/webp/README.md):
 # compiled with emcc (C), not em++ — em++ would compile them as C++ and
-# libwebp is C. Listed explicitly, keep in sync with src/webp/.
-# The objects are linked by em++ below, then removed.
-WEBP_C_SOURCES="
-../src/webp/src/dec/alpha_dec.c
-../src/webp/src/dec/buffer_dec.c
-../src/webp/src/dec/frame_dec.c
-../src/webp/src/dec/io_dec.c
-../src/webp/src/dec/quant_dec.c
-../src/webp/src/dec/tree_dec.c
-../src/webp/src/dec/vp8_dec.c
-../src/webp/src/dec/vp8l_dec.c
-../src/webp/src/dec/webp_dec.c
-../src/webp/src/dsp/alpha_processing.c
-../src/webp/src/dsp/alpha_processing_neon.c
-../src/webp/src/dsp/alpha_processing_sse2.c
-../src/webp/src/dsp/alpha_processing_sse41.c
-../src/webp/src/dsp/cpu.c
-../src/webp/src/dsp/dec.c
-../src/webp/src/dsp/dec_clip_tables.c
-../src/webp/src/dsp/dec_neon.c
-../src/webp/src/dsp/dec_sse2.c
-../src/webp/src/dsp/dec_sse41.c
-../src/webp/src/dsp/filters.c
-../src/webp/src/dsp/filters_neon.c
-../src/webp/src/dsp/filters_sse2.c
-../src/webp/src/dsp/lossless.c
-../src/webp/src/dsp/lossless_neon.c
-../src/webp/src/dsp/lossless_sse2.c
-../src/webp/src/dsp/lossless_sse41.c
-../src/webp/src/dsp/rescaler.c
-../src/webp/src/dsp/rescaler_neon.c
-../src/webp/src/dsp/rescaler_sse2.c
-../src/webp/src/dsp/upsampling.c
-../src/webp/src/dsp/upsampling_neon.c
-../src/webp/src/dsp/upsampling_sse2.c
-../src/webp/src/dsp/upsampling_sse41.c
-../src/webp/src/dsp/yuv.c
-../src/webp/src/dsp/yuv_neon.c
-../src/webp/src/dsp/yuv_sse2.c
-../src/webp/src/dsp/yuv_sse41.c
-../src/webp/src/utils/bit_reader_utils.c
-../src/webp/src/utils/color_cache_utils.c
-../src/webp/src/utils/huffman_utils.c
-../src/webp/src/utils/quant_levels_dec_utils.c
-../src/webp/src/utils/random_utils.c
-../src/webp/src/utils/rescaler_utils.c
-../src/webp/src/utils/thread_utils.c
-../src/webp/src/utils/utils.c
-"
+# libwebp is C. The objects are linked by em++ below, then removed.
+WEBP_C_SOURCES="$(wk_sources webp | sed 's|^|../|')"
 WEBP_OBJ_DIR="$(mktemp -d)"
 trap 'rm -rf "$WEBP_OBJ_DIR"' EXIT
 WEBP_OBJS=""
@@ -88,31 +53,7 @@ done
 # Vendored libavif 1.4.2 decode-only C sources (see src/avif/README.md):
 # compiled with emcc (C), not em++ — em++ would compile them as C++
 # and libavif is C. AVIF_CODEC_DAV1D registers the dav1d decoder.
-# Listed explicitly, keep in sync with src/avif/libavif/src/.
-AVIF_C_SOURCES="
-../src/avif/libavif/src/alpha.c
-../src/avif/libavif/src/avif.c
-../src/avif/libavif/src/codec_dav1d.c
-../src/avif/libavif/src/colr.c
-../src/avif/libavif/src/colrconvert.c
-../src/avif/libavif/src/diag.c
-../src/avif/libavif/src/exif.c
-../src/avif/libavif/src/gainmap.c
-../src/avif/libavif/src/io.c
-../src/avif/libavif/src/mem.c
-../src/avif/libavif/src/obu.c
-../src/avif/libavif/src/properties.c
-../src/avif/libavif/src/rawdata.c
-../src/avif/libavif/src/read.c
-../src/avif/libavif/src/reformat.c
-../src/avif/libavif/src/reformat_libsharpyuv.c
-../src/avif/libavif/src/reformat_libyuv.c
-../src/avif/libavif/src/sampletransform.c
-../src/avif/libavif/src/scale.c
-../src/avif/libavif/src/stream.c
-../src/avif/libavif/src/utils.c
-../src/avif/libavif/src/write.c
-"
+AVIF_C_SOURCES="$(wk_sources avif | sed 's|^|../|')"
 AVIF_OBJ_DIR="$(mktemp -d)"
 trap 'rm -rf "$AVIF_OBJ_DIR"' EXIT
 AVIF_OBJS=""
@@ -128,35 +69,8 @@ done
 # override that turns the x86 arch flags off for wasm.
 # The 13 *_tmpl.c files are compiled TWICE, once per bitdepth
 # (-DBITDEPTH=8 and -DBITDEPTH=16) — meson does the same
-# (libdav1d_bitdepth_8/16). Listed explicitly, keep in sync with
-# src/avif/dav1d/src/.
-DAV1D_C_SOURCES="
-../src/avif/dav1d/src/cdf.c
-../src/avif/dav1d/src/cpu.c
-../src/avif/dav1d/src/ctx.c
-../src/avif/dav1d/src/data.c
-../src/avif/dav1d/src/decode.c
-../src/avif/dav1d/src/dequant_tables.c
-../src/avif/dav1d/src/getbits.c
-../src/avif/dav1d/src/intra_edge.c
-../src/avif/dav1d/src/itx_1d.c
-../src/avif/dav1d/src/lf_mask.c
-../src/avif/dav1d/src/lib.c
-../src/avif/dav1d/src/log.c
-../src/avif/dav1d/src/mem.c
-../src/avif/dav1d/src/msac.c
-../src/avif/dav1d/src/obu.c
-../src/avif/dav1d/src/pal.c
-../src/avif/dav1d/src/picture.c
-../src/avif/dav1d/src/qm.c
-../src/avif/dav1d/src/ref.c
-../src/avif/dav1d/src/refmvs.c
-../src/avif/dav1d/src/scan.c
-../src/avif/dav1d/src/tables.c
-../src/avif/dav1d/src/thread_task.c
-../src/avif/dav1d/src/warpmv.c
-../src/avif/dav1d/src/wedge.c
-"
+# (libdav1d_bitdepth_8/16).
+DAV1D_C_SOURCES="$(wk_sources dav1d | sed 's|^|../|')"
 DAV1D_OBJ_DIR="$(mktemp -d)"
 trap 'rm -rf "$DAV1D_OBJ_DIR"' EXIT
 DAV1D_OBJS=""
@@ -165,21 +79,7 @@ for dav1d_src in $DAV1D_C_SOURCES; do
   emcc -I../src/avif/dav1d -I../src/avif/dav1d/include -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -ffast-math -O3 -c "$dav1d_src" -o "$dav1d_obj" || exit 1
   DAV1D_OBJS="$DAV1D_OBJS $dav1d_obj"
 done
-DAV1D_TMPL_SOURCES="
-../src/avif/dav1d/src/cdef_apply_tmpl.c
-../src/avif/dav1d/src/cdef_tmpl.c
-../src/avif/dav1d/src/fg_apply_tmpl.c
-../src/avif/dav1d/src/filmgrain_tmpl.c
-../src/avif/dav1d/src/ipred_prepare_tmpl.c
-../src/avif/dav1d/src/ipred_tmpl.c
-../src/avif/dav1d/src/itx_tmpl.c
-../src/avif/dav1d/src/lf_apply_tmpl.c
-../src/avif/dav1d/src/loopfilter_tmpl.c
-../src/avif/dav1d/src/looprestoration_tmpl.c
-../src/avif/dav1d/src/lr_apply_tmpl.c
-../src/avif/dav1d/src/mc_tmpl.c
-../src/avif/dav1d/src/recon_tmpl.c
-"
+DAV1D_TMPL_SOURCES="$(wk_sources dav1d_tmpl | sed 's|^|../|')"
 for dav1d_bitdepth in 8 16; do
   for dav1d_src in $DAV1D_TMPL_SOURCES; do
     dav1d_obj="$DAV1D_OBJ_DIR/$(basename "$(dirname "$dav1d_src")")_$(basename "$dav1d_src" .c)_$dav1d_bitdepth.o"
@@ -188,6 +88,10 @@ for dav1d_bitdepth in 8 16; do
   done
 done
 
+# em++ (not emcc): the engine is C++ and the link needs the C++
+# standard library (operator new/delete, std::string).
+CORE_SOURCES="$(wk_sources core | sed 's|^|../|')"
+STB_SOURCES="$(wk_sources stb | sed 's|^|../|')"
 em++ \
   -I../include \
   -I../src \
@@ -195,40 +99,11 @@ em++ \
   -I../src/avif/libavif/include \
   -I../src/avif/dav1d \
   -I../src/avif/dav1d/include \
-  ../src/core/adaptive_chroma.cpp \
-  ../src/core/avif_decode.cpp \
-  ../src/core/cclm.cpp \
-  ../src/core/coeff_presence_stream.cpp \
-  ../src/core/coeff_sign_stream.cpp \
-  ../src/core/coeff_span_stream.cpp \
-  ../src/core/coeff_table_bank_stream.cpp \
-  ../src/core/coeff_table_stream.cpp \
-  ../src/core/colorspace.cpp \
-  ../src/core/container.cpp \
-  ../src/core/control_field.cpp \
-  ../src/core/dct.cpp \
-  ../src/core/decoder.cpp \
-  ../src/core/encoder.cpp \
-  ../src/core/exif_import.cpp \
-  ../src/core/image_io.cpp \
-  ../src/stb/stb_image.cpp \
-  ../src/core/lossless.cpp \
-  ../src/core/lossy_coeff_stream.cpp \
-  ../src/core/lossy_tile_decode.cpp \
-  ../src/core/lossy_tile_encode.cpp \
-  ../src/core/metrics.cpp \
-  ../src/core/mode_span_rans.cpp \
-  ../src/core/mode_stream.cpp \
-  ../src/core/predict.cpp \
-  ../src/core/rans.cpp \
-  ../src/core/superblock_quant.cpp \
+  $CORE_SOURCES \
+  $STB_SOURCES \
   threading_stub.cpp \
-  ../src/core/tile_util.cpp \
-  ../src/core/webp_decode.cpp \
-  ../src/core/wkmeta.cpp \
   $WEBP_OBJS \
   $AVIF_OBJS \
-  $LIBYUV_OBJS \
   $DAV1D_OBJS \
   wk_wasm.cpp \
   -o wk.js \
