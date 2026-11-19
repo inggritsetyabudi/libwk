@@ -464,10 +464,15 @@ already costs PSNR 21–28 dB (max error up to 251 codes) before the
 codec runs, and the full pipeline scores PSNR 14–19 dB vs 35–63 dB
 for the nonlinear pipeline, with worse banding. The EOTF / OETF
 functions (Section 9.2) stay in the codebase for the tone-mapping preview
-and conversion tools, not for the codec core.
+and conversion tools, not for the codec core. Since slice 3 (2026-11-19)
+the preview is real: wkview tone-maps PQ/HLG frames with Reinhard
+(geometric-mean key value, `tools/tonemap.h`); this is viewer behaviour
+only, never a bitstream change.
 
 No bitstream change: the transfer is only signalled either way, so
 files written before and after this amendment decode identically.
+
+**Viewer-only change (slice 3, 2026-11-19):** wkview tone-maps HDR (PQ/HLG) 16-bit frames for display — PQ/HLG EOTF to linear light, Reinhard with a geometric-mean key value, sRGB OETF to 8-bit (`tools/tonemap.h`, `--linear` falls back to the old linear downscale); SDR 8-bit pixels are unchanged. Not a bitstream/format change: no file decodes differently.
 
 ---
 
