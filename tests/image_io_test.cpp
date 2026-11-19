@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include "../src/core/image_io.h"
+#include "../src/core/avif_decode.h"
 
 using namespace wk;
 
@@ -388,4 +389,372 @@ TEST(ImageIoTest, LoadWebpRejectsAnimated) {
     ASSERT_FALSE(loaded.has_value());
     EXPECT_NE(loaded.error().message.find("animated"), std::string::npos)
         << loaded.error().message;
+}
+
+// ---- AVIF (vendored libavif + dav1d, decode-only) ----
+
+// Fixtures are stored as hex text (snapshot pushes cannot carry binary
+// files); decode pairs of hex digits back to bytes. Mirrors the
+// roundtrip_test fixture reader.
+std::vector<uint8_t> read_fixture_bytes(const std::string& name) {
+    const auto path = std::filesystem::path(__FILE__).parent_path() / "fixtures" / name;
+    std::ifstream in(path);
+    if (!in) return {};
+    const std::string hex{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    if (hex.size() % 2 != 0) return {};
+    const auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::vector<uint8_t> bytes;
+    bytes.reserve(hex.size() / 2);
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        const int hi = nibble(hex[i]);
+        const int lo = nibble(hex[i + 1]);
+        if (hi < 0 || lo < 0) return {};
+        bytes.push_back(static_cast<uint8_t>((hi << 4) | lo));
+    }
+    return bytes;
+}
+
+std::array<uint16_t, 3> pixel_rgb16(const Image& image, uint32_t x, uint32_t y) {
+    const size_t bpp = image.has_alpha() ? 4u : 3u;
+    const size_t offset = (static_cast<size_t>(y) * image.width() + x) * bpp * 2;
+    const auto pixels = image.pixels();
+    const auto sample = [&](size_t o) {
+        return static_cast<uint16_t>(pixels[o] | (static_cast<uint16_t>(pixels[o + 1]) << 8));
+    };
+    return {sample(offset), sample(offset + 2), sample(offset + 4)};
+}
+
+// Compare a decoded 10-bit image against ffmpeg's rgb48le reference
+// (little-endian uint16 per channel, 10-bit values scaled to 16-bit).
+// libavif's YUV->RGB uses its own integer rounding, so the bound is a
+// small tolerance in 10-bit units, not exact equality. The exact
+// decoder-output check (YUV planes, max diff 0 vs ffmpeg) is done by
+// the research harness against the vendored libs, not here.
+int max_rgb16_diff_10bit(const Image& image, const std::vector<uint8_t>& expected16) {
+    const size_t pixel_count = static_cast<size_t>(image.width()) * image.height();
+    const uint16_t* expected = reinterpret_cast<const uint16_t*>(expected16.data());
+    const uint16_t* got = reinterpret_cast<const uint16_t*>(image.pixels().data());
+    int max_diff = 0;
+    for (size_t i = 0; i < pixel_count * 3; ++i) {
+        // ffmpeg scales 10-bit to 16-bit (x * 65535 / 1023); scale back.
+        const int want = (static_cast<int>(expected[i]) * 1023 + 32767) / 65535;
+        max_diff = std::max(max_diff, std::abs(static_cast<int>(got[i]) - want));
+    }
+    return max_diff;
+}
+
+void expect_cicp(const Image& image, uint8_t primaries, uint8_t transfer, uint8_t matrix) {
+    EXPECT_EQ(image.info().cicp.primaries, primaries);
+    EXPECT_EQ(image.info().cicp.transfer, transfer);
+    EXPECT_EQ(image.info().cicp.matrix, matrix);
+}
+
+TEST(ImageIoTest, LoadAvifTiny444_10bit) {
+    // 16x16 gradient, lossless AV1, yuv444p10le, CICP 9/16/9.
+    const auto bytes = read_fixture_bytes("tiny_grad_444_10.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_tiny_grad_444_10.avif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 16u);
+    EXPECT_EQ(loaded->height(), 16u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits10);
+    EXPECT_FALSE(loaded->has_alpha());
+    expect_cicp(*loaded, 9, 16, 9);
+    const auto expected = read_fixture_bytes("tiny_grad_444_10.avif.ffmpeg.rgb.hex");
+    ASSERT_EQ(expected.size(), 16u * 16u * 3u * 2u);
+    EXPECT_LE(max_rgb16_diff_10bit(*loaded, expected), 4);
+}
+
+TEST(ImageIoTest, LoadAvifTiny420_10bit) {
+    // 16x16 gradient, lossless AV1, yuv420p10le, CICP 9/16/9.
+    // The gradient is smooth on purpose (max step 8 per pixel): with
+    // a sharp gradient the 420 chroma upsampler's phase differs
+    // between libavif's internal bilinear and ffmpeg's swscale by
+    // ~37 LSBs — a real upsampler difference, not a decode error.
+    // Even smooth, the two upsamplers differ by a few LSBs, so the
+    // bound here is 8, not the 4 used for the 444 fixtures (measured
+    // max diff 5 on this fixture).
+    const auto bytes = read_fixture_bytes("tiny_grad_420_10.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_tiny_grad_420_10.avif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 16u);
+    EXPECT_EQ(loaded->height(), 16u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits10);
+    EXPECT_FALSE(loaded->has_alpha());
+    expect_cicp(*loaded, 9, 16, 9);
+    const auto expected = read_fixture_bytes("tiny_grad_420_10.avif.ffmpeg.rgb.hex");
+    ASSERT_EQ(expected.size(), 16u * 16u * 3u * 2u);
+    EXPECT_LE(max_rgb16_diff_10bit(*loaded, expected), 8);
+}
+
+TEST(ImageIoTest, LoadAvifTinySolid444_10bit) {
+    // 8x8 solid (512, 256, 768) in 10-bit, lossless AV1, 444, 9/16/9.
+    const auto bytes = read_fixture_bytes("tiny_solid_444_10.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_tiny_solid_444_10.avif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 8u);
+    EXPECT_EQ(loaded->height(), 8u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits10);
+    expect_cicp(*loaded, 9, 16, 9);
+    const auto expected = read_fixture_bytes("tiny_solid_444_10.avif.ffmpeg.rgb.hex");
+    ASSERT_EQ(expected.size(), 8u * 8u * 3u * 2u);
+    EXPECT_LE(max_rgb16_diff_10bit(*loaded, expected), 4);
+}
+
+TEST(ImageIoTest, LoadAvifTiny444_8bit) {
+    // 16x16 gradient, lossless AV1, yuv444p 8-bit, CICP 1/1/1.
+    const auto bytes = read_fixture_bytes("tiny_grad_444_8.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_tiny_grad_444_8.avif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 16u);
+    EXPECT_EQ(loaded->height(), 16u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits8);
+    EXPECT_FALSE(loaded->has_alpha());
+    expect_cicp(*loaded, 1, 1, 1);
+    const auto expected = read_fixture_bytes("tiny_grad_444_8.avif.ffmpeg.rgb.hex");
+    ASSERT_EQ(expected.size(), 16u * 16u * 3u);
+    int max_diff = 0;
+    const auto pixels = loaded->pixels();
+    for (size_t i = 0; i < expected.size(); ++i) {
+        max_diff = std::max(max_diff, std::abs(static_cast<int>(pixels[i]) - expected[i]));
+    }
+    EXPECT_LE(max_diff, 4);
+}
+
+// Spot pixels for the research fixtures (512x768, 10-bit, 9/16/9).
+// Expected values are ffmpeg rgb48le scaled back to 10-bit
+// (x * 1023 / 65535); tolerance +-2 in 10-bit units.
+void expect_spot16(const Image& image, uint32_t x, uint32_t y, uint16_t r16, uint16_t g16,
+                   uint16_t b16) {
+    const auto got = pixel_rgb16(image, x, y);
+    const auto want = [&](uint16_t v) { return (static_cast<int>(v) * 1023 + 32767) / 65535; };
+    EXPECT_LE(std::abs(static_cast<int>(got[0]) - want(r16)), 2) << "R at (" << x << ", " << y << ")";
+    EXPECT_LE(std::abs(static_cast<int>(got[1]) - want(g16)), 2) << "G at (" << x << ", " << y << ")";
+    EXPECT_LE(std::abs(static_cast<int>(got[2]) - want(b16)), 2) << "B at (" << x << ", " << y << ")";
+}
+
+TEST(ImageIoTest, LoadAvifResearchChart444) {
+    const auto bytes = read_fixture_bytes("chart_pq10_444.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_chart_444.avif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 512u);
+    EXPECT_EQ(loaded->height(), 768u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits10);
+    EXPECT_FALSE(loaded->has_alpha());
+    expect_cicp(*loaded, 9, 16, 9);
+    expect_spot16(*loaded, 0, 0, 4173, 4173, 4173);
+    expect_spot16(*loaded, 100, 100, 9688, 9688, 9688);
+    expect_spot16(*loaded, 256, 384, 0, 42778, 42763);
+    expect_spot16(*loaded, 511, 767, 24667, 24667, 24667);
+}
+
+TEST(ImageIoTest, LoadAvifResearchChart420) {
+    const auto bytes = read_fixture_bytes("chart_pq10_420.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_chart_420.avif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 512u);
+    EXPECT_EQ(loaded->height(), 768u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits10);
+    expect_cicp(*loaded, 9, 16, 9);
+    expect_spot16(*loaded, 0, 0, 4173, 4173, 4173);
+    expect_spot16(*loaded, 100, 100, 9688, 9688, 9688);
+    expect_spot16(*loaded, 256, 384, 0, 42778, 42763);
+    expect_spot16(*loaded, 511, 767, 24667, 24667, 24667);
+}
+
+TEST(ImageIoTest, LoadAvifResearchChartLossless) {
+    // Lossless AV1: decoded pixels must match the source PPM (within
+    // conversion rounding) — source chart_pq10.ppm spots in 10-bit.
+    const auto bytes = read_fixture_bytes("chart_pq10_444_ll.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_chart_ll.avif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 512u);
+    EXPECT_EQ(loaded->height(), 768u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits10);
+    expect_cicp(*loaded, 9, 16, 9);
+    const auto check = [&](uint32_t x, uint32_t y, uint16_t r, uint16_t g, uint16_t b) {
+        const auto got = pixel_rgb16(*loaded, x, y);
+        EXPECT_LE(std::abs(static_cast<int>(got[0]) - r), 2) << "R at (" << x << ", " << y << ")";
+        EXPECT_LE(std::abs(static_cast<int>(got[1]) - g), 2) << "G at (" << x << ", " << y << ")";
+        EXPECT_LE(std::abs(static_cast<int>(got[2]) - b), 2) << "B at (" << x << ", " << y << ")";
+    };
+    check(0, 0, 64, 64, 64);
+    check(100, 100, 151, 151, 151);
+    check(256, 384, 0, 668, 668);
+    check(511, 767, 385, 385, 385);
+}
+
+TEST(ImageIoTest, LoadAvifResearchMemorial444) {
+    const auto bytes = read_fixture_bytes("memorial_pq10_444.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_memorial_444.avif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 512u);
+    EXPECT_EQ(loaded->height(), 768u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits10);
+    expect_cicp(*loaded, 9, 16, 9);
+    expect_spot16(*loaded, 0, 0, 8170, 6114, 4502);
+    expect_spot16(*loaded, 100, 100, 19613, 18042, 12215);
+    expect_spot16(*loaded, 256, 384, 19072, 15503, 10963);
+    expect_spot16(*loaded, 511, 767, 14969, 13617, 10497);
+}
+
+TEST(ImageIoTest, LoadAvifResearchMemorial420) {
+    const auto bytes = read_fixture_bytes("memorial_pq10_420.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_memorial_420.avif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 512u);
+    EXPECT_EQ(loaded->height(), 768u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits10);
+    expect_cicp(*loaded, 9, 16, 9);
+    expect_spot16(*loaded, 0, 0, 7955, 6198, 4490);
+    expect_spot16(*loaded, 100, 100, 19464, 17833, 12751);
+    expect_spot16(*loaded, 256, 384, 19108, 16286, 11906);
+    expect_spot16(*loaded, 511, 767, 14537, 12487, 8991);
+}
+
+TEST(ImageIoTest, LoadAvifRejectsAnimated) {
+    // Real 2-frame AVIF (brand "avis", ffmpeg/libaom): the one-shot
+    // decode API cannot handle animation, reject with an error that
+    // says so.
+    const auto bytes = read_fixture_bytes("anim_2frame.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_anim.avif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_NE(loaded.error().message.find("animated"), std::string::npos)
+        << loaded.error().message;
+}
+
+TEST(ImageIoTest, LoadAvifRejectsGrid) {
+    // Synthetic ftyp + meta/iinf/infe v2 with item_type "grid": no
+    // real grid image is needed — the grid check runs before decode.
+    const std::vector<uint8_t> grid = {
+        0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66,
+        0x00, 0x00, 0x00, 0x00, 0x61, 0x76, 0x69, 0x66,
+        0x00, 0x00, 0x00, 0x2f, 0x6d, 0x65, 0x74, 0x61, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x23, 0x69, 0x69, 0x6e, 0x66, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01,
+        0x00, 0x00, 0x00, 0x15, 0x69, 0x6e, 0x66, 0x65, 0x02, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0x67, 0x72, 0x69, 0x64, 0x00};
+    const auto decoded = avif::decode(grid);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_NE(decoded.error().message.find("grid"), std::string::npos)
+        << decoded.error().message;
+    // Control: same boxes with item_type "av01" pass the grid check
+    // and fail later in the decoder (not with a grid error).
+    std::vector<uint8_t> no_grid = grid;
+    no_grid[62] = 0x61;  // 'a'
+    no_grid[63] = 0x76;  // 'v'
+    no_grid[64] = 0x30;  // '0'
+    no_grid[65] = 0x31;  // '1'
+    const auto decoded2 = avif::decode(no_grid);
+    ASSERT_FALSE(decoded2.has_value());
+    EXPECT_EQ(decoded2.error().message.find("grid"), std::string::npos)
+        << decoded2.error().message;
+}
+
+TEST(ImageIoTest, LoadAvifRejects12Bit) {
+    // 12-bit AVIF (ffmpeg/libaom yuv444p12le): out of scope for this
+    // slice (8/10-bit only), rejected with an explicit error.
+    const auto bytes = read_fixture_bytes("tiny_12bit.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_12bit.avif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_NE(loaded.error().message.find("bit depth"), std::string::npos)
+        << loaded.error().message;
+}
+
+TEST(ImageIoTest, LoadAvifRejectsTruncated) {
+    const auto bytes = read_fixture_bytes("chart_pq10_444.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    const std::vector<uint8_t> truncated(bytes.begin(), bytes.begin() + 100);
+    auto path = write_temp_bytes("wk_truncated.avif", truncated);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+}
+
+TEST(ImageIoTest, LoadAvifRejectsGarbageWithAvifMagic) {
+    // Valid ftyp/avif magic, garbage payload: reject cleanly, no crash.
+    std::vector<uint8_t> garbage = {0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70,
+                                    0x61, 0x76, 0x69, 0x66, 0x00, 0x00, 0x00, 0x00,
+                                    0x61, 0x76, 0x69, 0x66};
+    for (int i = 0; i < 64; ++i) {
+        garbage.push_back(static_cast<uint8_t>(i * 37 + 11));
+    }
+    auto path = write_temp_bytes("wk_garbage_magic.avif", garbage);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+}
+
+TEST(ImageIoTest, LoadAvifRejectsRandomBytes) {
+    std::vector<uint8_t> bytes;
+    for (int i = 0; i < 64; ++i) {
+        bytes.push_back(static_cast<uint8_t>(i * 53 + 7));
+    }
+    auto path = write_temp_bytes("wk_random.avif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+}
+
+TEST(ImageIoTest, LoadAvifViaMagicSniff) {
+    // AVIF bytes wearing a .jpg extension: magic sniff routes to the
+    // AVIF decoder, like the WebP solis case.
+    const auto bytes = read_fixture_bytes("chart_pq10_444.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_avif_named_jpg.jpg", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 512u);
+    EXPECT_EQ(loaded->height(), 768u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits10);
+}
+
+TEST(ImageIoTest, LoadAvifFallsBackForJpegNamedAvif) {
+    // A JPEG named .avif has no AVIF magic, so it falls through to stb
+    // (which sniffs content) — mirrors the WebP fallback test.
+    const auto jpg_bytes = read_file_bytes(photos_root() / "people" / "ember-7f3a.jpg");
+    auto path = write_temp_bytes("wk_jpeg_named_avif.avif", jpg_bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 225u);
+    EXPECT_EQ(loaded->height(), 225u);
 }
