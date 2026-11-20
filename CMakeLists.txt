@@ -40,23 +40,25 @@ endif()
 
 # Layout: src/core/ is the portable codec, src/arch/<target>/ holds
 # per-target code (one folder per target, each with its own
-# arch.cmake fragment), src/stb/, src/webp/ and src/avif/ are
-# vendored third-party (stb image I/O, libwebp decode-only, libavif
-# + dav1d decode-only). The build is split into cmake/ fragments:
-# wk_sources (the single source list + reader), wk_arch (target
-# detection and selection), wk_webp, wk_avif, wk_tools, wk_tests.
+# arch.cmake fragment), src/stb/, src/webp/, src/avif/ and src/jxl/
+# are vendored third-party (stb image I/O, libwebp decode-only,
+# libavif + dav1d decode-only, libjxl decode-only native-only). The
+# build is split into cmake/ fragments: wk_sources (the single
+# source list + reader), wk_arch (target detection and selection),
+# wk_webp, wk_avif, wk_jxl, wk_tools, wk_tests.
 # This file only assembles the library from those fragments.
 include(cmake/wk_sources.cmake)
 include(cmake/wk_arch.cmake)
 include(cmake/wk_webp.cmake)
 include(cmake/wk_avif.cmake)
+include(cmake/wk_jxl.cmake)
 
 wk_read_sources(core WK_CORE_SOURCES)
 wk_read_sources(stb WK_STB_SOURCES)
 
-add_library(wk STATIC ${WK_CORE_SOURCES} ${WK_STB_SOURCES} ${WK_WEBP_SOURCES} ${WK_AVIF_SOURCES} ${WK_LIBYUV_SOURCES} ${WK_DAV1D_SOURCES} $<TARGET_OBJECTS:dav1d_bitdepth_8> $<TARGET_OBJECTS:dav1d_bitdepth_16> ${WK_ARCH_SOURCES})
+add_library(wk STATIC ${WK_CORE_SOURCES} ${WK_STB_SOURCES} ${WK_WEBP_SOURCES} ${WK_AVIF_SOURCES} ${WK_LIBYUV_SOURCES} ${WK_DAV1D_SOURCES} $<TARGET_OBJECTS:dav1d_bitdepth_8> $<TARGET_OBJECTS:dav1d_bitdepth_16> ${WK_JXL_SOURCES} ${WK_JXL_HWY_SOURCES} ${WK_JXL_BROTLI_SOURCES} ${WK_JXL_SKCMS_SOURCES} ${WK_ARCH_SOURCES})
 target_include_directories(wk PUBLIC include)
-target_include_directories(wk PRIVATE src src/webp src/avif/libavif/include src/avif/libavif/third_party/libyuv/include src/avif/dav1d src/avif/dav1d/include)
+target_include_directories(wk PRIVATE src src/webp src/avif/libavif/include src/avif/libavif/third_party/libyuv/include src/avif/dav1d src/avif/dav1d/include src/jxl src/jxl/lib src/jxl/lib/include src/jxl/third_party/highway src/jxl/third_party/brotli/c/include src/jxl/third_party/skcms)
 
 include(cmake/wk_tools.cmake)
 include(cmake/wk_tests.cmake)

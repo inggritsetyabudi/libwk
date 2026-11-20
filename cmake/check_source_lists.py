@@ -44,10 +44,22 @@ SECTION_DIRS = {
     "arch_x86_64": ["src/arch/x86_64"],
     "arch_aarch64": ["src/arch/aarch64"],
     "arch_arm": ["src/arch/arm"],
+    # JXL is native only (no Emscripten port): its sections are
+    # deliberately NOT in WEB_SECTIONS below.
+    "jxl": ["src/jxl/lib/jxl", "src/jxl/lib/jxl/render_pipeline",
+            "src/jxl/lib/jxl/modular", "src/jxl/lib/jxl/modular/encoding",
+            "src/jxl/lib/jxl/modular/transform", "src/jxl/lib/jxl/cms"],
+    "jxl_hwy": ["src/jxl/third_party/highway/hwy"],
+    "jxl_brotli": ["src/jxl/third_party/brotli/c/dec",
+                   "src/jxl/third_party/brotli/c/common"],
+    "jxl_skcms": ["src/jxl/third_party/skcms", "src/jxl/third_party/skcms/src"],
 }
 
 # Sections the web builds must consume (libyuv is intentionally NOT
 # compiled for wasm; arch sources are header-only or excluded there).
+# The jxl sections are intentionally NOT here either: JXL is native
+# only (no Emscripten port), so web/build.sh and web/build.ps1 must
+# never consume them.
 WEB_SECTIONS = {"core", "stb", "webp", "avif", "dav1d", "dav1d_tmpl"}
 
 # Web-only files that may appear hardcoded in the web builds.
@@ -101,7 +113,7 @@ def on_disk_files(section):
         if not os.path.isdir(full):
             continue
         for name in sorted(os.listdir(full)):
-            if name.endswith((".c", ".cpp")):
+            if name.endswith((".c", ".cc", ".cpp")):
                 found.append(f"{d}/{name}")
     if section == "dav1d":
         found = [f for f in found if not f.endswith("_tmpl.c")]

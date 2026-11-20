@@ -15,6 +15,7 @@
 
 #include "image_io.h"
 #include "avif_decode.h"
+#include "jxl_decode.h"
 #include "webp_decode.h"
 #include "stb/stb_image.h"
 #include "stb/stb_image_write.h"
@@ -297,6 +298,32 @@ Result<Image> load_avif(std::string_view path) {
     return avif::decode(*file_bytes);
 }
 
+// JXL magic is sniffed from content, not the extension: a file
+// named .jpg can be a JXL (and vice versa). Only the first 12
+// bytes are read; any failure to open or a short read means "not
+// JXL" and the normal extension dispatch below reports the real
+// error.
+bool file_has_jxl_magic(std::string_view path) {
+    std::ifstream file(std::string(path), std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    std::array<uint8_t, 12> magic{};
+    if (!file.read(reinterpret_cast<char*>(magic.data()),
+                   static_cast<std::streamsize>(magic.size()))) {
+        return false;
+    }
+    return jxl::has_jxl_magic(magic);
+}
+
+Result<Image> load_jxl(std::string_view path) {
+    auto file_bytes = read_file_bytes(path);
+    if (!file_bytes) {
+        return std::unexpected(file_bytes.error());
+    }
+    return jxl::decode(*file_bytes);
+}
+
 // stb_image decodes JPG/PNG/BMP/TGA/GIF (and more) on every platform,
 // replacing the old Windows-only WIC path: wkenc could only read PPM
 // on Linux/Termux, and wkdec could only write PNG on Windows.
@@ -378,6 +405,9 @@ Result<Image> load_image_file(std::string_view path) {
     if (file_has_avif_magic(path)) {
         return load_avif(path);
     }
+    if (file_has_jxl_magic(path)) {
+        return load_jxl(path);
+    }
     const std::string ext = lowercase_extension(path);
     if (ext == ".ppm") {
         return load_ppm(path);
@@ -385,11 +415,12 @@ Result<Image> load_image_file(std::string_view path) {
     // ".webp" is here as a fallback for non-WebP content wearing a
     // .webp extension: stb sniffs content, so a misnamed JPEG/PNG
     // still loads. Genuine WebP never reaches this branch — the magic
-    // sniff above routes it to the libwebp decoder. Same for ".avif":
-    // a JPEG named .avif loads via stb; genuine AVIF never reaches
-    // this branch.
+    // sniff above routes it to the libwebp decoder. Same for ".avif"
+    // and ".jxl": a JPEG named .avif/.jxl loads via stb; genuine
+    // AVIF/JXL never reach this branch.
     if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" ||
-        ext == ".tga" || ext == ".gif" || ext == ".webp" || ext == ".avif") {
+        ext == ".tga" || ext == ".gif" || ext == ".webp" || ext == ".avif" ||
+        ext == ".jxl") {
         return load_stb_image(path);
     }
     return std::unexpected(Error{ErrorCode::UnsupportedFeature, "unsupported input image format"});
