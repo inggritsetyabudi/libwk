@@ -18,6 +18,7 @@
 #include <fstream>
 #include "../src/core/image_io.h"
 #include "../src/core/avif_decode.h"
+#include "../src/core/jxl_decode.h"
 
 using namespace wk;
 
@@ -752,6 +753,254 @@ TEST(ImageIoTest, LoadAvifFallsBackForJpegNamedAvif) {
     // (which sniffs content) — mirrors the WebP fallback test.
     const auto jpg_bytes = read_file_bytes(photos_root() / "people" / "ember-7f3a.jpg");
     auto path = write_temp_bytes("wk_jpeg_named_avif.avif", jpg_bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 225u);
+    EXPECT_EQ(loaded->height(), 225u);
+}
+
+// ---- JXL (vendored libjxl 0.13.0, decode-only, native only) ----
+
+// Fixtures are the tiny JXL files built for the slice (see
+// tools/jxl_slice_2026-11-20.md): 16x16/8x8, lossless JXL, so the
+// decoded pixels must match the ffmpeg reference EXACTLY (max diff
+// 0) — unlike AVIF, there is no YUV->RGB rounding here: JXL decodes
+// straight to RGB, and the 10-bit values libjxl scales to 16-bit
+// (x * 65535 / 1023) are scaled back exactly by the decoder
+// (round(x * 1023 / 65535) recovers every 10-bit value: the forward
+// error is at most 1 LSB in 16-bit units, i.e. 0.016 in 10-bit
+// units). The research harness proved 0 diff on all five fixtures
+// against ffmpeg 8.1.2 (libjxl 0.7) and against libjxl 0.13 itself.
+TEST(ImageIoTest, LoadJxlTinyGrad10bit) {
+    // 16x16 gradient, lossless JXL, 10-bit, CICP 9/16/9.
+    const auto bytes = read_fixture_bytes("tiny_grad_10.jxl.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_tiny_grad_10.jxl", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 16u);
+    EXPECT_EQ(loaded->height(), 16u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits10);
+    EXPECT_FALSE(loaded->has_alpha());
+    expect_cicp(*loaded, 9, 16, 9);
+    const auto expected = read_fixture_bytes("tiny_grad_10.jxl.ffmpeg.rgb16.hex");
+    ASSERT_EQ(expected.size(), 16u * 16u * 3u * 2u);
+    EXPECT_EQ(max_rgb16_diff_10bit(*loaded, expected), 0);
+}
+
+TEST(ImageIoTest, LoadJxlTinyGrad8bit) {
+    // 16x16 gradient, lossless JXL, 8-bit, CICP 1/13/1.
+    const auto bytes = read_fixture_bytes("tiny_grad_8.jxl.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_tiny_grad_8.jxl", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 16u);
+    EXPECT_EQ(loaded->height(), 16u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits8);
+    EXPECT_FALSE(loaded->has_alpha());
+    expect_cicp(*loaded, 1, 13, 1);
+    const auto expected = read_fixture_bytes("tiny_grad_8.jxl.ffmpeg.rgb.hex");
+    ASSERT_EQ(expected.size(), 16u * 16u * 3u);
+    const auto pixels = loaded->pixels();
+    int max_diff = 0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        max_diff = std::max(max_diff, std::abs(static_cast<int>(pixels[i]) - expected[i]));
+    }
+    EXPECT_EQ(max_diff, 0);
+}
+
+TEST(ImageIoTest, LoadJxlTinySolid10bit) {
+    // 8x8 solid (512, 256, 768) in 10-bit, lossless JXL, 9/16/9.
+    const auto bytes = read_fixture_bytes("tiny_solid_10.jxl.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_tiny_solid_10.jxl", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 8u);
+    EXPECT_EQ(loaded->height(), 8u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits10);
+    expect_cicp(*loaded, 9, 16, 9);
+    const auto expected = read_fixture_bytes("tiny_solid_10.jxl.ffmpeg.rgb16.hex");
+    ASSERT_EQ(expected.size(), 8u * 8u * 3u * 2u);
+    EXPECT_EQ(max_rgb16_diff_10bit(*loaded, expected), 0);
+}
+
+TEST(ImageIoTest, LoadJxlTinyGray) {
+    // 8x8 gray, lossless JXL, 8-bit. libjxl is asked for 3 channels,
+    // so it replicates gray to RGB itself; the carried primaries are
+    // 0 (gray), which passes the H.273 check as-is.
+    const auto bytes = read_fixture_bytes("tiny_gray.jxl.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_tiny_gray.jxl", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 8u);
+    EXPECT_EQ(loaded->height(), 8u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits8);
+    EXPECT_FALSE(loaded->has_alpha());
+    expect_cicp(*loaded, 0, 13, 1);
+    const auto expected = read_fixture_bytes("tiny_gray.jxl.ffmpeg.rgb.hex");
+    ASSERT_EQ(expected.size(), 8u * 8u * 3u);
+    const auto pixels = loaded->pixels();
+    int max_diff = 0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        max_diff = std::max(max_diff, std::abs(static_cast<int>(pixels[i]) - expected[i]));
+    }
+    EXPECT_EQ(max_diff, 0);
+}
+
+TEST(ImageIoTest, LoadJxlTinyAlpha) {
+    // 8x8 RGBA (PNG source), lossless JXL, 8-bit, CICP 1/13/1.
+    const auto bytes = read_fixture_bytes("tiny_alpha.jxl.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_tiny_alpha.jxl", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 8u);
+    EXPECT_EQ(loaded->height(), 8u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits8);
+    EXPECT_TRUE(loaded->has_alpha());
+    expect_cicp(*loaded, 1, 13, 1);
+    const auto expected = read_fixture_bytes("tiny_alpha.jxl.ffmpeg.rgba.hex");
+    ASSERT_EQ(expected.size(), 8u * 8u * 4u);
+    const auto pixels = loaded->pixels();
+    int max_diff = 0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        max_diff = std::max(max_diff, std::abs(static_cast<int>(pixels[i]) - expected[i]));
+    }
+    EXPECT_EQ(max_diff, 0);
+}
+
+TEST(ImageIoTest, LoadJxlHasMagic) {
+    // Raw codestream (0xFF 0x0A) and the 12-byte signature box
+    // ("JXL ") are both JXL; anything else is not. The box type is
+    // uppercase "JXL ", not the lowercase "jxl " of the ftyp brand
+    // or the jxlc box — a hand-rolled check got this wrong (the
+    // 16-bit container fixture), so the decoder uses libjxl's own
+    // JxlSignatureCheck.
+    EXPECT_TRUE(jxl::has_jxl_magic(std::vector<uint8_t>{0xFF, 0x0A, 0x43, 0x04}));
+    const std::vector<uint8_t> box = {0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58,
+                                      0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A};
+    EXPECT_TRUE(jxl::has_jxl_magic(box));
+    EXPECT_FALSE(jxl::has_jxl_magic(std::vector<uint8_t>{0x00, 0x00, 0x00, 0x0C,
+                                                         0x6A, 0x78, 0x6C, 0x20}));
+    EXPECT_FALSE(jxl::has_jxl_magic(std::vector<uint8_t>{0x89, 0x50, 0x4E, 0x47}));
+    EXPECT_FALSE(jxl::has_jxl_magic(std::vector<uint8_t>{0xFF}));
+}
+
+TEST(ImageIoTest, LoadJxlRejectsAnimated) {
+    // Real 2-frame JXL: the one-shot decode API cannot handle
+    // animation, reject with an error that says so.
+    const auto bytes = read_fixture_bytes("tiny_anim.jxl.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_anim.jxl", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_NE(loaded.error().message.find("animated"), std::string::npos)
+        << loaded.error().message;
+}
+
+TEST(ImageIoTest, LoadJxlRejects12Bit) {
+    // 12-bit JXL: out of scope for this slice (8/10-bit only),
+    // rejected with an explicit error.
+    const auto bytes = read_fixture_bytes("tiny_grad_12.jxl.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_12bit.jxl", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_NE(loaded.error().message.find("bit depth"), std::string::npos)
+        << loaded.error().message;
+}
+
+TEST(ImageIoTest, LoadJxlRejects16Bit) {
+    // 16-bit JXL (box container form): same rejection as 12-bit.
+    const auto bytes = read_fixture_bytes("tiny_grad_16.jxl.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_16bit.jxl", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_NE(loaded.error().message.find("bit depth"), std::string::npos)
+        << loaded.error().message;
+}
+
+TEST(ImageIoTest, LoadJxlRejectsLinearTransfer) {
+    // Custom-gamma ICC (2.2): libjxl 0.13 reports the file's transfer
+    // as LINEAR (8), and there is no H.273 code for linear — the
+    // gamma was lost at encode time (libjxl's ICC->fields
+    // conversion), not at decode. Reject, do not relabel.
+    const auto bytes = read_fixture_bytes("tiny_custom_gamma.jxl.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_gamma.jxl", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_NE(loaded.error().message.find("transfer"), std::string::npos)
+        << loaded.error().message;
+}
+
+TEST(ImageIoTest, LoadJxlRejectsTruncated) {
+    const auto bytes = read_fixture_bytes("tiny_grad_10.jxl.hex");
+    ASSERT_FALSE(bytes.empty());
+    const std::vector<uint8_t> truncated(bytes.begin(), bytes.begin() + 100);
+    auto path = write_temp_bytes("wk_truncated.jxl", truncated);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+}
+
+TEST(ImageIoTest, LoadJxlRejectsGarbageWithJxlMagic) {
+    // Valid JXL codestream magic, garbage payload: reject cleanly,
+    // no crash.
+    std::vector<uint8_t> garbage = {0xFF, 0x0A};
+    for (int i = 0; i < 64; ++i) {
+        garbage.push_back(static_cast<uint8_t>(i * 37 + 11));
+    }
+    auto path = write_temp_bytes("wk_garbage_magic.jxl", garbage);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+}
+
+TEST(ImageIoTest, LoadJxlRejectsRandomBytes) {
+    std::vector<uint8_t> bytes;
+    for (int i = 0; i < 64; ++i) {
+        bytes.push_back(static_cast<uint8_t>(i * 53 + 7));
+    }
+    auto path = write_temp_bytes("wk_random.jxl", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+}
+
+TEST(ImageIoTest, LoadJxlViaMagicSniff) {
+    // JXL bytes wearing a .jpg extension: magic sniff routes to the
+    // JXL decoder, like the WebP/AVIF cases.
+    const auto bytes = read_fixture_bytes("tiny_grad_10.jxl.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_jxl_named_jpg.jpg", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 16u);
+    EXPECT_EQ(loaded->height(), 16u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits10);
+}
+
+TEST(ImageIoTest, LoadJxlFallsBackForJpegNamedJxl) {
+    // A JPEG named .jxl has no JXL magic, so it falls through to stb
+    // (which sniffs content) — mirrors the WebP/AVIF fallback tests.
+    const auto jpg_bytes = read_file_bytes(photos_root() / "people" / "ember-7f3a.jpg");
+    auto path = write_temp_bytes("wk_jpeg_named_jxl.jxl", jpg_bytes);
     auto loaded = io::load_image_file(path.string());
     remove_temp(path);
     ASSERT_TRUE(loaded.has_value()) << loaded.error().message;

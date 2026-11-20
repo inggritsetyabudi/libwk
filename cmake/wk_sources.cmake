@@ -104,6 +104,15 @@ _wk_sources_check(avif NONE src/avif/libavif/src/*.c)
 _wk_sources_check(libyuv NONE src/avif/libavif/third_party/libyuv/source/*.c)
 _wk_sources_check(dav1d NO_TMPL src/avif/dav1d/src/*.c)
 _wk_sources_check(dav1d_tmpl ONLY_TMPL src/avif/dav1d/src/*.c)
+_wk_sources_check(jxl NONE
+    src/jxl/lib/jxl/*.cc src/jxl/lib/jxl/render_pipeline/*.cc src/jxl/lib/jxl/modular/*.cc
+    src/jxl/lib/jxl/modular/encoding/*.cc src/jxl/lib/jxl/modular/transform/*.cc
+    src/jxl/lib/jxl/cms/*.cc)
+_wk_sources_check(jxl_hwy NONE src/jxl/third_party/highway/hwy/*.cc)
+_wk_sources_check(jxl_brotli NONE
+    src/jxl/third_party/brotli/c/dec/*.c src/jxl/third_party/brotli/c/common/*.c)
+_wk_sources_check(jxl_skcms NONE
+    src/jxl/third_party/skcms/*.cc src/jxl/third_party/skcms/src/*.cc)
 _wk_sources_check(arch_generic NONE src/arch/generic/*.cpp)
 _wk_sources_check(arch_wasm NONE src/arch/wasm/*.cpp)
 _wk_sources_check(arch_x86_64 NONE src/arch/x86_64/*.cpp)
