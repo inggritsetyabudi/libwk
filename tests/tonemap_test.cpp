@@ -19,6 +19,7 @@
 // not its measured image scores (those live in the harness).
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -114,6 +115,79 @@ TEST(TonemapSample, PqMidtoneBrighterThanLinear) {
     const uint16_t code = 512;
     const uint8_t linear = static_cast<uint8_t>((static_cast<uint32_t>(code) * 255u + 511u) / 1023u);
     EXPECT_GT(tonemap_to_u8(code, kMax10, 16, kDarkSceneKeyScale), linear);
+}
+
+TEST(GamutMap, Bt2020MatrixAndClamp) {
+    // Pure primaries: matrix rows, negatives clamped to 0, values
+    // above 1 left for the Reinhard tone-map (not clamped to 1).
+    const std::array<double, 3> r = gamut_map_bt2020_to_srgb(1.0, 0.0, 0.0);
+    EXPECT_NEAR(r[0], 1.6604910, 1e-6);
+    EXPECT_EQ(r[1], 0.0);
+    EXPECT_EQ(r[2], 0.0);
+    const std::array<double, 3> g = gamut_map_bt2020_to_srgb(0.0, 1.0, 0.0);
+    EXPECT_EQ(g[0], 0.0);
+    EXPECT_NEAR(g[1], 1.1328999, 1e-6);
+    EXPECT_EQ(g[2], 0.0);
+    const std::array<double, 3> b = gamut_map_bt2020_to_srgb(0.0, 0.0, 1.0);
+    EXPECT_EQ(b[0], 0.0);
+    EXPECT_EQ(b[1], 0.0);
+    EXPECT_NEAR(b[2], 1.1187297, 1e-6);
+    // White is preserved (matrix rows sum to 1).
+    const std::array<double, 3> w = gamut_map_bt2020_to_srgb(1.0, 1.0, 1.0);
+    EXPECT_NEAR(w[0], 1.0, 1e-6);
+    EXPECT_NEAR(w[1], 1.0, 1e-6);
+    EXPECT_NEAR(w[2], 1.0, 1e-6);
+    // In-gamut mix: matrix applied exactly, nothing clamped.
+    const std::array<double, 3> m = gamut_map_bt2020_to_srgb(0.5, 0.25, 0.1);
+    EXPECT_NEAR(m[0], 1.6604910 * 0.5 - 0.5876411 * 0.25 - 0.0728499 * 0.1, 1e-9);
+    EXPECT_NEAR(m[1], -0.1245505 * 0.5 + 1.1328999 * 0.25 - 0.0083494 * 0.1, 1e-9);
+    EXPECT_NEAR(m[2], -0.0181508 * 0.5 - 0.1005789 * 0.25 + 1.1187297 * 0.1, 1e-9);
+}
+
+TEST(GamutMap, NeedsMappingOnlyForBt2020) {
+    EXPECT_TRUE(needs_gamut_mapping(9));
+    EXPECT_FALSE(needs_gamut_mapping(1));
+    EXPECT_FALSE(needs_gamut_mapping(0));
+    EXPECT_FALSE(needs_gamut_mapping(2));
+    EXPECT_FALSE(needs_gamut_mapping(22));
+}
+
+TEST(TonemapPixel, Bt2020PrimariesStayPureAndDominant) {
+    // Chart key scale for the 400-nit Band B patches, measured in
+    // holes/gamut/gamut_measure.py: clamp -> (222,0,0), (0,211,0),
+    // (0,0,211); white patch (1000 nits) -> (232,232,232). Ranges
+    // allow float rounding, but the zero channels must stay zero:
+    // that is the fix (no gamut step leaked the primaries into the
+    // other sRGB channels).
+    constexpr double kChartKeyScale = 41.3151;
+    uint8_t r = 0, g = 0, b = 0;
+    tonemap_pixel_rgb(0.04, 0.0, 0.0, 9, kChartKeyScale, r, g, b);
+    EXPECT_GE(r, 218);
+    EXPECT_LE(r, 226);
+    EXPECT_EQ(g, 0);
+    EXPECT_EQ(b, 0);
+    tonemap_pixel_rgb(0.0, 0.04, 0.0, 9, kChartKeyScale, r, g, b);
+    EXPECT_EQ(r, 0);
+    EXPECT_GE(g, 209);
+    EXPECT_LE(g, 215);
+    EXPECT_EQ(b, 0);
+    tonemap_pixel_rgb(0.0, 0.0, 0.04, 9, kChartKeyScale, r, g, b);
+    EXPECT_EQ(r, 0);
+    EXPECT_EQ(g, 0);
+    EXPECT_GE(b, 209);
+    EXPECT_LE(b, 215);
+    // White patch stays neutral.
+    tonemap_pixel_rgb(0.1, 0.1, 0.1, 9, kChartKeyScale, r, g, b);
+    EXPECT_EQ(r, g);
+    EXPECT_EQ(g, b);
+    EXPECT_GE(r, 228);
+    EXPECT_LE(r, 236);
+    // BT.709 primaries: no mapping, identical to the per-channel path.
+    uint8_t r2 = 0, g2 = 0, b2 = 0;
+    tonemap_pixel_rgb(0.04, 0.0, 0.0, 1, kChartKeyScale, r2, g2, b2);
+    EXPECT_EQ(r2, tonemap_channel(0.04, kChartKeyScale));
+    EXPECT_EQ(g2, 0);
+    EXPECT_EQ(b2, 0);
 }
 
 }  // namespace
