@@ -15,6 +15,7 @@
 
 #include "lossless.h"
 #include "coeff_table_stream.h"
+#include <array>
 #include <unordered_map>
 #include <algorithm>
 #include <cstring>
@@ -404,7 +405,9 @@ Result<std::vector<uint8_t>> lossless_decode(
             "lossless predictor mode out of range"});
     }
 
-    std::vector<uint8_t> output(pixel_count * 4);
+    // Allocated lazily below, after the payload proves itself (#hole8):
+    // a truncated stream must fail before a frame-sized raster exists.
+    std::vector<uint8_t> output;
 
     if (use_palette) {
         auto count_r = reader.read_u16();
@@ -472,13 +475,20 @@ Result<std::vector<uint8_t>> lossless_decode(
                     "palette index out of range"});
             }
         }
+        output.assign(pixel_count * 4, 0);
         undo_palette(indices.data(), width, height, palette, output.data());
     } else {
 
-        std::vector<uint8_t> transformed(pixel_count * 4);
-
+        // Read all four channel headers (table + rANS stream) before
+        // allocating the frame-sized transformed buffer (#hole8): the
+        // header reads are the only payload validation here, so they
+        // must run first. The spans point into the caller's input.
+        struct ChannelInput {
+            RansTable<RANS_PRECISION_BITS> table;
+            std::span<const uint8_t> enc_data;
+        };
+        std::array<ChannelInput, 4> channels;
         for (int ch = 0; ch < 4; ch++) {
-
             RansTable<RANS_PRECISION_BITS> table;
             if (adaptive_tables) {
                 auto table_r = read_coefficient_table(reader, 256, "lossless");
@@ -495,22 +505,25 @@ Result<std::vector<uint8_t>> lossless_decode(
                 table.build_from_counts(counts, 256);
             }
 
-
             auto enc_size = reader.read_u32();
             if (!enc_size) return std::unexpected(enc_size.error());
             auto enc_data = reader.read_bytes(*enc_size);
             if (!enc_data) return std::unexpected(enc_data.error());
+            channels[ch] = {std::move(table), *enc_data};
+        }
 
+        std::vector<uint8_t> transformed(pixel_count * 4);
 
+        for (int ch = 0; ch < 4; ch++) {
             RansDecoder<RANS_PRECISION_BITS> dec;
-            dec.init(enc_data->data(), enc_data->size());
+            dec.init(channels[ch].enc_data.data(), channels[ch].enc_data.size());
             if (!dec.ok()) {
                 return std::unexpected(Error{ErrorCode::RansError, "invalid rANS stream header"});
             }
 
             std::vector<uint8_t> residuals(pixel_count);
             for (size_t i = 0; i < pixel_count; i++) {
-                residuals[i] = static_cast<uint8_t>(dec.decode(table));
+                residuals[i] = static_cast<uint8_t>(dec.decode(channels[ch].table));
                 if (!dec.ok()) {
                     return std::unexpected(Error{ErrorCode::RansError, "corrupt rANS stream"});
                 }
