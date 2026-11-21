@@ -433,7 +433,10 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
                             static_cast<double>(config.adaptive_chroma_laplacian_threshold) * thr_scale,
                             static_cast<double>(config.adaptive_chroma_lap_p999_threshold) * thr_scale,
                             static_cast<double>(config.adaptive_chroma_lap_sat_p999_threshold) * thr_scale,
-                            fhdr.bit_depth)
+                            fhdr.bit_depth,
+                            // Fractions: no thr_scale (dimensionless).
+                            static_cast<double>(config.adaptive_chroma_lap_frac_gt2_threshold),
+                            static_cast<double>(config.adaptive_chroma_dct_band_threshold))
                             ? ChromaSubsampling::YUV420 : ChromaSubsampling::YUV444;
                         if (tile_subsampling == ChromaSubsampling::YUV420) {
                             tile_cb = cb_plane_420.data();
@@ -582,6 +585,8 @@ void wk_encoder_config_init(wk_encoder_config_t* config) {
     config->adaptive_chroma_laplacian_threshold = 2.1f;
     config->adaptive_chroma_lap_p999_threshold = 79.0f;
     config->adaptive_chroma_lap_sat_p999_threshold = 100.0f;
+    config->adaptive_chroma_lap_frac_gt2_threshold = 0.28f;
+    config->adaptive_chroma_dct_band_threshold = 0.50f;
     config->max_cll = 0;
     config->max_fall = 0;
 }
@@ -668,6 +673,9 @@ wk_error_t wk_encode(
     enc_config.adaptive_chroma_laplacian_threshold = config->adaptive_chroma_laplacian_threshold;
     enc_config.adaptive_chroma_lap_p999_threshold = config->adaptive_chroma_lap_p999_threshold;
     enc_config.adaptive_chroma_lap_sat_p999_threshold = config->adaptive_chroma_lap_sat_p999_threshold;
+    enc_config.adaptive_chroma_lap_frac_gt2_threshold =
+        config->adaptive_chroma_lap_frac_gt2_threshold;
+    enc_config.adaptive_chroma_dct_band_threshold = config->adaptive_chroma_dct_band_threshold;
 
     auto result = wk::encode(*image, enc_config);
     if (!result) {

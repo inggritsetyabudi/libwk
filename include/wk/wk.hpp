@@ -213,6 +213,17 @@ namespace wk
         // plain p999 34).
         float adaptive_chroma_lap_p999_threshold = 79.0f;
         float adaptive_chroma_lap_sat_p999_threshold = 100.0f;
+        // Third/fourth conditions for the adaptive decision above:
+        // both are fractions, so they do not scale with bit depth.
+        // frac_gt2 is the fraction of |Laplacian| values above 2
+        // (the cut scales 2 << (bit_depth - 8)); dct_band is the
+        // fraction of detrended chroma AC energy in the DCT 1..3 band.
+        // 0 disables the condition. Measured 2026-11-21 (hole #9,
+        // b3_a3): 0.28 / 0.50 catch the period-8 sinusoid family
+        // (frac_gt2 0.30, dct_band 0.95 at amplitude 3.0) with zero
+        // false positives on the 23-image corpus.
+        float adaptive_chroma_lap_frac_gt2_threshold = 0.28f;
+        float adaptive_chroma_dct_band_threshold = 0.50f;
         // Reserved: accepted but currently ignored -- no
         // SSIMULACRA2-targeted mode exists yet (the wkenc flag was
         // removed rather than advertise a no-op).
