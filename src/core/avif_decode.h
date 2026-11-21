@@ -27,8 +27,9 @@ bool has_avif_magic(std::span<const uint8_t> bytes);
 // Decode a still AVIF (8/10-bit, 444/420) into an Image. The Image
 // carries the file's embedded CICP, normalized to what the encoder
 // supports (see avif_decode.cpp). Animated and grid AVIFs are
-// rejected with explicit errors. Fails cleanly on malformed input
-// (no crash/UB).
+// rejected with explicit errors, as are files whose ispe dimensions
+// disagree with the AV1 frame dimensions from the sequence header.
+// Fails cleanly on malformed input (no crash/UB).
 Result<Image> decode(std::span<const uint8_t> bytes);
 
 }  // namespace wk::avif
