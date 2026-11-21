@@ -15,7 +15,6 @@
 
 #include <gtest/gtest.h>
 #include <cstdint>
-#include <cstring>
 #include <vector>
 #include <wk/wk.h>
 
@@ -28,17 +27,41 @@ wk_encoder_config_t make_config(uint8_t bit_depth) {
     return config;
 }
 
-std::vector<uint8_t> make_pixels(uint32_t width, uint32_t height, uint8_t bpp) {
+// Smooth gradient pixels: cheap for the cluster optimizer, so this
+// smoke test stays fast even under ASan Debug (a 16x16 full-entropy
+// encode costs ~65 s there). The gradient is smooth at the SAMPLE
+// level: at 10/12-bit a byte-level ramp would make adjacent 16-bit
+// samples alternate low/high (a near-noise pattern). The full-entropy
+// variant of the encode tests lives in c_api_encode_test.cpp —
+// #asan-gates.
+std::vector<uint8_t> make_gradient_pixels(uint32_t width, uint32_t height, uint8_t bpp) {
+    // 16-bit samples at bpp 6/8, 8-bit samples at bpp 3/4.
+    const bool wide = bpp > 4;
+    const uint8_t channels = wide ? static_cast<uint8_t>(bpp / 2) : bpp;
     std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * bpp);
-    for (size_t i = 0; i < pixels.size(); ++i) {
-        pixels[i] = static_cast<uint8_t>((i * 37) & 0xFF);
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            for (uint8_t c = 0; c < channels; ++c) {
+                // Smooth ramp, 0..~234: inside the 8-bit (255),
+                // 10-bit (1023) and 12-bit (4095) ranges, so no
+                // masking wrap anywhere.
+                const uint32_t v = (x + y) * 7 + c * 8;
+                const size_t i = (static_cast<size_t>(y) * width + x) * bpp + (wide ? c * 2 : c);
+                if (wide) {
+                    pixels[i] = static_cast<uint8_t>(v & 0xFF);
+                    pixels[i + 1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+                } else {
+                    pixels[i] = static_cast<uint8_t>(v & 0xFF);
+                }
+            }
+        }
     }
     return pixels;
 }
 
 wk_error_t try_encode(uint32_t width, uint32_t height, uint32_t stride, uint8_t bpp,
                       const wk_encoder_config_t& config, uint8_t** out_data, size_t* out_size) {
-    auto pixels = make_pixels(width, height, bpp);
+    auto pixels = make_gradient_pixels(width, height, bpp);
     return wk_encode(pixels.data(), width, height, stride, bpp, &config, out_data, out_size);
 }
 
@@ -46,7 +69,7 @@ wk_error_t try_encode(uint32_t width, uint32_t height, uint32_t stride, uint8_t 
 
 TEST(CApiTest, EncodeRejectsNullParams) {
     wk_encoder_config_t config = make_config(8);
-    auto pixels = make_pixels(16, 16, 3);
+    auto pixels = make_gradient_pixels(16, 16, 3);
     uint8_t* out_data = nullptr;
     size_t out_size = 0;
 
@@ -124,6 +147,8 @@ TEST(CApiTest, EncodeRejectsShortStride) {
 
 TEST(CApiTest, EncodeAcceptsValidCombos) {
     // Control: every consistent (bit_depth, bpp) pair encodes fine.
+    // Gradient pixels here: the full-entropy variant of this test
+    // lives in c_api_encode_test.cpp (slow under ASan by design).
     const std::vector<std::pair<uint8_t, uint8_t>> good_cases = {
         {8, 3}, {8, 4}, {10, 6}, {10, 8}, {12, 6}, {12, 8},
     };
@@ -147,7 +172,8 @@ TEST(CApiTest, EncodeAcceptsValidCombos) {
 
 TEST(CApiTest, EncodeAcceptsPaddedStride) {
     // Control: an explicit stride larger than the row size is fine; the
-    // padding bytes between rows are ignored.
+    // padding bytes between rows are ignored. Gradient fill here: the
+    // sawtooth variant lives in c_api_encode_test.cpp (~51 s under ASan).
     wk_encoder_config_t config = make_config(8);
     const uint32_t width = 16, height = 16, bpp = 3;
     const uint32_t row_bytes = width * bpp;
@@ -155,7 +181,7 @@ TEST(CApiTest, EncodeAcceptsPaddedStride) {
     std::vector<uint8_t> pixels(static_cast<size_t>(stride) * height, 0xAB);
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < row_bytes; ++x) {
-            pixels[static_cast<size_t>(y) * stride + x] = static_cast<uint8_t>((x * 13 + y) & 0xFF);
+            pixels[static_cast<size_t>(y) * stride + x] = static_cast<uint8_t>(((x + y) * 4) & 0xFF);
         }
     }
 
