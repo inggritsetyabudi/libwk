@@ -126,9 +126,7 @@ flowchart TD
 The library is the codec; the tools are thin front-ends over the public API.
 The encoder and decoder share the container parser, the tile machinery, the
 rANS engine, and the coefficient streams — only the direction of the pipeline
-differs. A deeper, generated dependency graph lives in
-`graphify-out/GRAPH_REPORT.md` (May 2026 snapshot; the current `src/` listing
-is authoritative where the two disagree).
+differs.
 
 ## Format at a Glance
 
@@ -292,7 +290,7 @@ cost of +1.9% file for a visible gain on skin. Two honest caveats from the
 same measurement: about 45% of the treated blocks are not human skin
 (false positives such as warm rock and lake reflections), and the SSIM gain
 on actual faces is below the visible threshold even though the PSNR gain is
-large. See `tools/skin_protection_research_2026-11-16.md` for the full
+large. See `docs/skin_protection_research_2026-11-16.md` for the full
 measurement.
 
 ## CLI Tools
@@ -494,7 +492,6 @@ extra/      screenshots, demo assets, and the WK logo
 utils/      helper scripts for benchmarking and smoke runs
 web/        WebAssembly build (WK Web Codec Studio)
 ideas/      roadmap and design notes
-graphify-out/ generated dependency graph (snapshot)
 ```
 
 ## Known Limitations
@@ -542,5 +539,4 @@ perceptual control field as its differentiator.
 - `web/README.md` — WebAssembly build
 - `ideas/NEXT_GEN_CODEC_ROADMAP.md` — phased roadmap
 - `ideas/PERCEPTUAL_CONTROL_FIELD.md` — control-field design
-- `graphify-out/GRAPH_REPORT.md` — generated dependency graph (snapshot)
-- `tools/skin_protection_research_2026-11-16.md` — Skin protection measurement
+- `docs/skin_protection_research_2026-11-16.md` — Skin protection measurement

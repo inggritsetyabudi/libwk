@@ -2,7 +2,8 @@
 
 `libjxl` 0.13.0, decode-only subset, vendored 2026-11-20 for JXL input
 (slice JXL decode). Research that picked this version:
-`tools/avif_jxl_convert_2026-11-19.md`. Vendor script:
+the AVIF/JXL conversion research notes of 19 Nov 2026 (kept locally,
+not in the repo). Vendor script:
 `~/workspace/libwk-exp-n1/jxl_slice/vendor_jxl.py` (copies the file
 sets from upstream `lib/jxl_lists.cmake`: `JPEGXL_INTERNAL_DEC_SOURCES`
 75 `.cc` + `JPEGXL_INTERNAL_DEC_BOX_SOURCES` 1 `.cc` +

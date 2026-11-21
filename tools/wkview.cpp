@@ -14,6 +14,7 @@
 // limitations under the License.
 #include "../src/core/common.h"
 #include "../src/core/image_io.h"
+#include "dither_display.h"
 #include "tonemap.h"
 #ifdef WK_VIEWER_GUI
 #include <MiniFB.h>
@@ -54,6 +55,9 @@ struct DisplayBuffer {
 
 struct ViewerPanel {
     DisplayBuffer image;
+    // --dither copy of the decoded panel (window only; the terminal
+    // path always uses image). Empty when dither is off.
+    std::optional<DisplayBuffer> dithered_image;
     std::string label;
     std::vector<std::string> info_lines;
     uint32_t label_bg = 0;
@@ -130,6 +134,9 @@ struct ViewerState {
     // Slice 3: --linear disables HDR tone-mapping (linear 16-bit
     // downscale, the pre-slice behaviour) for comparison.
     bool linear_display = false;
+    // --dither applies the measured display dither to the decoded
+    // panel in the window only (opt-in, default off).
+    bool dither_display = false;
     uint32_t list_scroll = 0;
     bool dirty = true;
     unsigned last_window_width = 0;
@@ -698,6 +705,27 @@ DisplayBuffer rasterize(const wk::Image& image, uint8_t cicp_transfer, bool line
     return display;
 }
 
+// Dithered copy of a rasterized panel for the window only. The plain
+// image is left untouched (the terminal path and the source panel
+// always use it).
+DisplayBuffer make_dithered_copy(const DisplayBuffer& image, uint8_t cicp_matrix, bool full_range) {
+    DisplayBuffer out = image;
+    std::vector<uint8_t> rgb(image.pixels.size() * 3);
+    for (size_t i = 0; i < image.pixels.size(); ++i) {
+        const uint32_t p = image.pixels[i];
+        rgb[i * 3 + 0] = static_cast<uint8_t>((p >> 16) & 0xff);
+        rgb[i * 3 + 1] = static_cast<uint8_t>((p >> 8) & 0xff);
+        rgb[i * 3 + 2] = static_cast<uint8_t>(p & 0xff);
+    }
+    wkview::apply_display_dither(rgb.data(), image.width, image.height, cicp_matrix, full_range);
+    for (size_t i = 0; i < image.pixels.size(); ++i) {
+        const uint32_t p = image.pixels[i];
+        out.pixels[i] = pack_rgba(rgb[i * 3 + 0], rgb[i * 3 + 1], rgb[i * 3 + 2],
+                                  static_cast<uint8_t>((p >> 24) & 0xff));
+    }
+    return out;
+}
+
 void blit_image(DisplayBuffer& canvas, const DisplayBuffer& image, uint32_t x, uint32_t y) {
     for (uint32_t row = 0; row < image.height; ++row) {
         std::copy_n(image.pixels.begin() + static_cast<std::ptrdiff_t>(row) * image.width,
@@ -1068,7 +1096,7 @@ wk::Result<std::pair<std::vector<ViewerItem>, size_t>> build_playlist(std::strin
     return std::make_pair(std::move(items), current_index);
 }
 
-ViewerDocument load_document(const ViewerItem& item, bool linear_display) {
+ViewerDocument load_document(const ViewerItem& item, bool linear_display, bool dither_display) {
     ViewerDocument document;
     document.wk_path = item.wk_path;
 
@@ -1119,6 +1147,10 @@ ViewerDocument load_document(const ViewerItem& item, bool linear_display) {
     // defaults it), so the transfer comes from the FHDR header read
     // above. No public struct changes for this.
     document.decoded_panel.image = rasterize(*decoded, info->cicp.transfer, linear_display);
+    if (dither_display) {
+        document.decoded_panel.dithered_image = make_dithered_copy(
+            document.decoded_panel.image, info->cicp.matrix, info->cicp.full_range);
+    }
     document.decoded_panel.label = "WK: " + item.wk_path.filename().string();
     document.decoded_panel.info_lines = make_wk_info_lines(item.wk_path.generic_string(),
                                                            file_size_or_zero(item.wk_path.generic_string()),
@@ -1391,6 +1423,7 @@ void draw_sidebar(DisplayBuffer& canvas, const ViewerState& state, const ViewerL
 
 void draw_panel(DisplayBuffer& canvas,
                 const ViewerPanel& panel,
+                const DisplayBuffer& image,
                 const Rect& label_rect,
                 const Rect& image_rect,
                 uint32_t image_bg) {
@@ -1402,7 +1435,7 @@ void draw_panel(DisplayBuffer& canvas,
                   fit_label_text(normalize_label(panel.label), label_rect.width),
                   panel.label_text);
     }
-    draw_scaled_image(canvas, panel.image, image_rect, image_bg);
+    draw_scaled_image(canvas, image, image_rect, image_bg);
 }
 
 DisplayBuffer compose_window(const ViewerState& state, uint32_t window_width, uint32_t window_height, ViewerLayout& out_layout) {
@@ -1430,9 +1463,14 @@ DisplayBuffer compose_window(const ViewerState& state, uint32_t window_width, ui
     draw_sidebar(canvas, state, out_layout);
 
     const uint32_t image_bg = pack_rgba(10, 10, 10, 255);
-    draw_panel(canvas, state.document.decoded_panel, out_layout.left_label, out_layout.left_image, image_bg);
+    draw_panel(canvas, state.document.decoded_panel,
+               state.document.decoded_panel.dithered_image.has_value()
+                   ? *state.document.decoded_panel.dithered_image
+                   : state.document.decoded_panel.image,
+               out_layout.left_label, out_layout.left_image, image_bg);
     if (out_layout.has_compare && state.document.source_panel.has_value()) {
-        draw_panel(canvas, *state.document.source_panel, out_layout.right_label, out_layout.right_image, image_bg);
+        draw_panel(canvas, *state.document.source_panel, state.document.source_panel->image,
+                   out_layout.right_label, out_layout.right_image, image_bg);
         fill_rect(canvas,
                   out_layout.left_panel.x + out_layout.left_panel.width,
                   out_layout.image_area.y,
@@ -1479,7 +1517,8 @@ void ensure_selection_visible(ViewerState& state) {
 }
 
 void load_current_document(ViewerState& state) {
-    state.document = load_document(state.items[state.current_index], state.linear_display);
+    state.document =
+        load_document(state.items[state.current_index], state.linear_display, state.dither_display);
     state.dirty = true;
 }
 
@@ -1943,6 +1982,7 @@ void print_usage() {
         << "  --diff                Heatmap of decoded-vs-source difference (needs a source)\n"
         << "  --no-color            Grayscale brightness ramp instead of truecolor\n"
         << "  --linear              Disable HDR tone-mapping (linear 16-bit downscale)\n"
+        << "  --dither              Display dither on Flat/Sky blocks (Gaussian sigma=1, window only)\n"
         << "\nControls (window mode):\n"
         << "  Left/Right or A/D   Previous or next WK file\n"
         << "  Up/Down             Move selection in the file list\n"
@@ -1962,6 +2002,7 @@ int main(int argc, char* argv[]) {
     ViewMode mode = ViewMode::Auto;
     TerminalViewOptions terminal_options;
     bool linear_display = false;
+    bool dither_display = false;
     std::vector<std::string> positional;
 
     for (int i = 1; i < argc; ++i) {
@@ -1980,6 +2021,10 @@ int main(int argc, char* argv[]) {
         }
         if (arg == "--linear") {
             linear_display = true;
+            continue;
+        }
+        if (arg == "--dither") {
+            dither_display = true;
             continue;
         }
         if (arg == "--diff") {
@@ -2032,7 +2077,9 @@ int main(int argc, char* argv[]) {
     state.show_list = state.items.size() > 1;
     state.compare_requested = state.items[state.current_index].has_source;
     state.linear_display = linear_display;
-    state.document = load_document(state.items[state.current_index], state.linear_display);
+    state.dither_display = dither_display;
+    state.document =
+        load_document(state.items[state.current_index], state.linear_display, state.dither_display);
 
     // Smart default: a window when a display exists, otherwise the
     // terminal. --cli forces the terminal, --window forces a window.
