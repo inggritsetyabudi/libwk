@@ -58,6 +58,7 @@ if(WK_BUILD_TESTS)
     wk_add_test(tool_log_test tests/tool_log_test.cpp)
     wk_add_test(tile_util_test tests/tile_util_test.cpp)
     wk_add_test(dither_display_test tests/dither_display_test.cpp)
+    wk_add_test(decoder_raster_alloc_test tests/decoder_raster_alloc_test.cpp)
 
     # The source-list check: verifies cmake/wk_sources.txt against
     # the tree and the web builds. It is a test, not a diagnostic,

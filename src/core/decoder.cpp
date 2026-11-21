@@ -66,6 +66,39 @@ Result<ImageInfo> get_info_impl(std::span<const uint8_t> data) {
     return tag;
 }
 
+// A frame's TILE chunks must cover its grid exactly once. Cheap
+// (tile headers + a tiles_x*tiles_y seen map, at most 64 KiB): it
+// must run before any frame-sized allocation, so a crafted header
+// cannot turn a few bytes into a multi-GB raster (#hole8).
+[[nodiscard]] Result<void> validate_tile_grid_coverage(const WkFile& file, const FrameHeader& hdr) {
+    const uint32_t tiles_x = hdr.tiles_x();
+    const uint32_t tiles_y = hdr.tiles_y();
+    if (file.tile_chunks.size() != hdr.tile_count()) {
+        return std::unexpected(Error{ErrorCode::DecodeFailed,
+                                     "tile chunk count does not match frame grid"});
+    }
+    std::vector<char> seen(static_cast<size_t>(tiles_x) * tiles_y, 0);
+    for (const auto& tile_chunk : file.tile_chunks) {
+        TileHeader tile_header;
+        auto tile_data = tile_payload_view(tile_chunk, tile_header);
+        if (!tile_data) return std::unexpected(tile_data.error());
+        if (tile_header.tile_x >= tiles_x || tile_header.tile_y >= tiles_y) {
+            return std::unexpected(Error{ErrorCode::InvalidTileCoord,
+                                         "tile coordinates out of range"});
+        }
+        const size_t index = static_cast<size_t>(tile_header.tile_y) * tiles_x +
+                             tile_header.tile_x;
+        if (seen[index]) {
+            return std::unexpected(Error{ErrorCode::InvalidTileCoord,
+                                         "duplicate tile chunk"});
+        }
+        seen[index] = 1;
+    }
+    // Chunk count equals the grid size and every coordinate is unique,
+    // so the grid is fully covered by the pigeonhole principle.
+    return {};
+}
+
 Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& config) {
     auto file = parse_container(data);
     if (!file) return std::unexpected(file.error());
@@ -78,7 +111,6 @@ Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& co
         return Image(width, height, static_cast<BitDepth>(hdr.bit_depth), hdr.has_alpha());
     }
 
-    Image output(width, height, static_cast<BitDepth>(hdr.bit_depth), hdr.has_alpha());
     if (hdr.is_lossless()) {
         // A lossless frame is either the pre-0.2.8 format (one tile at
         // (0,0) holding the whole frame) or the per-tile format (v0.2.8:
@@ -108,9 +140,13 @@ Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& co
                                              "lossless tile must be at (0, 0)"});
             }
 
+            // Decode first, allocate the output only once the payload
+            // proves decodable (#hole8): a truncated single tile must
+            // fail before any frame-sized raster exists.
             auto decoded = lossless_decode(*tile_data, width, height, hdr.bit_depth);
             if (!decoded) return std::unexpected(decoded.error());
 
+            Image output(width, height, static_cast<BitDepth>(hdr.bit_depth), hdr.has_alpha());
             if (hdr.has_alpha()) {
                 std::memcpy(output.pixels().data(), decoded->data(),
                             std::min(decoded->size(), output.pixels().size()));
@@ -129,31 +165,12 @@ Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& co
         // exactly once. A truncated file (fewer chunks than the grid)
         // fails here; a single tile payload decoded as a whole frame
         // above fails in the rANS/LZ stream instead -- either way it
-        // fails loudly, never as wrong pixels.
-        const uint32_t tiles_x = hdr.tiles_x();
-        const uint32_t tiles_y = hdr.tiles_y();
-        if (file->tile_chunks.size() != hdr.tile_count()) {
-            return std::unexpected(Error{ErrorCode::DecodeFailed,
-                                         "tile chunk count does not match frame grid"});
-        }
-        std::vector<char> seen(static_cast<size_t>(tiles_x) * tiles_y, 0);
-        for (const auto& tile_chunk : file->tile_chunks) {
-            TileHeader tile_header;
-            auto tile_data = tile_payload_view(tile_chunk, tile_header);
-            if (!tile_data) return std::unexpected(tile_data.error());
-            if (tile_header.tile_x >= tiles_x || tile_header.tile_y >= tiles_y) {
-                return std::unexpected(Error{ErrorCode::InvalidTileCoord,
-                                             "tile coordinates out of range"});
-            }
-            const size_t index = static_cast<size_t>(tile_header.tile_y) * tiles_x +
-                                 tile_header.tile_x;
-            if (seen[index]) {
-                return std::unexpected(Error{ErrorCode::InvalidTileCoord,
-                                             "duplicate tile chunk"});
-            }
-            seen[index] = 1;
-        }
+        // fails loudly, never as wrong pixels. Validate before
+        // allocating the output raster (#hole8).
+        auto coverage = validate_tile_grid_coverage(*file, hdr);
+        if (!coverage) return std::unexpected(coverage.error());
 
+        Image output(width, height, static_cast<BitDepth>(hdr.bit_depth), hdr.has_alpha());
         const uint32_t tile_size = hdr.tile_size();
         for (const auto& tile_chunk : file->tile_chunks) {
             TileHeader tile_header;
@@ -193,37 +210,29 @@ Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& co
     // A lossy frame must be covered by its TILE chunks exactly once:
     // a missing tile used to decode as a blank quadrant and a duplicated
     // tile silently overwrote the first copy. Check before decoding
-    // anything, so a malformed file fails fast instead of after work.
+    // anything, and before any frame-sized allocation, so a malformed
+    // file fails fast instead of after gigabytes of work (#hole8).
     // Animated files are excluded: their frames reuse tile coordinates
     // across frames, so grid coverage does not apply to them (animation
     // is unfinished -- the encoder never produces it and decode ignores
     // it -- so this stays out of scope rather than guessing its layout).
     if (!hdr.is_animated()) {
-        const uint32_t tiles_x = hdr.tiles_x();
-        const uint32_t tiles_y = hdr.tiles_y();
-        if (file->tile_chunks.size() != hdr.tile_count()) {
-            return std::unexpected(Error{ErrorCode::DecodeFailed,
-                                         "tile chunk count does not match frame grid"});
+        auto coverage = validate_tile_grid_coverage(*file, hdr);
+        if (!coverage) return std::unexpected(coverage.error());
+    }
+
+    // Every lossy tile starts with 256 bytes of quant tables + 8 bytes
+    // of block dims + a 4-byte layout tag: anything shorter is provably
+    // truncated, so reject it before the frame-wide planes are
+    // allocated (#hole8).
+    for (const auto& tile_chunk : file->tile_chunks) {
+        TileHeader tile_header;
+        auto tile_data = tile_payload_view(tile_chunk, tile_header);
+        if (!tile_data) return std::unexpected(tile_data.error());
+        if (tile_data->size() < 268) {
+            return std::unexpected(Error{ErrorCode::TruncatedInput,
+                                         "lossy tile payload shorter than tile header"});
         }
-        std::vector<char> seen(static_cast<size_t>(tiles_x) * tiles_y, 0);
-        for (const auto& tile_chunk : file->tile_chunks) {
-            TileHeader tile_header;
-            auto tile_data = tile_payload_view(tile_chunk, tile_header);
-            if (!tile_data) return std::unexpected(tile_data.error());
-            if (tile_header.tile_x >= tiles_x || tile_header.tile_y >= tiles_y) {
-                return std::unexpected(Error{ErrorCode::InvalidTileCoord,
-                                             "tile coordinates out of range"});
-            }
-            const size_t index = static_cast<size_t>(tile_header.tile_y) * tiles_x +
-                                 tile_header.tile_x;
-            if (seen[index]) {
-                return std::unexpected(Error{ErrorCode::InvalidTileCoord,
-                                             "duplicate tile chunk"});
-            }
-            seen[index] = 1;
-        }
-        // Chunk count equals the grid size and every coordinate is unique,
-        // so the grid is fully covered by the pigeonhole principle.
     }
 
     const uint32_t tile_size = hdr.tile_size();
@@ -351,6 +360,10 @@ Result<Image> decode_impl(std::span<const uint8_t> data, const DecoderConfig& co
         cr_full = std::move(full_cr);
     }
 
+    // The output raster is allocated last: every tile has already
+    // decoded into the planes above, so a truncated stream fails
+    // before this allocation, never after it (#hole8).
+    Image output(width, height, static_cast<BitDepth>(hdr.bit_depth), hdr.has_alpha());
     ycbcr_to_rgb(output.pixels().data(), full_y.data(), cb_full.data(), cr_full.data(),
                  width, height, hdr.cicp_matrix, hdr.bit_depth, hdr.full_range(),
                  hdr.has_alpha(), hdr.has_alpha() ? full_a.data() : nullptr);
