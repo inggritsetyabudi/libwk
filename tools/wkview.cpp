@@ -635,7 +635,8 @@ DisplayBuffer make_placeholder_image(uint32_t width, uint32_t height, uint32_t b
     return image;
 }
 
-DisplayBuffer rasterize(const wk::Image& image, uint8_t cicp_transfer, bool linear_display) {
+DisplayBuffer rasterize(const wk::Image& image, uint8_t cicp_transfer, uint8_t cicp_primaries,
+                      bool linear_display) {
     DisplayBuffer display;
     display.width = image.width();
     display.height = image.height();
@@ -661,32 +662,43 @@ DisplayBuffer rasterize(const wk::Image& image, uint8_t cicp_transfer, bool line
 
     if (!linear_display && wkview::is_hdr_transfer(cicp_transfer)) {
         // Slice 3 tone-map (viewer-only): PQ/HLG -> linear light via
-        // the EOTF -> Reinhard with a geometric-mean key value ->
-        // sRGB OETF -> 8-bit. The key value needs one pre-pass over
-        // the frame's linear luminance. Alpha stays linear, it is
-        // not light.
+        // the EOTF -> BT.2020 gamut mapping when the file is wide
+        // gamut (#gamut) -> Reinhard with a geometric-mean key value
+        // -> sRGB OETF -> 8-bit. The key value needs one pre-pass over
+        // the frame's linear luminance, computed on the gamut-mapped
+        // light so the BT.709 weights apply in sRGB space. Alpha stays
+        // linear, it is not light.
+        const bool gamut = wkview::needs_gamut_mapping(cicp_primaries);
+        std::vector<std::array<double, 3>> linear_rgb(display.pixels.size());
         std::vector<double> luminance(display.pixels.size());
         for (size_t i = 0; i < display.pixels.size(); ++i) {
             const uint8_t* pixel = source.data() + i * bytes_per_pixel;
-            const double r = wkview::tonemap_linear_rel(read_u16_le(pixel + 0), max_value,
-                                                        cicp_transfer);
-            const double g = wkview::tonemap_linear_rel(read_u16_le(pixel + 2), max_value,
-                                                        cicp_transfer);
-            const double b = wkview::tonemap_linear_rel(read_u16_le(pixel + 4), max_value,
-                                                        cicp_transfer);
-            luminance[i] = wkview::tonemap_luminance(r, g, b);
+            const std::array<double, 3> rgb = {wkview::tonemap_linear_rel(
+                                                   read_u16_le(pixel + 0), max_value,
+                                                   cicp_transfer),
+                                               wkview::tonemap_linear_rel(
+                                                   read_u16_le(pixel + 2), max_value,
+                                                   cicp_transfer),
+                                               wkview::tonemap_linear_rel(
+                                                   read_u16_le(pixel + 4), max_value,
+                                                   cicp_transfer)};
+            linear_rgb[i] = rgb;
+            if (gamut) {
+                const std::array<double, 3> mapped =
+                    wkview::gamut_map_bt2020_to_srgb(rgb[0], rgb[1], rgb[2]);
+                luminance[i] = wkview::tonemap_luminance(mapped[0], mapped[1], mapped[2]);
+            } else {
+                luminance[i] = wkview::tonemap_luminance(rgb[0], rgb[1], rgb[2]);
+            }
         }
         const double key_scale =
             wkview::tonemap_key_scale(wkview::tonemap_geometric_mean(luminance.data(),
                                                                      luminance.size()));
         for (size_t i = 0; i < display.pixels.size(); ++i) {
             const uint8_t* pixel = source.data() + i * bytes_per_pixel;
-            const uint8_t r = wkview::tonemap_to_u8(read_u16_le(pixel + 0), max_value,
-                                                    cicp_transfer, key_scale);
-            const uint8_t g = wkview::tonemap_to_u8(read_u16_le(pixel + 2), max_value,
-                                                    cicp_transfer, key_scale);
-            const uint8_t b = wkview::tonemap_to_u8(read_u16_le(pixel + 4), max_value,
-                                                    cicp_transfer, key_scale);
+            uint8_t r = 0, g = 0, b = 0;
+            wkview::tonemap_pixel_rgb(linear_rgb[i][0], linear_rgb[i][1], linear_rgb[i][2],
+                                     cicp_primaries, key_scale, r, g, b);
             const uint8_t a = has_alpha ? scale_to_u8(read_u16_le(pixel + 6), image.bit_depth())
                                         : 255;
             display.pixels[i] = pack_rgba(r, g, b, a);
@@ -1144,9 +1156,10 @@ ViewerDocument load_document(const ViewerItem& item, bool linear_display, bool d
 
     document.info = *info;
     // The decoded wk::Image does not carry CICP (its constructor
-    // defaults it), so the transfer comes from the FHDR header read
-    // above. No public struct changes for this.
-    document.decoded_panel.image = rasterize(*decoded, info->cicp.transfer, linear_display);
+    // defaults it), so the transfer and primaries come from the FHDR
+    // header read above. No public struct changes for this.
+    document.decoded_panel.image =
+        rasterize(*decoded, info->cicp.transfer, info->cicp.primaries, linear_display);
     if (dither_display) {
         document.decoded_panel.dithered_image = make_dithered_copy(
             document.decoded_panel.image, info->cicp.matrix, info->cicp.full_range);
@@ -1182,9 +1195,9 @@ ViewerDocument load_document(const ViewerItem& item, bool linear_display, bool d
     // A source file carries no CICP (PPM has none; stb loaders do not
     // set it), so its own transfer is BT.709 by default and a 16-bit
     // source stays linear, as before. Only the decoded panel is
-    // tone-mapped, from the FHDR transfer.
+    // tone-mapped, from the FHDR transfer and primaries.
     source_panel.image = rasterize(*source_image, source_image->info().cicp.transfer,
-                                   linear_display);
+                                   source_image->info().cicp.primaries, linear_display);
     source_panel.label = "SOURCE: " + item.source_path.filename().string();
     source_panel.info_lines = make_source_info_lines(item.source_path.generic_string(),
                                                      file_size_or_zero(item.source_path.generic_string()),
