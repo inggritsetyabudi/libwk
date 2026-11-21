@@ -762,8 +762,9 @@ TEST(HdrTest, ControlField10BitReproduces8Bit) {
             f8[i].quant_scale_index == f10[i].quant_scale_index) {
             ++agree;
         }
-        EXPECT_NEAR(f10[i].chroma_grad, f8[i].chroma_grad * 4.0f, 0.5f)
-            << "block " << i << ": chroma_grad must scale x4";
+        EXPECT_NEAR(f10[i].chroma_grad, f8[i].chroma_grad, 0.5f)
+            << "block " << i << ": chroma_grad is 8-bit scale at both "
+            << "depths (#cf10: planes requantized before classifying)";
     }
     EXPECT_EQ(agree, f8.size()) << "10-bit field must reproduce 8-bit exactly";
 
@@ -800,11 +801,63 @@ TEST(HdrTest, ControlField10BitReproduces8Bit) {
     EXPECT_GT(skin8, 0u) << "patch must classify Skin at 8-bit";
     EXPECT_EQ(skin10, skin8) << "Skin recall must be 100% at 10-bit (slice 0: 2179/2179)";
     EXPECT_EQ(skin_agree, sf8.size());
-    const auto m8 = skin_false_positive_mask(sf8, (sw + 7) / 8, (sh + 7) / 8, 8);
-    const auto m10 = skin_false_positive_mask(sf10, (sw + 7) / 8, (sh + 7) / 8, 10);
-    EXPECT_EQ(m10, m8) << "FP mask must agree (chroma-grad threshold 3.0 -> 12.0)";
+    const auto m8 = skin_false_positive_mask(sf8, (sw + 7) / 8, (sh + 7) / 8);
+    const auto m10 = skin_false_positive_mask(sf10, (sw + 7) / 8, (sh + 7) / 8);
+    EXPECT_EQ(m10, m8) << "FP mask must agree (chroma-grad threshold 3.0 "
+                       << "at both depths, #cf10)";
     EXPECT_EQ(std::count(m8.begin(), m8.end(), 1), 0)
         << "smooth skin patch must not be dropped at either depth";
+}
+
+// Control field on the REAL encoder path (hole #5b): the 10-bit planes
+// come from a second RGB->YCbCr pass, not exact x4 of the 8-bit planes,
+// and its rounding shifts hue ~+2 deg. A Skin patch sitting on the -15
+// deg hue edge (RGB 163,134,134 -> YCbCr ~140,124,142, like the
+// textui_ui_light blocks that lost all 32 Skin blocks at 10-bit)
+// loses ALL its Skin blocks pre-fix; the fix must bring them back.
+TEST(HdrTest, ControlField10BitSkinEdgeViaRealConversion) {
+    const uint32_t w = 64, h = 64;
+    const size_t n = static_cast<size_t>(w) * h;
+    Image img8(w, h, BitDepth::Bits8, false);
+    Image img10(w, h, BitDepth::Bits10, false);
+    auto px8 = img8.pixels().data();
+    auto px10 = px16(img10);
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            const int d = static_cast<int>((x + 2 * y) % 9) - 4;
+            const size_t i = (static_cast<size_t>(y) * w + x) * 3;
+            px8[i + 0] = static_cast<uint8_t>(std::clamp(163 + d, 0, 255));
+            px8[i + 1] = static_cast<uint8_t>(std::clamp(134 + d, 0, 255));
+            px8[i + 2] = static_cast<uint8_t>(std::clamp(134 - d, 0, 255));
+            px10[i + 0] = static_cast<uint16_t>(4 * px8[i + 0]);
+            px10[i + 1] = static_cast<uint16_t>(4 * px8[i + 1]);
+            px10[i + 2] = static_cast<uint16_t>(4 * px8[i + 2]);
+        }
+    }
+    Planes p8, p10;
+    p8.y.resize(n);
+    p8.cb.resize(n);
+    p8.cr.resize(n);
+    p10.y.resize(n);
+    p10.cb.resize(n);
+    p10.cr.resize(n);
+    rgb_to_ycbcr(p8.y.data(), p8.cb.data(), p8.cr.data(),
+                 img8.pixels().data(), w, h, 1, 8, true, false);
+    rgb_to_ycbcr(p10.y.data(), p10.cb.data(), p10.cr.data(),
+                 img10.pixels().data(), w, h, 1, 10, true, false);
+    const auto f8 = analyze_control_field(p8.y.data(), w, h, p8.cb.data(),
+                                          p8.cr.data(), 8);
+    const auto f10 = analyze_control_field(p10.y.data(), w, h, p10.cb.data(),
+                                           p10.cr.data(), 10);
+    ASSERT_EQ(f8.size(), f10.size());
+    size_t skin8 = 0, skin10 = 0;
+    for (size_t i = 0; i < f8.size(); ++i) {
+        if (f8[i].content == BlockContent::Skin) ++skin8;
+        if (f10[i].content == BlockContent::Skin) ++skin10;
+    }
+    EXPECT_EQ(skin8, f8.size()) << "edge patch must classify Skin at 8-bit";
+    EXPECT_EQ(skin10, skin8)
+        << "Skin recall must be 100% at 10-bit on the real conversion path";
 }
 
 // 16-bit PPM input: maxval 1023 loads as 10-bit, maxval 4095 as

@@ -73,7 +73,13 @@ struct BlockControl {
 // bit_depth rescales the 8-bit-calibrated thresholds above 8-bit
 // (gradients/colours x4, variances x16 at 10-bit; measured slice 0,
 // 2026-11-17: 100.00% agreement with the 8-bit classification on
-// 176,697 blocks). At 8-bit the behaviour is identical.
+// 176,697 blocks). That exactness holds only for planes that are
+// exact x4 of the 8-bit planes; the real RGB->YCbCr pass rounds
+// differently, so above 8-bit the planes are first requantized to
+// 8-bit scale inside the function (luma rounds to nearest, chroma
+// floors — see control_field.cpp, #cf10) and classified at v = 1.
+// Measured on the real encoder path: 99.792% agreement, Skin
+// recall 100%. At 8-bit the behaviour is identical.
 std::vector<BlockControl> analyze_control_field(
     const int16_t* tile_luma, uint32_t tw, uint32_t th,
     const int16_t* tile_cb = nullptr, const int16_t* tile_cr = nullptr,
@@ -87,13 +93,15 @@ std::vector<BlockControl> analyze_control_field(
 // high (rock, not skin). Non-Skin blocks are always 0. The rule is
 // measured, not guessed: (component width >= 40 AND aspect >= 2.0)
 // OR chroma_grad >= 3.0 cuts 46.6% of the SKIN_A file cost at ~zero
-// GT loss (2026-11-16). The chroma-grad threshold scales with bit
-// depth like the field's (x4 at 10-bit). Components are 8-connected
+// GT loss (2026-11-16). The chroma-grad threshold does not scale
+// with bit depth: analyze_control_field requantizes above-8-bit
+// planes to 8-bit scale (#cf10), so the field's chroma_grad is
+// always in 8-bit code values. Components are 8-connected
 // over the Skin mask of the whole frame — a single tile cannot see
 // them, so the caller classifies the frame once and hands the mask
 // to the tiles.
 std::vector<uint8_t> skin_false_positive_mask(
     const std::vector<BlockControl>& field, uint32_t blocks_per_row,
-    uint32_t blocks_per_col, uint8_t bit_depth = 8);
+    uint32_t blocks_per_col);
 
 }  // namespace wk
