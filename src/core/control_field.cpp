@@ -70,11 +70,47 @@ std::vector<BlockControl> analyze_control_field(
     // slice 0, 2026-11-17: 100.00% classification agreement on
     // 176,697 blocks, Skin/TextUI recall 100%; 98.44% under
     // BT.2020. At 8-bit v = 1: behaviour identical.
+    //
+    // #cf10: above 8-bit the planes are first requantized to 8-bit
+    // scale and classified at v = 1. The v-scaled thresholds are
+    // exact only for planes that are exact x4 of the 8-bit planes;
+    // the real RGB->YCbCr pass rounds differently (Y -2..+2,
+    // Cb -1..+4 codes), which shifted hue ~+2 deg and lost all
+    // edge Skin blocks (99.281% agreement, Skin recall 96.2% on
+    // the real path). Luma rounds to nearest, chroma floors: the
+    // +1.5-code chroma offset aligns chroma rounding exactly, luma
+    // has no such offset. Measured on the 12-image slice-0 corpus:
+    // 99.792% agreement, Skin recall 100%. The residual 0.21% is
+    // luma rounding noise at threshold edges; exactly 100% would
+    // need classifying from RGB-derived 8-bit planes (encoder
+    // data-flow change, not this slice).
+    const bool use_color = tile_cb != nullptr && tile_cr != nullptr;
+    std::vector<int16_t> yq, cbq, crq;
+    if (bit_depth > 8) {
+        const unsigned shift = static_cast<unsigned>(bit_depth) - 8;
+        const size_t npix = static_cast<size_t>(tw) * th;
+        yq.resize(npix);
+        for (size_t i = 0; i < npix; ++i) {
+            yq[i] = static_cast<int16_t>(
+                (tile_luma[i] + (1 << (shift - 1))) >> shift);
+        }
+        if (use_color) {
+            cbq.resize(npix);
+            crq.resize(npix);
+            for (size_t i = 0; i < npix; ++i) {
+                cbq[i] = static_cast<int16_t>(tile_cb[i] >> shift);
+                crq[i] = static_cast<int16_t>(tile_cr[i] >> shift);
+            }
+        }
+        tile_luma = yq.data();
+        tile_cb = use_color ? cbq.data() : nullptr;
+        tile_cr = use_color ? crq.data() : nullptr;
+        bit_depth = 8;
+    }
     const double v =
         static_cast<double>(1 << std::max(0, static_cast<int>(bit_depth) - 8));
     const double v2 = v * v;
     const double mid = 128.0 * v;
-    const bool use_color = tile_cb != nullptr && tile_cr != nullptr;
     const uint32_t blocks_per_row = (tw + 7) / 8;
     const uint32_t blocks_per_col = (th + 7) / 8;
     std::vector<BlockControl> field;
@@ -278,17 +314,17 @@ std::vector<BlockControl> analyze_control_field(
 
 std::vector<uint8_t> skin_false_positive_mask(
     const std::vector<BlockControl>& field, uint32_t blocks_per_row,
-    uint32_t blocks_per_col, uint8_t bit_depth) {
+    uint32_t blocks_per_col) {
     std::vector<uint8_t> mask(field.size(), 0);
     if (field.empty() || blocks_per_row == 0 || blocks_per_col == 0 ||
         field.size() != static_cast<size_t>(blocks_per_row) * blocks_per_col)
         return mask;
 
-    // The chroma-grad threshold is 8-bit-calibrated (3.0); it scales
-    // with the code-value range like the field's (x4 at 10-bit).
-    const float cgrad_threshold = static_cast<float>(
-        kSkinFpMinChromaGrad *
-        (1 << std::max(0, static_cast<int>(bit_depth) - 8)));
+    // The chroma-grad threshold is 8-bit-calibrated (3.0) and no
+    // longer scales with bit depth: analyze_control_field now
+    // requantizes above-8-bit planes to 8-bit scale (#cf10), so
+    // the field's chroma_grad is always in 8-bit code values.
+    const float cgrad_threshold = kSkinFpMinChromaGrad;
 
     // 8-connected components over the Skin mask (same connectivity as
     // the research diagnostic). A component is described by its

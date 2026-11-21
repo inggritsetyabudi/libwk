@@ -393,7 +393,7 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
                 y_plane.data(), width, height,
                 classify_cb_plane, classify_cr_plane, fhdr.bit_depth);
             skin_drop_mask = skin_false_positive_mask(
-                frame_field, (width + 7) / 8, (height + 7) / 8, fhdr.bit_depth);
+                frame_field, (width + 7) / 8, (height + 7) / 8);
         }
 
         ThreadPool pool(config.threads);
