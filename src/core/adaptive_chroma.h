@@ -47,12 +47,22 @@ inline constexpr size_t kAdaptiveChromaMinSaturatedSamples = 10;
 //     exceeds kAdaptiveChromaSaturationThreshold; -1 when there are fewer
 //     than kAdaptiveChromaMinSaturatedSamples such values.
 //   sat_count: number of |Laplacian| values at saturated pixels.
+//   frac_gt2: fraction of combined Cb+Cr |Laplacian| values above 2
+//     (scaled 2 << (bit_depth - 8)); the dense mid-range texture the
+//     mean drowns (a period-8 sinusoid has frac_gt2 0.30 at mean 1.71).
+//   dct_band: fraction of the tile's detrended chroma AC energy (per
+//     8x8 block DCT, pooled over Cb+Cr) falling on coefficients
+//     (u, v) in 1..3; a period-8 sinusoid concentrates ~0.95 of its
+//     energy there, natural texture spreads it (safe tiles stay below
+//     0.31). 0 when the tile has no AC energy.
 // For a degenerate region (no interior pixel) mean and p999 are +inf.
 struct ChromaLaplacianStats {
     double mean = 0.0;
     double p999 = 0.0;
     double sat_p999 = -1.0;
     size_t sat_count = 0;
+    double frac_gt2 = 0.0;
+    double dct_band = 0.0;
 };
 
 // Mean, p999 and saturated p999 of |Laplacian| over a tile region.
@@ -79,12 +89,21 @@ struct ChromaLaplacianStats {
 // drowns (a step edge has p999 79 while its mean is 0.15); the saturated
 // p999 catches small saturated features (lips: sat_p999 116 while the
 // plain p999 is only 34) that the plain p999 also misses.
+// Third/fourth conditions (0 = disabled): when frac_gt2_threshold > 0
+// and the tile's frac_gt2 reaches it, or dct_band_threshold > 0 and the
+// tile's dct_band reaches it, the tile is forced to YUV444 as well.
+// They catch periodic high-frequency chroma the mean and the
+// percentiles are blind to (a period-8 sinusoid has mean 1.71, p999 8,
+// sat_p999 -1, but frac_gt2 0.30 and dct_band 0.95); both are fractions,
+// so they do not scale with bit depth.
 [[nodiscard]] bool should_subsample_chroma_420(const int16_t* cb_plane, const int16_t* cr_plane,
                                                uint32_t plane_width, uint32_t plane_height,
                                                uint32_t x0, uint32_t y0, uint32_t tw, uint32_t th,
                                                double threshold = kAdaptiveChromaLaplacianThreshold,
                                                double p999_threshold = 0.0,
                                                double sat_p999_threshold = 0.0,
-                                               uint8_t bit_depth = 8);
+                                               uint8_t bit_depth = 8,
+                                               double frac_gt2_threshold = 0.0,
+                                               double dct_band_threshold = 0.0);
 
 }  // namespace wk

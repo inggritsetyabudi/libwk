@@ -77,6 +77,8 @@ extern "C"
         float adaptive_chroma_laplacian_threshold;
         float adaptive_chroma_lap_p999_threshold;
         float adaptive_chroma_lap_sat_p999_threshold;
+        float adaptive_chroma_lap_frac_gt2_threshold;
+        float adaptive_chroma_dct_band_threshold;
         uint16_t max_cll;   // HDR mastering metadata, nits (0 = unspecified).
         uint16_t max_fall;  // HDR mastering metadata, nits (0 = unspecified).
     } wk_encoder_config_t;

@@ -28,6 +28,37 @@ std::vector<int16_t> flat_plane(uint32_t w, uint32_t h, int16_t value) {
     return std::vector<int16_t>(static_cast<size_t>(w) * h, value);
 }
 
+// Builds the b3_a3 synthetic probe (F3 adaptive-chroma experiment):
+// chroma gradient + 2D sinusoid of period 8px (= chroma Nyquist),
+// amplitude A. Cb = mid + 22*(x/512) + A*sin(2*pi*x/8)*sin(2*pi*y/8),
+// Cr = mid - 18*(y/512) + A*cos(2*pi*x/8)*cos(2*pi*y/8), with mid and
+// amplitude scaled by `scale` (1 = 8-bit, 4 = 10-bit, 16 = 12-bit).
+// The gradient denominators are the full 512px probe size, not the
+// tile size: the tile is a crop of the probe, and a gradient over the
+// tile width would be 8x too steep (its rounding staircase would
+// pollute the Laplacian and dilute dct_band).
+void b3_probe(uint32_t w, uint32_t h, double amplitude, int scale,
+              std::vector<int16_t>& cb, std::vector<int16_t>& cr) {
+    constexpr double kPi = 3.14159265358979323846;
+    const double mid = 128.0 * scale;
+    cb.assign(static_cast<size_t>(w) * h, 0);
+    cr.assign(static_cast<size_t>(w) * h, 0);
+    for (uint32_t r = 0; r < h; ++r) {
+        for (uint32_t c = 0; c < w; ++c) {
+            const double sx = std::sin(2.0 * kPi * static_cast<double>(c) / 8.0);
+            const double sy = std::sin(2.0 * kPi * static_cast<double>(r) / 8.0);
+            const double cx = std::cos(2.0 * kPi * static_cast<double>(c) / 8.0);
+            const double cy = std::cos(2.0 * kPi * static_cast<double>(r) / 8.0);
+            const double cb_v = mid + 22.0 * scale * static_cast<double>(c) / 512.0 +
+                                amplitude * scale * sx * sy;
+            const double cr_v = mid - 18.0 * scale * static_cast<double>(r) / 512.0 +
+                                amplitude * scale * cx * cy;
+            cb[static_cast<size_t>(r) * w + c] = static_cast<int16_t>(std::lround(cb_v));
+            cr[static_cast<size_t>(r) * w + c] = static_cast<int16_t>(std::lround(cr_v));
+        }
+    }
+}
+
 }  // namespace
 
 TEST(AdaptiveChroma, FlatChromaHasZeroLaplacian) {
@@ -165,4 +196,121 @@ TEST(AdaptiveChroma, SatP999CatchesSmallSaturatedFeature) {
                                              2.1, 0.0, 100.0));
     EXPECT_FALSE(should_subsample_chroma_420(cb.data(), cr.data(), 256, 256, 0, 0, 256, 256,
                                              2.1, 79.0, 100.0));
+}
+
+// ---- b3_a3 periodic-HF failure mode (hole #9) ----
+
+TEST(AdaptiveChroma, B3TileA3Stats) {
+    // 64x64 b3 probe, amplitude 3.0 (the b3_a3.0 case): the 5-tap
+    // Laplacian barely sees the 8px sinusoid (mean 1.58 < 2.1, p999 5),
+    // but the spectrum is concentrated in one band (dct_band ~0.96)
+    // and a third of the |Laplacian| values exceed 2 (frac_gt2 ~0.30).
+    // Python replica of this exact synthetic pattern (analyze2.py):
+    // mean 1.582, p999 5, frac_gt2 0.303, dct_band 0.956. (The full
+    // probe's float values are 1.712 / 8 / 0.300 / 0.947 — the gaps are
+    // the RGB round-trip noise the synthetic tile lacks.)
+    std::vector<int16_t> cb, cr;
+    b3_probe(64, 64, 3.0, 1, cb, cr);
+    const auto stats = chroma_laplacian_stats(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64);
+    EXPECT_NEAR(stats.mean, 1.58, 0.15);
+    EXPECT_DOUBLE_EQ(stats.p999, 5.0);
+    EXPECT_NEAR(stats.frac_gt2, 0.30, 0.03);
+    EXPECT_NEAR(stats.dct_band, 0.96, 0.04);
+    // Without the new conditions the tile goes 420 (the bug).
+    EXPECT_TRUE(should_subsample_chroma_420(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64,
+                                            2.1, 79.0, 100.0));
+    // With them it goes 444.
+    EXPECT_FALSE(should_subsample_chroma_420(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64,
+                                             2.1, 79.0, 100.0, 8, 0.28, 0.50));
+}
+
+TEST(AdaptiveChroma, B3TileA2CaughtByDctBandOnly) {
+    // Amplitude 2.0: frac_gt2 0.147 is BELOW 0.28, so the third
+    // condition alone does not catch it; dct_band 0.915 does.
+    // Python replica of this exact synthetic pattern: mean 1.008,
+    // frac_gt2 0.147, dct_band 0.915.
+    std::vector<int16_t> cb, cr;
+    b3_probe(64, 64, 2.0, 1, cb, cr);
+    const auto stats = chroma_laplacian_stats(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64);
+    EXPECT_NEAR(stats.mean, 1.01, 0.15);
+    EXPECT_NEAR(stats.frac_gt2, 0.15, 0.03);
+    EXPECT_NEAR(stats.dct_band, 0.92, 0.04);
+    // frac_gt2 alone: still 420 (tolerated at -2.72 dB).
+    EXPECT_TRUE(should_subsample_chroma_420(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64,
+                                            2.1, 79.0, 100.0, 8, 0.28, 0.0));
+    // dct_band alone: 444.
+    EXPECT_FALSE(should_subsample_chroma_420(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64,
+                                             2.1, 79.0, 100.0, 8, 0.0, 0.50));
+    // Both on: 444.
+    EXPECT_FALSE(should_subsample_chroma_420(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64,
+                                             2.1, 79.0, 100.0, 8, 0.28, 0.50));
+}
+
+TEST(AdaptiveChroma, SafeGradientTileStays420) {
+    // Gradient only (amplitude 0, the a_sky shape): a linear ramp has
+    // ~zero Laplacian and its DCT energy sits on the (u,0)/(0,v) axes,
+    // outside the 1..3 band, so dct_band is ~0 and the tile stays 420.
+    // Python replica: mean 0.081 (the rounding staircase), dct_band 0.
+    std::vector<int16_t> cb, cr;
+    b3_probe(64, 64, 0.0, 1, cb, cr);
+    const auto stats = chroma_laplacian_stats(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64);
+    EXPECT_NEAR(stats.mean, 0.08, 0.05);
+    EXPECT_DOUBLE_EQ(stats.frac_gt2, 0.0);
+    EXPECT_NEAR(stats.dct_band, 0.0, 0.02);
+    EXPECT_TRUE(should_subsample_chroma_420(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64,
+                                            2.1, 79.0, 100.0, 8, 0.28, 0.50));
+}
+
+TEST(AdaptiveChroma, FlatTileDctBandIsZero) {
+    // No AC energy at all: dct_band is 0 by the e_ac == 0 guard.
+    auto cb = flat_plane(16, 16, 128);
+    auto cr = flat_plane(16, 16, 128);
+    const auto stats = chroma_laplacian_stats(cb.data(), cr.data(), 16, 16, 0, 0, 16, 16);
+    EXPECT_DOUBLE_EQ(stats.dct_band, 0.0);
+    EXPECT_DOUBLE_EQ(stats.frac_gt2, 0.0);
+    EXPECT_TRUE(should_subsample_chroma_420(cb.data(), cr.data(), 16, 16, 0, 0, 16, 16,
+                                            2.1, 79.0, 100.0, 8, 0.28, 0.50));
+}
+
+TEST(AdaptiveChroma, B3Tile10BitSpotCheck) {
+    // Same A=3.0 pattern scaled x4 (mid 512): dct_band is a fraction
+    // so it does not scale, and the frac_gt2 cut scales 2 << (bd-8) =
+    // 8. Thresholds scale with the code-value range (x4), as at the
+    // encoder call site. Expect the same 444 decision as 8-bit.
+    // Python replica: mean 5.354, frac_gt2 (cut 8) 0.248, dct_band
+    // 0.985. Note frac_gt2 0.248 is BELOW 0.28 here, so dct_band
+    // carries the decision at 10-bit; the separation still holds with
+    // a wide margin (0.985 vs the 0.50 threshold).
+    std::vector<int16_t> cb, cr;
+    b3_probe(64, 64, 3.0, 4, cb, cr);
+    const auto stats = chroma_laplacian_stats(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64, 10);
+    EXPECT_NEAR(stats.mean, 5.35, 0.6);
+    EXPECT_NEAR(stats.frac_gt2, 0.25, 0.03);
+    EXPECT_NEAR(stats.dct_band, 0.99, 0.04);
+    EXPECT_FALSE(should_subsample_chroma_420(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64,
+                                             8.4, 316.0, 400.0, 10, 0.28, 0.50));
+    // Gradient-only at 10-bit stays 420.
+    std::vector<int16_t> gcb, gcr;
+    b3_probe(64, 64, 0.0, 4, gcb, gcr);
+    EXPECT_TRUE(should_subsample_chroma_420(gcb.data(), gcr.data(), 64, 64, 0, 0, 64, 64,
+                                            8.4, 316.0, 400.0, 10, 0.28, 0.50));
+}
+
+TEST(AdaptiveChroma, B3Tile12BitSpotCheck) {
+    // Same A=3.0 pattern scaled x16 (mid 2048); thresholds x16.
+    // Python replica: mean 20.864, frac_gt2 (cut 32) 0.313, dct_band
+    // 0.987 — the separation holds at 12-bit too.
+    std::vector<int16_t> cb, cr;
+    b3_probe(64, 64, 3.0, 16, cb, cr);
+    const auto stats = chroma_laplacian_stats(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64, 12);
+    EXPECT_NEAR(stats.mean, 20.86, 2.5);
+    EXPECT_NEAR(stats.frac_gt2, 0.31, 0.03);
+    EXPECT_NEAR(stats.dct_band, 0.99, 0.04);
+    EXPECT_FALSE(should_subsample_chroma_420(cb.data(), cr.data(), 64, 64, 0, 0, 64, 64,
+                                             33.6, 1264.0, 1600.0, 12, 0.28, 0.50));
+    // Gradient-only at 12-bit stays 420.
+    std::vector<int16_t> gcb, gcr;
+    b3_probe(64, 64, 0.0, 16, gcb, gcr);
+    EXPECT_TRUE(should_subsample_chroma_420(gcb.data(), gcr.data(), 64, 64, 0, 0, 64, 64,
+                                            33.6, 1264.0, 1600.0, 12, 0.28, 0.50));
 }
