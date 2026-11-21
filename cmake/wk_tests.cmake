@@ -41,6 +41,7 @@ if(WK_BUILD_TESTS)
     wk_add_test(quantize_test tests/quantize_test.cpp)
     wk_add_test(metrics_test tests/metrics_test.cpp)
     wk_add_test(c_api_test tests/c_api_test.cpp)
+    wk_add_test(c_api_encode_test tests/c_api_encode_test.cpp)
     wk_add_test(wk_hpp_test tests/wk_hpp_test.cpp)
     wk_add_test(threading_test tests/threading_test.cpp)
     wk_add_test(arch_test tests/arch_test.cpp)
@@ -59,6 +60,17 @@ if(WK_BUILD_TESTS)
     wk_add_test(tile_util_test tests/tile_util_test.cpp)
     wk_add_test(dither_display_test tests/dither_display_test.cpp)
     wk_add_test(decoder_raster_alloc_test tests/decoder_raster_alloc_test.cpp)
+
+    # ASan Debug builds make the encode-heavy tests extremely slow: one
+    # 16x16 full-entropy encode costs ~65 s under ASan vs 3 s in Release
+    # (see tools/holes_asan_stall_2026-11-21.md). Give them an explicit
+    # timeout so a CI default timeout does not kill them mid-run. Only
+    # when the build actually carries -fsanitize=address; Release and
+    # normal builds keep the default (no timeout).
+    if(CMAKE_C_FLAGS MATCHES "-fsanitize=address" OR CMAKE_CXX_FLAGS MATCHES "-fsanitize=address")
+        set_tests_properties(c_api_test hdr_test roundtrip_test c_api_encode_test
+            PROPERTIES TIMEOUT 7200)
+    endif()
 
     # The source-list check: verifies cmake/wk_sources.txt against
     # the tree and the web builds. It is a test, not a diagnostic,
