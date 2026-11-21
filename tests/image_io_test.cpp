@@ -14,8 +14,10 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include "../src/core/image_io.h"
 #include "../src/core/avif_decode.h"
 #include "../src/core/jxl_decode.h"
@@ -697,6 +699,63 @@ TEST(ImageIoTest, LoadAvifRejects12Bit) {
     ASSERT_FALSE(loaded.has_value());
     EXPECT_NE(loaded.error().message.find("bit depth"), std::string::npos)
         << loaded.error().message;
+}
+
+// Rewrite the ispe width/height of an AVIF byte string in place
+// (ispe box: size + type + version/flags + width + height, all big
+// endian). Returns nullopt when no ispe box is found.
+std::optional<std::vector<uint8_t>> patch_ispe_dims(const std::vector<uint8_t>& bytes,
+                                                    uint32_t width, uint32_t height) {
+    static constexpr uint8_t kIspe[4] = {'i', 's', 'p', 'e'};
+    for (size_t i = 0; i + 16 <= bytes.size(); ++i) {
+        if (std::memcmp(bytes.data() + i, kIspe, 4) != 0) continue;
+        std::vector<uint8_t> patched = bytes;
+        const auto put_u32be = [&](size_t at, uint32_t v) {
+            patched[at] = static_cast<uint8_t>(v >> 24);
+            patched[at + 1] = static_cast<uint8_t>(v >> 16);
+            patched[at + 2] = static_cast<uint8_t>(v >> 8);
+            patched[at + 3] = static_cast<uint8_t>(v);
+        };
+        put_u32be(i + 8, width);
+        put_u32be(i + 12, height);
+        return patched;
+    }
+    return std::nullopt;
+}
+
+TEST(ImageIoTest, LoadAvifRejectsIspeDimsLie) {
+    // ispe says 2048x2048 but the AV1 frame is 16x16: the decoder must
+    // reject the file instead of scaling the frame up to the ispe size
+    // (fuzz finding 1: a 16384x16384 lie cost 33 s / 4.6 GB).
+    const auto bytes = read_fixture_bytes("tiny_grad_444_10.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    const auto lied = patch_ispe_dims(bytes, 2048, 2048);
+    ASSERT_TRUE(lied.has_value());
+    const auto decoded = avif::decode(*lied);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_NE(decoded.error().message.find("ispe"), std::string::npos)
+        << decoded.error().message;
+    // Control: the same patcher writing the true 16x16 dims still
+    // decodes — the check must not reject a truthful ispe.
+    const auto honest = patch_ispe_dims(bytes, 16, 16);
+    ASSERT_TRUE(honest.has_value());
+    const auto decoded2 = avif::decode(*honest);
+    ASSERT_TRUE(decoded2.has_value()) << decoded2.error().message;
+    EXPECT_EQ(decoded2->width(), 16u);
+    EXPECT_EQ(decoded2->height(), 16u);
+}
+
+TEST(ImageIoTest, LoadAvifRejectsIspeDimsLieHuge) {
+    // The exact fuzz reproducer: ispe 16384x16384 on a 16x16 frame.
+    // Pre-fix this allocates ~4.6 GB; post-fix it must fail fast.
+    const auto bytes = read_fixture_bytes("tiny_grad_444_10.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    const auto lied = patch_ispe_dims(bytes, 16384, 16384);
+    ASSERT_TRUE(lied.has_value());
+    const auto decoded = avif::decode(*lied);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_NE(decoded.error().message.find("ispe"), std::string::npos)
+        << decoded.error().message;
 }
 
 TEST(ImageIoTest, LoadAvifRejectsTruncated) {

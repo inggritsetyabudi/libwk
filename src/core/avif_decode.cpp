@@ -16,6 +16,8 @@
 #include "avif_decode.h"
 #include "avif/avif.h"
 #include "common.h"
+#include "dav1d/dav1d.h"
+#include "dav1d/headers.h"
 #include <cstring>
 #include <optional>
 
@@ -136,6 +138,214 @@ bool has_grid_item(std::span<const uint8_t> bytes) {
     return false;
 }
 
+// ---- ispe vs AV1 frame dims (#ispe) ----
+// A lying ispe makes the decoder scale the AV1 frame up to the ispe
+// size (fuzz finding 1: ispe 16384x16384 on a 16x16 frame cost 33 s /
+// 4.6 GB). Reject before NextImage when the ispe dims disagree with
+// the AV1 sequence-header dims from the primary item's data.
+
+// Content offset of a box: 8 for a normal header, 16 for largesize.
+size_t box_content_begin(std::span<const uint8_t> bytes, const Box& box) {
+    return box.begin + (read_u32be(bytes, box.begin) == 1 ? 16 : 8);
+}
+
+std::optional<Box> find_top_box(std::span<const uint8_t> bytes, const char* type) {
+    size_t cursor = 0;
+    while (auto box = next_box(bytes, cursor, bytes.size())) {
+        if (box_type_is(bytes, *box, type)) return *box;
+        cursor = box->end;
+    }
+    return std::nullopt;
+}
+
+std::optional<Box> find_child_box(std::span<const uint8_t> bytes, size_t begin, size_t end,
+                                  const char* type) {
+    size_t cursor = begin;
+    while (auto box = next_box(bytes, cursor, end)) {
+        if (box_type_is(bytes, *box, type)) return *box;
+        cursor = box->end;
+    }
+    return std::nullopt;
+}
+
+// Primary item ID from pitm (version 0: U16, version 1: U32).
+std::optional<uint32_t> primary_item_id(std::span<const uint8_t> bytes) {
+    auto meta = find_top_box(bytes, "meta");
+    if (!meta) return std::nullopt;
+    const size_t content = box_content_begin(bytes, *meta);
+    if (content + 4 > meta->end) return std::nullopt;
+    auto pitm = find_child_box(bytes, content + 4, meta->end, "pitm");
+    if (!pitm) return std::nullopt;
+    const size_t c = box_content_begin(bytes, *pitm);
+    if (c + 4 > pitm->end) return std::nullopt;
+    if (bytes[c] == 0) {
+        if (c + 6 > pitm->end) return std::nullopt;
+        return (static_cast<uint32_t>(bytes[c + 4]) << 8) | bytes[c + 5];
+    }
+    if (bytes[c] == 1) {
+        if (c + 8 > pitm->end) return std::nullopt;
+        return read_u32be(bytes, c + 4);
+    }
+    return std::nullopt;
+}
+
+// (offset, length) of the first non-empty extent of the given item in
+// iloc, following libavif's reader (read.c): version 0/1/2, item ID
+// U16 (v<2) / U32 (v2), data_reference_index U16, base_offset, then
+// extents. Only construction method 0 (file offset) is supported;
+// anything else cannot be located here and fails the check.
+std::optional<std::pair<uint64_t, uint64_t>> primary_item_extent(std::span<const uint8_t> bytes,
+                                                                  uint32_t item_id) {
+    auto meta = find_top_box(bytes, "meta");
+    if (!meta) return std::nullopt;
+    const size_t content = box_content_begin(bytes, *meta);
+    if (content + 4 > meta->end) return std::nullopt;
+    auto iloc = find_child_box(bytes, content + 4, meta->end, "iloc");
+    if (!iloc) return std::nullopt;
+    const size_t c = box_content_begin(bytes, *iloc);
+    const size_t end = iloc->end;
+    // version/flags (4) + offset/length sizes (1) + base/index sizes (1).
+    if (c + 6 > end) return std::nullopt;
+    const uint8_t version = bytes[c];
+    if (version > 2) return std::nullopt;
+    const size_t offset_size = bytes[c + 4] >> 4;
+    const size_t length_size = bytes[c + 4] & 0xF;
+    const size_t base_offset_size = bytes[c + 5] >> 4;
+    const size_t index_size = bytes[c + 5] & 0xF;
+    const auto size_ok = [](size_t s) { return s == 0 || s == 4 || s == 8; };
+    if (!size_ok(offset_size) || !size_ok(length_size) || !size_ok(base_offset_size) ||
+        !size_ok(index_size)) {
+        return std::nullopt;
+    }
+    size_t o = c + 6;
+    const auto read_field = [&](size_t n, uint64_t* out) -> bool {
+        if (o + n > end) return false;
+        uint64_t v = 0;
+        for (size_t i = 0; i < n; ++i) v = (v << 8) | bytes[o + i];
+        o += n;
+        *out = v;
+        return true;
+    };
+    uint64_t count = 0;
+    if (!read_field(version == 2 ? 4 : 2, &count)) return std::nullopt;
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t id = 0;
+        if (!read_field(version == 2 ? 4 : 2, &id)) return std::nullopt;
+        if (version >= 1) {
+            // reserved(12) + construction_method(4).
+            uint64_t method_field = 0;
+            if (!read_field(2, &method_field)) return std::nullopt;
+            if (id == item_id && (method_field & 0xF) != 0) return std::nullopt;
+        }
+        uint64_t data_ref = 0;
+        if (!read_field(2, &data_ref)) return std::nullopt;
+        uint64_t base_offset = 0;
+        if (!read_field(base_offset_size, &base_offset)) return std::nullopt;
+        uint64_t extent_count = 0;
+        if (!read_field(2, &extent_count)) return std::nullopt;
+        for (uint64_t e = 0; e < extent_count; ++e) {
+            if (version >= 1 && index_size > 0) {
+                uint64_t item_ref = 0;
+                if (!read_field(index_size, &item_ref)) return std::nullopt;
+            }
+            uint64_t extent_offset = 0, extent_length = 0;
+            if (!read_field(offset_size, &extent_offset)) return std::nullopt;
+            if (!read_field(length_size, &extent_length)) return std::nullopt;
+            if (id == item_id && extent_length > 0) {
+                return std::pair<uint64_t, uint64_t>{base_offset + extent_offset, extent_length};
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+// (max_width, max_height) of a sequence header OBU in the given OBU
+// bytes, via dav1d's own parser; nothing when no sequence header is
+// present or it does not parse.
+std::optional<std::pair<uint32_t, uint32_t>> seq_header_dims(std::span<const uint8_t> obu) {
+    if (obu.empty()) return std::nullopt;
+    Dav1dSequenceHeader seq{};
+    if (dav1d_parse_sequence_header(&seq, obu.data(), obu.size()) != 0) return std::nullopt;
+    if (seq.max_width <= 0 || seq.max_height <= 0) return std::nullopt;
+    return std::pair<uint32_t, uint32_t>{static_cast<uint32_t>(seq.max_width),
+                                         static_cast<uint32_t>(seq.max_height)};
+}
+
+std::string ispe_mismatch_message(uint32_t ispe_w, uint32_t ispe_h, uint32_t av1_w,
+                                  uint32_t av1_h) {
+    return "AVIF ispe dimensions (" + std::to_string(ispe_w) + "x" + std::to_string(ispe_h) +
+           ") disagree with AV1 frame dimensions (" + std::to_string(av1_w) + "x" +
+           std::to_string(av1_h) + ")";
+}
+
+// Every av1C box in ipco whose configOBUs carry a sequence header
+// must agree with the image dims; boxes without one are skipped.
+// This is a secondary check only — it can never override the
+// primary-item check below.
+std::optional<Error> check_av1c_seq_headers(std::span<const uint8_t> bytes, uint32_t width,
+                                            uint32_t height) {
+    auto meta = find_top_box(bytes, "meta");
+    if (!meta) return std::nullopt;
+    const size_t content = box_content_begin(bytes, *meta);
+    if (content + 4 > meta->end) return std::nullopt;
+    auto iprp = find_child_box(bytes, content + 4, meta->end, "iprp");
+    if (!iprp) return std::nullopt;
+    size_t cursor = box_content_begin(bytes, *iprp);
+    while (auto box = next_box(bytes, cursor, iprp->end)) {
+        if (box_type_is(bytes, *box, "ipco")) {
+            size_t c2 = box_content_begin(bytes, *box);
+            while (auto av1c = next_box(bytes, c2, box->end)) {
+                if (box_type_is(bytes, *av1c, "av1C")) {
+                    const size_t cfg = box_content_begin(bytes, *av1c);
+                    // AV1CodecConfigurationRecord is 4 bytes; the
+                    // configOBUs follow it.
+                    if (cfg + 4 < av1c->end) {
+                        auto dims =
+                            seq_header_dims(bytes.subspan(cfg + 4, av1c->end - (cfg + 4)));
+                        if (dims && *dims != std::pair<uint32_t, uint32_t>{width, height}) {
+                            return Error{ErrorCode::InvalidHeader,
+                                         ispe_mismatch_message(width, height, dims->first,
+                                                               dims->second)};
+                        }
+                    }
+                }
+                c2 = av1c->end;
+            }
+        }
+        cursor = box->end;
+    }
+    return std::nullopt;
+}
+
+// ispe dims must match the AV1 frame dims from the sequence header in
+// the primary item's data; otherwise NextImage would scale the frame
+// up to the ispe size. An error is also returned when the frame dims
+// cannot be verified at all — fail closed rather than decode blind.
+std::optional<Error> check_ispe_matches_av1_frame(std::span<const uint8_t> bytes, uint32_t width,
+                                                  uint32_t height) {
+    const auto item_id = primary_item_id(bytes);
+    if (!item_id) {
+        return Error{ErrorCode::InvalidHeader,
+                     "cannot verify AVIF frame dimensions from AV1 sequence header"};
+    }
+    const auto extent = primary_item_extent(bytes, *item_id);
+    if (!extent || extent->first > bytes.size() || extent->second > bytes.size() - extent->first) {
+        return Error{ErrorCode::InvalidHeader,
+                     "cannot verify AVIF frame dimensions from AV1 sequence header"};
+    }
+    const auto dims = seq_header_dims(
+        bytes.subspan(static_cast<size_t>(extent->first), static_cast<size_t>(extent->second)));
+    if (!dims) {
+        return Error{ErrorCode::InvalidHeader,
+                     "cannot verify AVIF frame dimensions from AV1 sequence header"};
+    }
+    if (*dims != std::pair<uint32_t, uint32_t>{width, height}) {
+        return Error{ErrorCode::InvalidHeader,
+                     ispe_mismatch_message(width, height, dims->first, dims->second)};
+    }
+    return check_av1c_seq_headers(bytes, width, height);
+}
+
 // The carried CICP must describe what the RGB pixels actually are:
 // libavif converts YUV->RGB with the file's matrix, and our encoder
 // converts RGB->YCbCr with the carried matrix, so the two must agree.
@@ -220,6 +430,14 @@ Result<Image> decode(std::span<const uint8_t> bytes) {
         decoder->image->yuvFormat != AVIF_PIXEL_FORMAT_YUV420) {
         avifDecoderDestroy(decoder);
         return std::unexpected(Error{ErrorCode::InvalidHeader, "unsupported AVIF chroma format"});
+    }
+
+    // ispe dims must match the AV1 frame dims, checked before
+    // NextImage so a lying ispe cannot trigger a huge scale-up.
+    if (auto err = check_ispe_matches_av1_frame(bytes, decoder->image->width,
+                                                 decoder->image->height)) {
+        avifDecoderDestroy(decoder);
+        return std::unexpected(*err);
     }
 
     // NextImage decodes into decoder->image (owned by the decoder);
