@@ -2,7 +2,8 @@
 
 `libavif` 1.4.2 + `dav1d` 1.5.5, decode-only subset, vendored 2026-11-19
 for AVIF input (slice AVIF decode). Research that picked these versions:
-`tools/avif_jxl_convert_2026-11-19.md`.
+the AVIF/JXL conversion research notes of 19 Nov 2026 (kept locally,
+not in the repo).
 
 - libavif source: https://github.com/AOMediaCodec/libavif/releases/tag/v1.4.2
   (tarball `libavif-1.4.2.tar.gz`, 14,665,927 bytes)
