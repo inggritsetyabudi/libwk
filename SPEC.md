@@ -1,4 +1,4 @@
-# WK Image Format — Bitstream Specification v0.2.8
+# WK Image Format — Bitstream Specification v0.2.9
 
 **MIME type:** `image/x-wk`  
 **File extension:** `.wk`  
@@ -22,6 +22,8 @@
 
 **v0.2.8 validation changes:** the decoder now rejects an FHDR whose `cicp_primaries` has no entry in ITU-T H.273 Table 2 (allowed: 0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 22) and an FHDR whose `HDR` flag disagrees with `bit_depth`/`cicp_transfer` (the flag must be set exactly when `bit_depth` > 8 or the transfer is PQ/HLG). The encoder sets the flag by the same rule, so 8-bit PQ/HLG files now carry the flag set, and the encoder also rejects `cicp_primaries` with no Table 2 entry instead of writing a file the decoder would reject. No bitstream change: the container format (`0x0001`) is unchanged, and files that already agree decode identically. Files written by earlier encoders with 8-bit PQ/HLG transfer (flag clear) are now rejected; re-encode them with the current encoder. The encoder can now carry HDR mastering metadata: `EncoderConfig.max_cll`/`max_fall` (nits, 0 = unspecified, the default) are written to FHDR as-is, and `wkenc` gains `--max-cll`/`--max-fall`. When the transfer is PQ (16) and a field is left unset (0), the encoder computes it from the source RGB instead of writing 0: per pixel max(R,G,B) in linear light via the PQ EOTF (CTA-861); MaxCLL is the maximum, MaxFALL the mean over the frame, rounded to the nearest nit. A manually set value always wins, per field. HLG/SDR files are unaffected (still 0 unless set). Note the default VALUE changes for PQ files (computed instead of 0); the FHDR fields themselves are unchanged.
 
+**v0.2.9 changes:** conditional zlib compression of the META chunk payload (see Section 7.7): the writer compresses the serialized WKMETA payload with zlib (level 6) only when the compressed form is strictly smaller, and signals it with chunk flag bit 3 (`CHUNK_FLAG_META_COMPRESSED`); the container version stays `0x0001` and the FHDR is unchanged. A decoder that does not know the flag feeds the raw bytes to the WKMETA parser, which rejects them (a zlib stream starts with 0x78, never the 0x01 wkmeta version), so old decoders fail cleanly on compressed-META files instead of misreading them. Measured 2026-11-22 (probe, real payloads): a 16-entry block with a 1,000-character description saves 602–964 B (42.82–68.56% with realistic text), 10 varied region STRUCTs save 1,216 B (81.61%); small payloads (EXIF import 13 B, one region 18 B) stay raw, and the 15 B quality-score-only baseline stays raw because it grows to 23 B compressed. ICCP and PROV are never compressed.
+
 ---
 
 ## 1. File Structure
@@ -42,7 +44,7 @@ Each chunk has the following structure:
 | Offset | Size | Field   | Description |
 |--------|------|---------|-------------|
 | 0      | 4    | Type    | 4 ASCII characters (e.g., "FHDR") |
-| 4      | 1    | Flags   | Bit field: bit0=optional, bit1=metadata-only, bit2=repeatable |
+| 4      | 1    | Flags   | Bit field: bit0=optional, bit1=metadata-only, bit2=repeatable, bit3=compressed (META only, see Section 7.7) |
 | 5      | 4    | Size    | `uint32 LE` — payload length in bytes |
 | 9      | Size | Payload | Chunk-specific data |
 
@@ -398,6 +400,14 @@ read.
 | 0x0007 | PERSON_ID     | UUID             | Identity of the person |
 | 0x0008 | OBJECT_CLASS  | STR              | Object class label |
 | 0x0009 | CREATOR       | STR              | Who created the annotation |
+
+### 7.7 Compressed META payloads
+
+A META chunk whose chunk flags byte has bit 3 set (`CHUNK_FLAG_META_COMPRESSED`) holds a zlib-compressed (RFC 1950, DEFLATE) form of the Section 7.1 envelope, not the envelope itself. The writer MUST compress only when the compressed form is strictly smaller than the raw payload; otherwise it writes the raw payload with the bit clear. The bit costs no bytes of its own (it lives in the existing flags byte), so any strict saving is a net win, and small payloads stay raw.
+
+A decoder MUST decompress the payload before parsing when the bit is set, and MUST reject the file when the payload is not a valid zlib stream, has trailing bytes after the stream, or would expand past 16 MiB (a decompression bomb bound; real META payloads are kilobytes). A decoder that does not know the bit rejects the file cleanly anyway: it feeds the compressed bytes to the Section 7.2 parser, whose first check (wkmeta_version must be 0x01) fails on any zlib stream (first byte 0x78 for the usual window sizes, never 0x01).
+
+ICCP and PROV chunks are never compressed. The container version is unchanged (0x0001).
 
 ---
 

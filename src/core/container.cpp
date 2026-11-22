@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #include "container.h"
+#include "meta_compress.h"
 #include <cstring>
 
 namespace wk
@@ -398,7 +399,28 @@ namespace wk
                 // A META chunk that fails to parse must be rejected, not
                 // silently dropped: dropping it would discard metadata
                 // the file claims to carry.
-                auto meta = meta::MetaBlock::parse(chunk->payload);
+                //
+                // A META chunk with the compressed flag holds a zlib
+                // stream, not a WKMETA envelope: decompress first, then
+                // parse as usual. A decoder that does not know the flag
+                // feeds the raw bytes to the parser, which rejects them
+                // (zlib streams start 0x78, never the 0x01 wkmeta
+                // version), so old decoders fail cleanly on these files.
+                std::span<const uint8_t> meta_payload{chunk->payload};
+                std::vector<uint8_t> decompressed;
+                if (chunk->flags & CHUNK_FLAG_META_COMPRESSED)
+                {
+                    auto dec = meta::decompress_meta_payload(chunk->payload);
+                    if (!dec)
+                    {
+                        return std::unexpected(Error{ErrorCode::MetaParseError,
+                                                     "META chunk failed to decompress: " +
+                                                         dec.error().message});
+                    }
+                    decompressed = std::move(*dec);
+                    meta_payload = std::span<const uint8_t>{decompressed};
+                }
+                auto meta = meta::MetaBlock::parse(meta_payload);
                 if (!meta)
                 {
                     return std::unexpected(Error{ErrorCode::MetaParseError,
@@ -534,8 +556,17 @@ namespace wk
         if (file.metadata)
         {
             auto meta_payload = file.metadata->serialize();
-            write_chunk(w, CHUNK_WKMETA, CHUNK_FLAG_OPTIONAL | CHUNK_FLAG_META_ONLY,
-                        meta_payload);
+            uint8_t meta_flags = CHUNK_FLAG_OPTIONAL | CHUNK_FLAG_META_ONLY;
+            // Compress only when strictly smaller: the flag bit costs
+            // nothing, so any saving is a net win, and the 15 B baseline
+            // (which grows to 23 B compressed) stays raw. ICCP/PROV are
+            // never compressed by this slice.
+            if (auto compressed = meta::compress_meta_payload(meta_payload))
+            {
+                meta_payload = std::move(*compressed);
+                meta_flags |= CHUNK_FLAG_META_COMPRESSED;
+            }
+            write_chunk(w, CHUNK_WKMETA, meta_flags, meta_payload);
         }
 
         if (!file.icc_profile.empty())

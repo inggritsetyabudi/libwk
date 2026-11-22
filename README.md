@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="SPEC.md"><img src="https://img.shields.io/badge/version-0.2.8-blue" alt="Version 0.2.8" /></a>
+  <a href="SPEC.md"><img src="https://img.shields.io/badge/version-0.2.9-blue" alt="Version 0.2.9" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License Apache-2.0" /></a>
   <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-23-blue" alt="C++23" /></a>
   <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/CMake-%3E%3D_3.28-blue" alt="CMake >= 3.28" /></a>
@@ -43,7 +43,9 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Requirements: CMake `>= 3.28`, a C++23 compiler, Ninja (recommended).
+Requirements: CMake `>= 3.28`, a C++23 compiler, Ninja (recommended), and
+system zlib (`zlib1g-dev` on Ubuntu) for conditional `WKMETA` payload
+compression.
 Dependencies are fetched automatically by CMake: `minifb` for the viewer and
 `googletest` for tests. The viewer is built by default (`WK_BUILD_VIEWER=ON`);
 with `WK_BUILD_VIEWER=OFF`, `wkview` is still built but terminal-only.
@@ -147,7 +149,7 @@ flowchart LR
 ```
 
 Optional chunks (`META`, `ICCP`, `PROV`, `ANIM`) sit between `FHDR` and the
-`TILE` chunks. The full bitstream specification is `SPEC.md` (v0.2.8).
+`TILE` chunks. The full bitstream specification is `SPEC.md` (v0.2.9).
 
 | Chunk | Contents |
 | --- | --- |
@@ -260,10 +262,12 @@ What is in a good working state right now:
 - strict container parsing with explicit failure on malformed files
   (20,000-iteration fuzzing, zero crashes)
 - EXIF import into `WKMETA`, metadata edit and JSON export
+- conditional zlib compression of `WKMETA` payloads, applied only when it
+  shrinks the payload
 - PNG output for 8-bit decode
 - side-by-side compare viewer with file and format information
 - C and C++ public APIs, and a WebAssembly build under `web/`
-- 33 test binaries passing in the current tree (Release and ASan/UBSan)
+- 39 test binaries passing in the current tree (Release and ASan/UBSan)
 
 What is intentionally not claimed as finished yet:
 

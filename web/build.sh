@@ -108,6 +108,7 @@ em++ \
   wk_wasm.cpp \
   -o wk.js \
   -s WASM=1 \
+  -s USE_ZLIB=1 \
   -s EXPORTED_FUNCTIONS="$EXPORTED_FUNCTIONS" \
   -s EXPORTED_RUNTIME_METHODS="$EXPORTED_RUNTIME" \
   -s ALLOW_MEMORY_GROWTH=1 \

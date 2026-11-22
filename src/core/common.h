@@ -375,6 +375,10 @@ namespace wk
     constexpr uint8_t CHUNK_FLAG_OPTIONAL = 0x01;
     constexpr uint8_t CHUNK_FLAG_META_ONLY = 0x02;
     constexpr uint8_t CHUNK_FLAG_REPEATABLE = 0x04;
+    // Bit 3: the chunk payload is zlib-compressed (DEFLATE). Only defined
+    // for META; a decoder that does not know it rejects the file cleanly
+    // (see container.cpp). #meta
+    constexpr uint8_t CHUNK_FLAG_META_COMPRESSED = 0x08;
 
     constexpr uint16_t FHDR_FLAG_LOSSLESS = 0x0001;
     constexpr uint16_t FHDR_FLAG_ANIMATED = 0x0002;

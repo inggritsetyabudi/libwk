@@ -57,6 +57,12 @@ wk_read_sources(core WK_CORE_SOURCES)
 wk_read_sources(stb WK_STB_SOURCES)
 
 add_library(wk STATIC ${WK_CORE_SOURCES} ${WK_STB_SOURCES} ${WK_WEBP_SOURCES} ${WK_AVIF_SOURCES} ${WK_LIBYUV_SOURCES} ${WK_DAV1D_SOURCES} $<TARGET_OBJECTS:dav1d_bitdepth_8> $<TARGET_OBJECTS:dav1d_bitdepth_16> ${WK_JXL_SOURCES} ${WK_JXL_HWY_SOURCES} ${WK_JXL_BROTLI_SOURCES} ${WK_JXL_SKCMS_SOURCES} ${WK_ARCH_SOURCES})
+# System zlib for conditional META compression (src/core/meta_compress.cpp).
+# The repo's first system-library dependency: zlib1g-dev must be installed
+# (it is the only piece of the codec not vendored). The web build gets the
+# same library from Emscripten's zlib port (web/build.sh, -s USE_ZLIB=1).
+find_package(ZLIB REQUIRED)
+target_link_libraries(wk PRIVATE ZLIB::ZLIB)
 target_include_directories(wk PUBLIC include)
 target_include_directories(wk PRIVATE src src/webp src/avif/libavif/include src/avif/libavif/third_party/libyuv/include src/avif/dav1d src/avif/dav1d/include src/jxl src/jxl/lib src/jxl/lib/include src/jxl/third_party/highway src/jxl/third_party/brotli/c/include src/jxl/third_party/skcms)
 
