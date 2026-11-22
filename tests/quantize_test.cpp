@@ -110,7 +110,108 @@ TEST(QuantizeTest, ScaledQuantizeMatchesUnscaledAtIdentity) {
     EXPECT_EQ(plain_back, scaled_back);
 }
 
-// A small low-frequency coefficient that dies in the q50 deadzone
+// Chroma HF deadzone (#k1): a quantized chroma coefficient with zigzag
+// index >= 24 and |q| <= 1 is zeroed; luma, lower zigzag positions, and
+// |q| >= 2 are untouched. The rule lives in the quantizer, so RDO and
+// reconstruction see the zeroed coefficients.
+TEST(QuantizeTest, ChromaHighFrequencyDeadzone) {
+    QuantTable chroma;
+    chroma.build(75.0f, true, 8);
+
+    // Zigzag 24, |q| = 1 -> 0 (both signs, both quantize paths).
+    for (float sign : {1.0f, -1.0f}) {
+        DctBlock input{};
+        input[ZIGZAG_ORDER[24]] = sign * static_cast<float>(chroma.steps()[24]);
+        DctBlockI16 out{}, out_scaled{};
+        chroma.quantize(input, out);
+        chroma.quantize_scaled(input, out_scaled, 1.0f);
+        EXPECT_EQ(out[24], 0) << "chroma zigzag 24 q=1 should be zeroed (sign " << sign << ")";
+        EXPECT_EQ(out_scaled[24], 0) << "scaled chroma zigzag 24 q=1 should be zeroed (sign " << sign << ")";
+    }
+
+    // Zigzag 63 (highest), |q| = 1 -> 0.
+    {
+        DctBlock input{};
+        input[ZIGZAG_ORDER[63]] = static_cast<float>(chroma.steps()[63]);
+        DctBlockI16 out{};
+        chroma.quantize(input, out);
+        EXPECT_EQ(out[63], 0);
+    }
+
+    // Zigzag 23 (just below the threshold), |q| = 1 -> untouched.
+    {
+        DctBlock input{};
+        input[ZIGZAG_ORDER[23]] = static_cast<float>(chroma.steps()[23]);
+        DctBlockI16 out{};
+        chroma.quantize(input, out);
+        EXPECT_EQ(out[23], 1);
+    }
+
+    // Zigzag 24, |q| = 2 -> untouched.
+    {
+        DctBlock input{};
+        input[ZIGZAG_ORDER[24]] = 2.0f * static_cast<float>(chroma.steps()[24]);
+        DctBlockI16 out{};
+        chroma.quantize(input, out);
+        EXPECT_EQ(out[24], 2);
+        // With scale 0.5 the effective step halves, so v = step still
+        // quantizes to 2 and survives the deadzone.
+        DctBlock scaled_input{};
+        scaled_input[ZIGZAG_ORDER[24]] = static_cast<float>(chroma.steps()[24]);
+        DctBlockI16 out_scaled{};
+        chroma.quantize_scaled(scaled_input, out_scaled, 0.5f);
+        EXPECT_EQ(out_scaled[24], 2);
+    }
+
+    // DC, |q| = 1 -> untouched (below the threshold).
+    {
+        DctBlock input{};
+        input[ZIGZAG_ORDER[0]] = static_cast<float>(chroma.steps()[0]);
+        DctBlockI16 out{};
+        chroma.quantize(input, out);
+        EXPECT_EQ(out[0], 1);
+    }
+
+    // Luma at zigzag 24, |q| = 1 -> untouched (chroma only).
+    QuantTable luma;
+    luma.build(75.0f, false, 8);
+    {
+        DctBlock input{};
+        input[ZIGZAG_ORDER[24]] = static_cast<float>(luma.steps()[24]);
+        DctBlockI16 out{}, out_scaled{};
+        luma.quantize(input, out);
+        luma.quantize_scaled(input, out_scaled, 1.0f);
+        EXPECT_EQ(out[24], 1);
+        EXPECT_EQ(out_scaled[24], 1);
+    }
+
+    // Scaled chroma path with a halved step: v = step/2 quantizes to 1
+    // at zigzag 24 and is zeroed.
+    {
+        DctBlock input{};
+        input[ZIGZAG_ORDER[24]] = 0.5f * static_cast<float>(chroma.steps()[24]);
+        DctBlockI16 out{};
+        chroma.quantize_scaled(input, out, 0.5f);
+        EXPECT_EQ(out[24], 0);
+    }
+}
+
+// The deadzone is 8-bit only: at 10/12-bit the |q| = 1 chroma HF
+// coefficients are signal (gradient textures lose ~2.2 dB when they
+// are zeroed), so higher bit depths keep the old behavior.
+TEST(QuantizeTest, ChromaHighFrequencyDeadzoneIs8BitOnly) {
+    for (uint8_t bit_depth : {10, 12}) {
+        QuantTable chroma;
+        chroma.build(75.0f, true, bit_depth);
+        DctBlock input{};
+        input[ZIGZAG_ORDER[24]] = static_cast<float>(chroma.steps()[24]);
+        DctBlockI16 out{}, out_scaled{};
+        chroma.quantize(input, out);
+        chroma.quantize_scaled(input, out_scaled, 1.0f);
+        EXPECT_EQ(out[24], 1) << "10/12-bit chroma zigzag 24 q=1 must survive";
+        EXPECT_EQ(out_scaled[24], 1) << "10/12-bit scaled chroma zigzag 24 q=1 must survive";
+    }
+}
 // survives when the block's step is halved: this is the mechanism that
 // lets a seed row keep its slope. (Luma q50: DC step 16, AC1 step 11.)
 TEST(QuantizeTest, ScaledQuantizeKeepsSmallSlopeCoefficient) {
