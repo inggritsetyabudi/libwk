@@ -62,6 +62,17 @@ FILE HEADER (magic + version)
 └── FEND  — End marker (required, last, zero-byte payload)
 ```
 
+ICCP and PROV payloads are the raw profile / manifest bytes,
+written verbatim. They are set through the encoder configuration
+(`EncoderConfig.icc_profile` / `c2pa_manifest`) or the
+`--import-icc` / `--import-prov` options of `wkenc` and
+`wkmeta-edit`. A PROV chunk requires the FHDR `HAS_C2PA` flag
+(see section 10 rule 12). On lossy encodes the encoder also writes
+one META entry, `RATING.QUALITY_SCORE` (the mean per-tile quality
+score); `EncoderConfig.write_quality_score` (default on) and
+`wkenc --no-quality-score` omit it — with no other metadata this
+drops the whole 24 B META chunk.
+
 ---
 
 ## 2. FHDR Chunk — Frame Header (19 bytes)
@@ -400,6 +411,16 @@ read.
 | 0x0007 | PERSON_ID     | UUID             | Identity of the person |
 | 0x0008 | OBJECT_CLASS  | STR              | Object class label |
 | 0x0009 | CREATOR       | STR              | Who created the annotation |
+
+Region annotations are written as STRUCT values, never as flat
+REGION entries: a flat entry (e.g. `REGION.CONFIDENCE` on its own)
+is not a region and is not read by `get_regions()`. The command-line
+tools build the STRUCT from individual `--set REGION.*` options,
+merging each field into the first STRUCT entry (creating it, with
+tag 0x0001, when the file has none) and leaving any other STRUCT
+entries untouched. Value formats on the command line: `RECT_NORM`
+as `x,y,w,h` (each 0..1), `CONFIDENCE` as a decimal 0..1, `TYPE` as
+an integer 0..255, `PERSON_ID` as an 8-4-4-4-12 hex UUID.
 
 ### 7.7 Compressed META payloads
 

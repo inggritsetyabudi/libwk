@@ -524,6 +524,54 @@ namespace wk::meta
         return regions;
     }
 
+    auto MetaBlock::set_region_field(uint16_t tag, Value v)
+        -> std::expected<void, MetaError>
+    {
+        // #meta: one STRUCT per region (SPEC section 7.6); flat
+        // REGION entries are not valid regions, so fields always
+        // land in a STRUCT, never as flat entries.
+        switch (tag)
+        {
+        case region::NAME:
+        case region::TYPE:
+        case region::ROLE:
+        case region::RECT_NORM:
+        case region::CONFIDENCE:
+        case region::PERSON_NAME:
+        case region::PERSON_ID:
+        case region::OBJECT_CLASS:
+        case region::CREATOR:
+            break;
+        default:
+            return std::unexpected(
+                MetaError{MetaErrorCode::InvalidTag, "not a region field tag"});
+        }
+
+        for (auto &e : entries)
+        {
+            if (e.ns != Namespace::Region || e.is_opaque)
+                continue;
+            auto *s = std::get_if<Struct>(&e.value);
+            if (!s)
+                continue;
+            for (auto &f : s->fields)
+            {
+                if (f.tag == tag)
+                {
+                    f.value = std::move(v);
+                    return {};
+                }
+            }
+            s->fields.push_back({Namespace::Region, tag, std::move(v), {}, false});
+            return {};
+        }
+
+        Struct s;
+        s.fields.push_back({Namespace::Region, tag, std::move(v), {}, false});
+        entries.push_back({Namespace::Region, region::NAME, std::move(s), {}, false});
+        return {};
+    }
+
     auto MetaBlock::get_license() const -> std::expected<std::string, MetaError>
     {
         auto r = get(Namespace::Rights, rights::LICENSE_SPDX);

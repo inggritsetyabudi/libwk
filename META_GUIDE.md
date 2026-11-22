@@ -234,3 +234,43 @@ if (file && file->metadata) {
 | Dublin Core | CONTENT     | Title, Description (as LSTR) |
 | SPDX        | RIGHTS      | LICENSE_SPDX identifier |
 | BCP 47      | LSTR type   | Language tags on all LSTR values |
+
+---
+
+## Region Annotations, ICC Profiles, and Provenance
+
+Region annotations are stored as one STRUCT per region (SPEC section
+7.6). Set fields with `--set REGION.*` — they merge into the first
+STRUCT entry, so a second `--set` on the same file updates the same
+region instead of writing a flat entry that nothing reads:
+
+```bash
+wkmeta-edit \
+  --set REGION.NAME "Face A" \
+  --set REGION.TYPE 1 \
+  --set REGION.ROLE subject \
+  --set REGION.RECT_NORM "0.1,0.2,0.3,0.4" \
+  --set REGION.CONFIDENCE 0.87 \
+  --set REGION.PERSON_NAME "Ada" \
+  --set REGION.PERSON_ID 123e4567-e89b-12d3-a456-426614174000 \
+  --set REGION.OBJECT_CLASS person \
+  --set REGION.CREATOR alice \
+  photo.wk
+```
+
+Embed an ICC profile or a C2PA manifest at encode time or later —
+the bytes are stored verbatim in the ICCP / PROV chunks:
+
+```bash
+wkenc --quality 85 --import-icc srgb2014.icc --import-prov manifest.c2pa photo.ppm photo.wk
+wkmeta-edit --import-icc srgb2014.icc --import-prov manifest.c2pa photo.wk
+```
+
+Lossy encodes write `RATING.QUALITY_SCORE` (the mean per-tile
+quality score) into META by default. Omit it with:
+
+```bash
+wkenc --quality 85 --no-quality-score photo.ppm photo.wk
+```
+
+With no other metadata this drops the whole 24 B META chunk.

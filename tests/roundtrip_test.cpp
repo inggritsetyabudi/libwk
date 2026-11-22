@@ -2857,3 +2857,67 @@ TEST(RoundtripTest, UnknownLossyLayoutTagRejected) {
     auto decoded = decode(*broken);
     EXPECT_FALSE(decoded.has_value()) << "unknown layout tag must be rejected";
 }
+
+TEST(RoundtripTest, EncodeCarriesIccAndProvProfiles) {
+    Image image = make_rgb_gradient(64, 64);
+    EncoderConfig config;
+    config.icc_profile.resize(32);
+    for (size_t i = 0; i < config.icc_profile.size(); ++i)
+        config.icc_profile[i] = static_cast<uint8_t>(i * 7 + 1);
+    config.c2pa_manifest.resize(48);
+    for (size_t i = 0; i < config.c2pa_manifest.size(); ++i)
+        config.c2pa_manifest[i] = static_cast<uint8_t>(255 - i);
+
+    auto encoded = encode(image, config);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    EXPECT_EQ(file->icc_profile, config.icc_profile);
+    EXPECT_EQ(file->c2pa_manifest, config.c2pa_manifest);
+
+    // Pixels still decode.
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->width(), 64u);
+    EXPECT_EQ(decoded->height(), 64u);
+}
+
+TEST(RoundtripTest, QualityScoreWrittenByDefault) {
+    Image image = make_rgb_gradient(64, 64);
+
+    auto encoded = encode(image, EncoderConfig{});
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto file = parse_container(*encoded);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    ASSERT_TRUE(file->metadata.has_value());
+    auto score = file->metadata->get(wk::meta::Namespace::Rating, wk::meta::rating::QUALITY_SCORE);
+    ASSERT_TRUE(score.has_value());
+    EXPECT_NE(std::get_if<float>(*score), nullptr);
+}
+
+TEST(RoundtripTest, NoQualityScoreOptOutRemovesMetaChunk) {
+    Image image = make_rgb_gradient(64, 64);
+
+    auto with_score = encode(image, EncoderConfig{});
+    ASSERT_TRUE(with_score.has_value()) << with_score.error().message;
+
+    EncoderConfig no_score;
+    no_score.write_quality_score = false;
+    auto without_score = encode(image, no_score);
+    ASSERT_TRUE(without_score.has_value()) << without_score.error().message;
+
+    // The whole META chunk is 24 B: 9 framing + 3 envelope + 8 header + 4 float.
+    ASSERT_GE(with_score->size(), 24u);
+    EXPECT_EQ(with_score->size() - without_score->size(), 24u);
+
+    auto file = parse_container(*without_score);
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    EXPECT_FALSE(file->metadata.has_value());
+
+    // Pixels are identical with and without the score.
+    auto dec_with = decode(*with_score);
+    auto dec_without = decode(*without_score);
+    ASSERT_TRUE(dec_with.has_value());
+    ASSERT_TRUE(dec_without.has_value());
+    EXPECT_TRUE(std::ranges::equal(dec_with->pixels(), dec_without->pixels()));
+}

@@ -311,7 +311,8 @@ Main options: `--quality N` (0–100, default 75), `--lossless`,
 `--cclm` / `--no-cclm` (CCLM on by default),
 `--adaptive-chroma-subsampling` (on by default) with
 `--chroma-lap-threshold F` (default 2.1) and the p999 safeguards,
-`--import-exif FILE`, `--metrics` (decode the output and report PSNR/SSIM
+`--import-exif FILE`, `--import-icc FILE`, `--import-prov FILE`,
+`--no-quality-score`, `--metrics` (decode the output and report PSNR/SSIM
 vs the source), `--tile-stats`, `--coeff-stats`, `--version`.
 
 Default tile policy: lossy still-image encode uses 1024 px tiles;
@@ -349,7 +350,7 @@ wkmeta-edit [options] <input.wk>
 ```
 
 Main options: `--set NS.TAG VALUE`, `--delete NS.TAG`, `--import-exif FILE`,
-`--export-json`, `-o, --output FILE`.
+`--import-icc FILE`, `--import-prov FILE`, `--export-json`, `-o, --output FILE`.
 
 ### `wkview`
 
@@ -399,7 +400,7 @@ Main entry points: `wk_encode(...)`, `wk_decode(...)`, `wk_get_info(...)`,
 
 ## Tests
 
-33 test binaries, run with `ctest --test-dir build --output-on-failure`:
+39 test binaries, run with `ctest --test-dir build --output-on-failure`:
 
 - core: `rans_test`, `dct_test`, `predict_test`, `quantize_test`,
   `container_test`, `roundtrip_test`, `geo_roundtrip_test`
@@ -489,7 +490,7 @@ the same `stb`-based code on all platforms.
 include/    public headers (wk.hpp, wk.h, wkmeta.hpp)
 src/        core/ (portable codec), arch/ (per-target code), stb/ (vendored image I/O)
 tools/      CLI tools and viewer (wkenc, wkdec, wkmetric, wkmeta-dump, wkmeta-edit, wkview)
-tests/      unit and integration tests (33 test binaries)
+tests/      unit and integration tests (39 test binaries)
 photos/     sample corpus split into people/ and scenery/
 benchmark/  RD harness (rd_bench.py), baselines, and generated outputs
 extra/      screenshots, demo assets, and the WK logo

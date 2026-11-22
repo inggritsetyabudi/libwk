@@ -200,6 +200,9 @@ void print_usage() {
         << "  --chroma-dct-band-threshold F\n"
         << "                          Force 444 when a tile's DCT 1..3 band energy fraction reaches F (0: off)\n"
         << "  --import-exif FILE      Import EXIF from JPEG/TIFF donor file\n"
+        << "  --import-icc FILE       Embed an ICC profile (ICCP chunk)\n"
+        << "  --import-prov FILE      Embed a C2PA manifest (PROV chunk)\n"
+        << "  --no-quality-score      Do not write RATING.QUALITY_SCORE into META\n"
         << "  --metrics               Decode the output and report PSNR/SSIM vs the source\n"
         << "  -v, --verbose           Show debug logs (per-step detail)\n"
         << "  -q, --quiet             Only warnings and errors\n"
@@ -282,6 +285,8 @@ int main(int argc, char* argv[]) {
     std::string input_path;
     std::string output_path;
     std::string exif_source_path;
+    std::string icc_source_path;
+    std::string prov_source_path;
     std::optional<uint8_t> bit_depth_flag;
     std::optional<wk::CICP> cicp_flag;
     bool tile_stats = false;
@@ -462,6 +467,20 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             exif_source_path = argv[++i];
+        } else if (arg == "--import-icc") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --import-icc requires a profile file\n";
+                return 1;
+            }
+            icc_source_path = argv[++i];
+        } else if (arg == "--import-prov") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --import-prov requires a manifest file\n";
+                return 1;
+            }
+            prov_source_path = argv[++i];
+        } else if (arg == "--no-quality-score") {
+            config.write_quality_score = false;
         } else if (arg == "--metrics") {
             metrics = true;
         } else if (arg == "-v" || arg == "--verbose") {
@@ -532,6 +551,22 @@ int main(int argc, char* argv[]) {
         // the default, so their behaviour is unchanged. An explicit
         // --cicp flag always wins over the embedded value.
         config.cicp = image->info().cicp;
+    }
+    if (!icc_source_path.empty()) {
+        auto icc_bytes = wk::tool::read_file_bytes(icc_source_path);
+        if (!icc_bytes) {
+            wk::tool::log_error("failed to read ICC profile: " + icc_bytes.error().message);
+            return 1;
+        }
+        config.icc_profile = std::move(*icc_bytes);
+    }
+    if (!prov_source_path.empty()) {
+        auto prov_bytes = wk::tool::read_file_bytes(prov_source_path);
+        if (!prov_bytes) {
+            wk::tool::log_error("failed to read provenance manifest: " + prov_bytes.error().message);
+            return 1;
+        }
+        config.c2pa_manifest = std::move(*prov_bytes);
     }
     wk::tool::log_debug(std::string("encoding: ") + (config.lossless ? "lossless" : "lossy") +
                         (config.lossless ? "" : " q" + std::to_string(static_cast<int>(config.quality))) +
