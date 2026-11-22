@@ -271,6 +271,215 @@ std::optional<std::pair<uint32_t, uint32_t>> seq_header_dims(std::span<const uin
                                          static_cast<uint32_t>(seq.max_height)};
 }
 
+// ---- frame header dims (#fso) ----
+// The sequence header only gives an upper bound: the frame header can
+// override the frame size down (read_frame_size), so a lying ispe that
+// agrees with the sequence header still scales the frame up (fuzz
+// follow-up: seq max 16384x16384 + override to 16x16 cost 183 s /
+// 4.6 GB). Parse the uncompressed frame header up to the size fields,
+// following dav1d parse_frame_hdr + read_frame_size (obu.c) field by
+// field. No dav1d API exposes frame-header parsing, so the bits are
+// read here with a small MSB-first reader; anything that cannot be
+// verified fails the check instead of decoding blind.
+struct BitReader {
+    std::span<const uint8_t> bytes;
+    size_t bitpos = 0;
+    bool ok = true;
+    bool bit() {
+        if (bitpos >= bytes.size() * 8) {
+            ok = false;
+            return false;
+        }
+        const bool v = (bytes[bitpos >> 3] >> (7 - (bitpos & 7))) & 1;
+        ++bitpos;
+        return v;
+    }
+    uint32_t bits(size_t n) {
+        uint32_t v = 0;
+        for (size_t i = 0; i < n; ++i) v = (v << 1) | static_cast<uint32_t>(bit());
+        return v;
+    }
+    void skip(size_t n) {
+        if (bitpos + n > bytes.size() * 8) {
+            ok = false;
+            return;
+        }
+        bitpos += n;
+    }
+};
+
+// Frame types (dav1d headers.h): KEY 0, INTER 1, INTRA 2, SWITCH 3.
+// (frame_width, frame_height) of the frame header at the start of
+// payload — the coded size, after superres upsampling, which is what
+// the decoder outputs — or nothing when it cannot be verified.
+std::optional<std::pair<uint32_t, uint32_t>> frame_header_dims(
+    std::span<const uint8_t> payload, const Dav1dSequenceHeader& seq, uint8_t temporal_id,
+    uint8_t spatial_id) {
+    BitReader br{payload};
+    // show_existing_frame reuses an earlier frame's dims, which are
+    // not in this OBU: unverifiable, fail closed.
+    if (!seq.reduced_still_picture_header && br.bit()) return std::nullopt;
+    uint32_t frame_type = 0;  // KEY
+    bool show_frame = true;
+    if (!seq.reduced_still_picture_header) {
+        frame_type = br.bits(2);
+        show_frame = br.bit();
+    }
+    if (show_frame) {
+        if (seq.decoder_model_info_present && !seq.equal_picture_interval)
+            br.skip(seq.frame_presentation_delay_length);
+    } else {
+        br.skip(1);  // showable_frame
+    }
+    // error_resilient_mode is forced without reading a bit when the
+    // frame type (or reduced header) implies it (dav1d short-circuits).
+    const bool error_resilient =
+        (frame_type == 0 && show_frame) || frame_type == 3 || seq.reduced_still_picture_header
+            ? true
+            : br.bit();
+    br.skip(1);  // disable_cdf_update
+    bool allow_screen_content_tools = false;
+    if (seq.screen_content_tools == DAV1D_ADAPTIVE) {
+        allow_screen_content_tools = br.bit();
+    } else {
+        allow_screen_content_tools = seq.screen_content_tools == DAV1D_ON;
+    }
+    if (allow_screen_content_tools && seq.force_integer_mv == DAV1D_ADAPTIVE)
+        br.skip(1);  // force_integer_mv
+    // KEY/INTRA frames force force_integer_mv = 1 without a bit.
+    if (seq.frame_id_numbers_present) br.skip(seq.frame_id_n_bits);
+    bool frame_size_override = false;
+    if (!seq.reduced_still_picture_header) {
+        frame_size_override = frame_type == 3 ? true : br.bit();
+    }
+    if (seq.order_hint) br.skip(seq.order_hint_n_bits);  // frame_offset
+    if (!error_resilient && (frame_type == 1 || frame_type == 3))
+        br.skip(3);  // primary_ref_frame
+    if (seq.decoder_model_info_present) {
+        const bool removal_present = br.bit();
+        if (removal_present) {
+            for (int i = 0; i < seq.num_operating_points; ++i) {
+                const auto& op = seq.operating_points[i];
+                if (op.decoder_model_param_present) {
+                    const bool in_temporal = (op.idc >> temporal_id) & 1;
+                    const bool in_spatial = (op.idc >> (spatial_id + 8)) & 1;
+                    if (op.idc == 0 || (in_temporal && in_spatial))
+                        br.skip(seq.buffer_removal_delay_length);
+                }
+            }
+        }
+    }
+    const bool is_key_or_intra = frame_type == 0 || frame_type == 2;
+    bool use_ref = false;
+    if (is_key_or_intra) {
+        uint32_t refresh = 0xff;
+        if (!(frame_type == 0 && show_frame)) refresh = br.bits(8);
+        if (refresh != 0xff && error_resilient && seq.order_hint)
+            br.skip(8u * seq.order_hint_n_bits);
+    } else {
+        if (frame_type != 3) br.skip(8);  // refresh_frame_flags
+        if (error_resilient && seq.order_hint) br.skip(8u * seq.order_hint_n_bits);
+        bool short_signaling = false;
+        if (seq.order_hint) {
+            short_signaling = br.bit();
+            if (short_signaling) {
+                br.skip(3);  // refidx[0]
+                br.skip(3);  // refidx[3]
+            }
+        }
+        for (int i = 0; i < 7; ++i) {
+            if (!short_signaling) br.skip(3);  // refidx[i]
+            if (seq.frame_id_numbers_present) br.skip(seq.delta_frame_id_n_bits);
+        }
+        use_ref = !error_resilient && frame_size_override;
+    }
+    if (!br.ok) return std::nullopt;
+    if (use_ref) {
+        // Any set bit takes the size from a reference frame we do not
+        // have; fail closed instead of guessing.
+        bool any_ref = false;
+        for (int i = 0; i < 7; ++i) any_ref = br.bit() || any_ref;
+        if (!br.ok || any_ref) return std::nullopt;
+    }
+    uint32_t width = 0, height = 0;
+    if (frame_size_override) {
+        width = br.bits(seq.width_n_bits) + 1;
+        height = br.bits(seq.height_n_bits) + 1;
+    } else {
+        width = static_cast<uint32_t>(seq.max_width);
+        height = static_cast<uint32_t>(seq.max_height);
+    }
+    if (seq.super_res && br.bit()) {
+        const uint32_t denom = 9 + br.bits(3);
+        const uint32_t upscaled = (width * 8 + (denom >> 1)) / denom;
+        const uint32_t floor = width < 16 ? width : 16;
+        width = upscaled > floor ? upscaled : floor;
+    }
+    if (!br.ok || width == 0 || height == 0) return std::nullopt;
+    return std::pair<uint32_t, uint32_t>{width, height};
+}
+
+// LEB128 unsigned; false on truncation or overflow.
+bool read_leb128(std::span<const uint8_t> bytes, size_t& pos, uint64_t& out) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (pos >= bytes.size()) return false;
+        const uint8_t b = bytes[pos++];
+        v |= static_cast<uint64_t>(b & 0x7f) << (7 * i);
+        if ((b & 0x80) == 0) {
+            out = v;
+            return true;
+        }
+    }
+    return false;
+}
+
+// (frame_width, frame_height) of the first frame in the OBU stream, or
+// nothing when unverifiable. Walks OBUs; the sequence header in effect
+// supplies the parameters for the frame-header reader.
+std::optional<std::pair<uint32_t, uint32_t>> first_frame_dims(std::span<const uint8_t> obu) {
+    std::optional<Dav1dSequenceHeader> seq;
+    size_t pos = 0;
+    while (pos < obu.size()) {
+        const size_t obu_begin = pos;
+        const uint8_t hdr = obu[pos++];
+        const uint32_t type = (hdr >> 3) & 0xF;
+        const bool has_extension = (hdr >> 2) & 1;
+        const bool has_size = (hdr >> 1) & 1;
+        uint8_t temporal_id = 0, spatial_id = 0;
+        if (has_extension) {
+            if (pos >= obu.size()) return std::nullopt;
+            const uint8_t ext = obu[pos++];
+            temporal_id = (ext >> 5) & 0x7;
+            spatial_id = (ext >> 3) & 0x3;
+        }
+        size_t payload_begin = pos;
+        size_t payload_end = obu.size();
+        if (has_size) {
+            uint64_t len = 0;
+            if (!read_leb128(obu, pos, len)) return std::nullopt;
+            payload_begin = pos;
+            if (len > obu.size() - pos) return std::nullopt;
+            payload_end = pos + static_cast<size_t>(len);
+        }
+        const auto payload = obu.subspan(payload_begin, payload_end - payload_begin);
+        if (type == 1) {  // OBU_SEQUENCE_HEADER
+            Dav1dSequenceHeader parsed{};
+            if (dav1d_parse_sequence_header(&parsed, obu.data() + obu_begin,
+                                            payload_end - obu_begin) != 0)
+                return std::nullopt;
+            seq = parsed;
+        } else if (type == 3 || type == 6 || type == 7) {
+            // OBU_FRAME_HEADER / OBU_FRAME / OBU_REDUNDANT_FRAME_HDR:
+            // the payload starts with the uncompressed frame header.
+            if (!seq) return std::nullopt;
+            return frame_header_dims(payload, *seq, temporal_id, spatial_id);
+        }
+        pos = payload_end;
+    }
+    return std::nullopt;
+}
+
 std::string ispe_mismatch_message(uint32_t ispe_w, uint32_t ispe_h, uint32_t av1_w,
                                   uint32_t av1_h) {
     return "AVIF ispe dimensions (" + std::to_string(ispe_w) + "x" + std::to_string(ispe_h) +
@@ -318,9 +527,11 @@ std::optional<Error> check_av1c_seq_headers(std::span<const uint8_t> bytes, uint
 }
 
 // ispe dims must match the AV1 frame dims from the sequence header in
-// the primary item's data; otherwise NextImage would scale the frame
-// up to the ispe size. An error is also returned when the frame dims
-// cannot be verified at all — fail closed rather than decode blind.
+// the primary item's data, and also the frame header's own dims (the
+// sequence header is only an upper bound: frame_size_override can
+// shrink the frame); otherwise NextImage would scale the frame up to
+// the ispe size. An error is also returned when the frame dims cannot
+// be verified at all — fail closed rather than decode blind.
 std::optional<Error> check_ispe_matches_av1_frame(std::span<const uint8_t> bytes, uint32_t width,
                                                   uint32_t height) {
     const auto item_id = primary_item_id(bytes);
@@ -333,8 +544,9 @@ std::optional<Error> check_ispe_matches_av1_frame(std::span<const uint8_t> bytes
         return Error{ErrorCode::InvalidHeader,
                      "cannot verify AVIF frame dimensions from AV1 sequence header"};
     }
-    const auto dims = seq_header_dims(
-        bytes.subspan(static_cast<size_t>(extent->first), static_cast<size_t>(extent->second)));
+    const auto extent_bytes =
+        bytes.subspan(static_cast<size_t>(extent->first), static_cast<size_t>(extent->second));
+    const auto dims = seq_header_dims(extent_bytes);
     if (!dims) {
         return Error{ErrorCode::InvalidHeader,
                      "cannot verify AVIF frame dimensions from AV1 sequence header"};
@@ -342,6 +554,15 @@ std::optional<Error> check_ispe_matches_av1_frame(std::span<const uint8_t> bytes
     if (*dims != std::pair<uint32_t, uint32_t>{width, height}) {
         return Error{ErrorCode::InvalidHeader,
                      ispe_mismatch_message(width, height, dims->first, dims->second)};
+    }
+    const auto frame_dims = first_frame_dims(extent_bytes);
+    if (!frame_dims) {
+        return Error{ErrorCode::InvalidHeader,
+                     "cannot verify AVIF frame dimensions from AV1 frame header"};
+    }
+    if (*frame_dims != std::pair<uint32_t, uint32_t>{width, height}) {
+        return Error{ErrorCode::InvalidHeader,
+                     ispe_mismatch_message(width, height, frame_dims->first, frame_dims->second)};
     }
     return check_av1c_seq_headers(bytes, width, height);
 }
