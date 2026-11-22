@@ -364,3 +364,111 @@ TEST(WkmetaStrictTest, GetRegionsAcceptsPlainStrings) {
     EXPECT_EQ(regions[0].name, "Box");
     EXPECT_EQ(regions[0].person_name, "Bob");
 }
+
+TEST(WkmetaStrictTest, SetRegionFieldCreatesStruct) {
+    MetaBlock block;
+
+    auto r = block.set_region_field(region::CONFIDENCE, float(0.87f));
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    ASSERT_EQ(block.entries.size(), 1u);
+    EXPECT_EQ(block.entries[0].ns, Namespace::Region);
+    EXPECT_EQ(block.entries[0].tag, region::NAME);
+    auto *s = std::get_if<Struct>(&block.entries[0].value);
+    ASSERT_NE(s, nullptr);
+    ASSERT_EQ(s->fields.size(), 1u);
+    EXPECT_EQ(s->fields[0].tag, region::CONFIDENCE);
+    ASSERT_NE(std::get_if<float>(&s->fields[0].value), nullptr);
+    EXPECT_NEAR(*std::get_if<float>(&s->fields[0].value), 0.87f, 1e-6f);
+
+    auto regions = block.get_regions();
+    ASSERT_EQ(regions.size(), 1u);
+    EXPECT_NEAR(regions[0].confidence, 0.87f, 1e-6f);
+}
+
+TEST(WkmetaStrictTest, SetRegionFieldMergesIntoExistingStruct) {
+    MetaBlock block;
+
+    ASSERT_TRUE(block.set_region_field(region::NAME, LocalizedString{"en", "Face"}).has_value());
+    ASSERT_TRUE(block.set_region_field(region::ROLE, std::string("subject")).has_value());
+    ASSERT_TRUE(block.set_region_field(region::CONFIDENCE, float(0.9f)).has_value());
+    ASSERT_EQ(block.entries.size(), 1u);
+
+    auto regions = block.get_regions();
+    ASSERT_EQ(regions.size(), 1u);
+    EXPECT_EQ(regions[0].name, "Face");
+    EXPECT_EQ(regions[0].role, "subject");
+    EXPECT_NEAR(regions[0].confidence, 0.9f, 1e-6f);
+
+    // Updating an existing field replaces it instead of appending.
+    ASSERT_TRUE(block.set_region_field(region::CONFIDENCE, float(0.5f)).has_value());
+    auto *s = std::get_if<Struct>(&block.entries[0].value);
+    ASSERT_NE(s, nullptr);
+    ASSERT_EQ(s->fields.size(), 3u);
+    regions = block.get_regions();
+    ASSERT_EQ(regions.size(), 1u);
+    EXPECT_NEAR(regions[0].confidence, 0.5f, 1e-6f);
+}
+
+TEST(WkmetaStrictTest, SetRegionFieldRejectsUnknownTag) {
+    MetaBlock block;
+
+    auto r = block.set_region_field(0x00FF, float(1.0f));
+    EXPECT_FALSE(r.has_value());
+    EXPECT_TRUE(block.entries.empty());
+}
+
+TEST(WkmetaStrictTest, SetRegionFieldLeavesOtherStructEntriesAlone) {
+    MetaBlock block;
+
+    Struct first;
+    first.fields.push_back({Namespace::Region, region::NAME, LocalizedString{"en", "One"}, {}, false});
+    Struct second;
+    second.fields.push_back({Namespace::Region, region::NAME, LocalizedString{"en", "Two"}, {}, false});
+    block.entries.push_back({Namespace::Region, region::NAME, first, {}, false});
+    block.entries.push_back({Namespace::Region, region::NAME, second, {}, false});
+
+    ASSERT_TRUE(block.set_region_field(region::ROLE, std::string("subject")).has_value());
+    ASSERT_EQ(block.entries.size(), 2u);
+
+    auto regions = block.get_regions();
+    ASSERT_EQ(regions.size(), 2u);
+    EXPECT_EQ(regions[0].role, "subject");
+    EXPECT_EQ(regions[1].role, "");
+    EXPECT_EQ(regions[1].name, "Two");
+}
+
+TEST(WkmetaStrictTest, SetRegionFieldRoundTripsAllFields) {
+    MetaBlock block;
+
+    auto rect = std::make_shared<ValueArray>();
+    rect->elements = {Value{0.1f}, Value{0.2f}, Value{0.3f}, Value{0.4f}};
+    auto person_id = Uuid::from_string("123e4567-e89b-12d3-a456-426614174000");
+
+    ASSERT_TRUE(block.set_region_field(region::NAME, LocalizedString{"en", "Person 1"}).has_value());
+    ASSERT_TRUE(block.set_region_field(region::TYPE, uint8_t(1)).has_value());
+    ASSERT_TRUE(block.set_region_field(region::ROLE, std::string("subject")).has_value());
+    ASSERT_TRUE(block.set_region_field(region::RECT_NORM, Value{rect}).has_value());
+    ASSERT_TRUE(block.set_region_field(region::CONFIDENCE, float(0.9f)).has_value());
+    ASSERT_TRUE(block.set_region_field(region::PERSON_NAME, LocalizedString{"en", "Ada"}).has_value());
+    ASSERT_TRUE(block.set_region_field(region::PERSON_ID, person_id).has_value());
+    ASSERT_TRUE(block.set_region_field(region::OBJECT_CLASS, std::string("person")).has_value());
+    ASSERT_TRUE(block.set_region_field(region::CREATOR, std::string("alice")).has_value());
+
+    auto bytes = block.serialize();
+    auto parsed = MetaBlock::parse(bytes);
+    ASSERT_TRUE(parsed.has_value());
+    auto regions = parsed->get_regions();
+    ASSERT_EQ(regions.size(), 1u);
+    EXPECT_EQ(regions[0].name, "Person 1");
+    EXPECT_EQ(regions[0].type, 1);
+    EXPECT_EQ(regions[0].role, "subject");
+    EXPECT_NEAR(regions[0].x, 0.1f, 1e-6f);
+    EXPECT_NEAR(regions[0].y, 0.2f, 1e-6f);
+    EXPECT_NEAR(regions[0].w, 0.3f, 1e-6f);
+    EXPECT_NEAR(regions[0].h, 0.4f, 1e-6f);
+    EXPECT_NEAR(regions[0].confidence, 0.9f, 1e-6f);
+    EXPECT_EQ(regions[0].person_name, "Ada");
+    EXPECT_EQ(regions[0].person_id, person_id);
+    EXPECT_EQ(regions[0].object_class, "person");
+    EXPECT_EQ(regions[0].creator, "alice");
+}

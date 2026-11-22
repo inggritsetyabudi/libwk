@@ -188,10 +188,15 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
     if (source_has_alpha) fhdr.flags |= wk::FHDR_FLAG_ALPHA;
     if (fhdr.hdr_flag_expected()) fhdr.flags |= wk::FHDR_FLAG_HDR;
     if (config.cicp.full_range) fhdr.flags |= wk::FHDR_FLAG_FULL_RANGE;
+    // #meta: parse_container requires the HAS_C2PA flag to match
+    // PROV chunk presence, so set it here when a manifest is given.
+    if (!config.c2pa_manifest.empty()) fhdr.flags |= wk::FHDR_FLAG_HAS_C2PA;
     fhdr.flags |= FHDR_FLAG_TILED;
 
     WkFile file;
     file.header = fhdr;
+    file.icc_profile = config.icc_profile;
+    file.c2pa_manifest = config.c2pa_manifest;
 
     if (config.lossless) {
         if (fhdr.bit_depth != 8) {
@@ -496,7 +501,7 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
             tile_count++;
         }
 
-        if (tile_count > 0) {
+        if (tile_count > 0 && config.write_quality_score) {
             float avg_score = total_score / tile_count;
             meta::MetaBlock meta;
             meta.set(meta::Namespace::Rating, meta::rating::QUALITY_SCORE, avg_score);

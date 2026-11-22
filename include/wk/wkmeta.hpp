@@ -325,6 +325,12 @@ namespace wk::meta
         [[nodiscard]] auto get_title(std::string_view lang_bcp47 = "") const
             -> std::expected<std::string, MetaError>;
         [[nodiscard]] auto get_regions() const -> std::vector<RegionAnnotation>;
+        // Sets one field of a region annotation (SPEC section 7.6).
+        // The field is merged into the first REGION STRUCT entry; if
+        // the block has none, a new STRUCT entry (tag 0x0001) is
+        // created. Other STRUCT entries are left untouched. The tag
+        // must be one of the region field tags (0x0001-0x0009).
+        auto set_region_field(uint16_t tag, Value v) -> std::expected<void, MetaError>;
         [[nodiscard]] auto get_license() const -> std::expected<std::string, MetaError>;
 
         [[nodiscard]] auto serialize() const -> std::vector<uint8_t>;

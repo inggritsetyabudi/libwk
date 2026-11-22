@@ -368,6 +368,67 @@ std::expected<wk::meta::Value, std::string> parse_value_str(const std::string& n
         return Timestamp::from_iso8601(value_str);
     }
 
+    if (ns_str == "REGION" && tag_str == "TYPE") {
+        auto v = parse_u32_strict(value_str, "REGION.TYPE");
+        if (!v)
+            return std::unexpected(v.error());
+        if (*v > 255) {
+            return std::unexpected("value '" + value_str + "' for REGION.TYPE is out of range [0, 255]");
+        }
+        return static_cast<uint8_t>(*v);
+    }
+    if (ns_str == "REGION" && tag_str == "CONFIDENCE") {
+        auto v = ranged_double(0.0, 1.0, "REGION.CONFIDENCE");
+        if (!v)
+            return std::unexpected(v.error());
+        return static_cast<float>(*v);
+    }
+    if (ns_str == "REGION" && tag_str == "RECT_NORM") {
+        // Comma list "x,y,w,h", each 0..1 -> ARRAY of 4 FLOAT32.
+        auto rect = std::make_shared<wk::meta::ValueArray>();
+        size_t start = 0;
+        for (int k = 0; k < 4; ++k) {
+            auto comma = value_str.find(',', start);
+            if (k < 3 && comma == std::string::npos) {
+                return std::unexpected("invalid rect '" + value_str +
+                                       "' for REGION.RECT_NORM (expected x,y,w,h)");
+            }
+            auto part = value_str.substr(start, comma == std::string::npos ? std::string::npos
+                                                                            : comma - start);
+            auto v = parse_double_strict(part, "REGION.RECT_NORM");
+            if (!v)
+                return std::unexpected(v.error());
+            if (*v < 0.0 || *v > 1.0) {
+                return std::unexpected("value '" + part + "' for REGION.RECT_NORM is out of range [0, 1]");
+            }
+            rect->elements.push_back(static_cast<float>(*v));
+            start = comma == std::string::npos ? value_str.size() : comma + 1;
+        }
+        if (start < value_str.size()) {
+            return std::unexpected("invalid rect '" + value_str +
+                                   "' for REGION.RECT_NORM (expected x,y,w,h)");
+        }
+        return wk::meta::Value{rect};
+    }
+    if (ns_str == "REGION" && tag_str == "PERSON_ID") {
+        // Uuid::from_string is lenient (short/garbage input silently
+        // becomes a zero UUID), so validate the 8-4-4-4-12 hex shape
+        // here first.
+        bool shape_ok = value_str.size() == 36 && value_str[8] == '-' && value_str[13] == '-' &&
+                        value_str[18] == '-' && value_str[23] == '-';
+        for (size_t i = 0; shape_ok && i < value_str.size(); ++i) {
+            if (value_str[i] == '-')
+                continue;
+            char c = value_str[i];
+            shape_ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        }
+        if (!shape_ok) {
+            return std::unexpected("invalid UUID '" + value_str +
+                                   "' for REGION.PERSON_ID (expected 8-4-4-4-12 hex)");
+        }
+        return wk::meta::Uuid::from_string(value_str);
+    }
+
     const auto colon = value_str.find(':');
     if (colon != std::string::npos && colon < 5 &&
         (ns_str == "CONTENT" || ns_str == "RIGHTS" || ns_str == "ANIM" || ns_str == "REGION")) {
@@ -393,6 +454,13 @@ void merge_metadata(wk::meta::MetaBlock& destination, const wk::meta::MetaBlock&
     }
 }
 
+bool is_region_field_tag(uint16_t tag) {
+    using namespace wk::meta;
+    return tag == region::NAME || tag == region::TYPE || tag == region::ROLE ||
+           tag == region::RECT_NORM || tag == region::CONFIDENCE || tag == region::PERSON_NAME ||
+           tag == region::PERSON_ID || tag == region::OBJECT_CLASS || tag == region::CREATOR;
+}
+
 void print_usage() {
     std::cerr
         << "Usage: wkmeta-edit [options] <input.wk>\n\n"
@@ -400,6 +468,8 @@ void print_usage() {
         << "  --set NS.TAG VALUE   Set metadata field (example: --set GEO.LAT 1.234)\n"
         << "  --delete NS.TAG      Delete metadata field\n"
         << "  --import-exif FILE   Import EXIF from JPEG/TIFF donor file\n"
+        << "  --import-icc FILE    Set the ICCP chunk from an ICC profile file\n"
+        << "  --import-prov FILE   Set the PROV chunk from a C2PA manifest file\n"
         << "  --export-json        Print WKMETA as JSON to stdout\n"
         << "  --version            Print version\n"
         << "  -o, --output FILE    Output file (default: in-place edit)\n"
@@ -419,6 +489,8 @@ int main(int argc, char* argv[]) {
     std::string input_path;
     std::string output_path;
     std::string exif_source_path;
+    std::string icc_source_path;
+    std::string prov_source_path;
     bool export_json = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -442,6 +514,18 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             exif_source_path = argv[++i];
+        } else if (arg == "--import-icc") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --import-icc requires a profile file\n";
+                return 1;
+            }
+            icc_source_path = argv[++i];
+        } else if (arg == "--import-prov") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --import-prov requires a manifest file\n";
+                return 1;
+            }
+            prov_source_path = argv[++i];
         } else if (arg == "--export-json") {
             export_json = true;
         } else if (arg == "--version") {
@@ -513,7 +597,15 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        auto set_result = file->metadata->set(*ns, *tag, std::move(*value));
+        // REGION fields live inside one STRUCT entry (SPEC section
+        // 7.6), never as flat entries: merge them into the first
+        // STRUCT instead of writing a flat entry nobody reads.
+        std::expected<void, wk::meta::MetaError> set_result;
+        if (*ns == wk::meta::Namespace::Region && is_region_field_tag(*tag)) {
+            set_result = file->metadata->set_region_field(*tag, std::move(*value));
+        } else {
+            set_result = file->metadata->set(*ns, *tag, std::move(*value));
+        }
         if (!set_result) {
             std::cerr << "Error: failed to set " << operation.key << ": " << set_result.error().message << '\n';
             return 1;
@@ -560,6 +652,27 @@ int main(int argc, char* argv[]) {
         }
 
         merge_metadata(*file->metadata, *imported);
+    }
+
+    if (!icc_source_path.empty()) {
+        auto icc_bytes = wk::tool::read_file_bytes(icc_source_path);
+        if (!icc_bytes) {
+            std::cerr << "Error: " << icc_bytes.error().message << '\n';
+            return 1;
+        }
+        file->icc_profile = std::move(*icc_bytes);
+    }
+
+    if (!prov_source_path.empty()) {
+        auto prov_bytes = wk::tool::read_file_bytes(prov_source_path);
+        if (!prov_bytes) {
+            std::cerr << "Error: " << prov_bytes.error().message << '\n';
+            return 1;
+        }
+        file->c2pa_manifest = std::move(*prov_bytes);
+        // parse_container requires the HAS_C2PA flag to match PROV
+        // chunk presence.
+        file->header.flags |= wk::FHDR_FLAG_HAS_C2PA;
     }
 
     if (export_json) {

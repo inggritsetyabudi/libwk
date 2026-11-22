@@ -167,6 +167,16 @@ namespace wk
         // Metadata only -- the values never touch pixels.
         uint16_t max_cll = 0;
         uint16_t max_fall = 0;
+        // Embedded ICC profile and C2PA provenance manifest (#meta):
+        // raw bytes written verbatim to the ICCP / PROV chunks.
+        // Empty (the default) means no chunk is written.
+        std::vector<uint8_t> icc_profile;
+        std::vector<uint8_t> c2pa_manifest;
+        // Write the encoder's RATING.QUALITY_SCORE entry (the mean
+        // per-tile quality score) into META on lossy encodes.
+        // Default on; set false to drop the 24 B META chunk when no
+        // other metadata is present.
+        bool write_quality_score = true;
         uint8_t tile_size_log2 = 0;
         uint32_t threads = 0;
         // Phase 2 perceptual control field: when true, the encoder
