@@ -758,6 +758,36 @@ TEST(ImageIoTest, LoadAvifRejectsIspeDimsLieHuge) {
         << decoded.error().message;
 }
 
+TEST(ImageIoTest, LoadAvifRejectsFrameSizeOverride) {
+    // The sequence header max dims agree with the ispe, but the frame
+    // header overrides the frame size down to 16x16: the decoder must
+    // reject instead of scaling the frame up to the ispe size (the
+    // 16384 variant costs 183 s / 4.6 GB pre-fix, same as the plain
+    // ispe lie). Fixtures are the proven attack files from the
+    // frame_size_override diagnosis (672 bytes each).
+    for (const char* name :
+         {"fso_2048.avif.hex", "fso_4096.avif.hex", "fso_8192.avif.hex", "fso_16384.avif.hex"}) {
+        const auto bytes = read_fixture_bytes(name);
+        ASSERT_FALSE(bytes.empty()) << name;
+        const auto decoded = avif::decode(bytes);
+        ASSERT_FALSE(decoded.has_value()) << name;
+        EXPECT_NE(decoded.error().message.find("ispe"), std::string::npos)
+            << name << ": " << decoded.error().message;
+    }
+}
+
+TEST(ImageIoTest, LoadAvifRejectsFrameSizeOverride8Bit) {
+    // Same override on an 8-bit seed: the mechanism does not depend
+    // on bit depth, but prove it with numbers (513-byte file crafted
+    // from avif_tiny_444_8.avif the same way as the 10-bit variants).
+    const auto bytes = read_fixture_bytes("fso_2048_8bit.avif.hex");
+    ASSERT_FALSE(bytes.empty());
+    const auto decoded = avif::decode(bytes);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_NE(decoded.error().message.find("ispe"), std::string::npos)
+        << decoded.error().message;
+}
+
 TEST(ImageIoTest, LoadAvifRejectsTruncated) {
     const auto bytes = read_fixture_bytes("chart_pq10_444.avif.hex");
     ASSERT_FALSE(bytes.empty());
