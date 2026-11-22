@@ -67,6 +67,7 @@ public:
               bool refine_low_frequencies = false) {
         quality_ = std::clamp(quality, 1.0f, 100.0f);
         is_chroma_ = is_chroma;
+        bit_depth_ = bit_depth;
         refine_low_frequencies_ = refine_low_frequencies;
         const auto& base = is_chroma ? BASE_QUANT_CHROMA : BASE_QUANT_LUMA;
 
@@ -110,6 +111,7 @@ public:
                 const float q = v * inv_table_[i];
                 output[i] = static_cast<int16_t>(
                     (v > 0) ? std::floor(q + 0.5f) : std::ceil(q - 0.5f));
+                zero_chroma_hf_deadzone(i, output[i]);  // #k1
             }
         }
     }
@@ -130,6 +132,17 @@ public:
         0.5f, 0.625f, 0.75f, 0.875f, 1.0f, 1.25f, 1.5f, 2.0f};
     static constexpr uint8_t kQuantScaleIdentity = 4;
 
+    // Chroma high-frequency deadzone (#k1): after rounding, a chroma
+    // coefficient at zigzag index >= 24 with |q| <= 1 is zeroed. Luma
+    // is untouched. The zeroing happens inside quantization, so the
+    // quantization-aware RDO and the reconstruction used for prediction
+    // both see the zeroed coefficients. 8-bit only: the rule is
+    // measured on 8-bit photos, and at 10/12-bit it costs ~2.2 dB on
+    // gradient textures (the |q| = 1 coefficients there are signal,
+    // not ringing), so higher bit depths keep the old behavior.
+    static constexpr int kChromaHfDeadzoneZigzag = 24;
+    static constexpr int16_t kChromaHfDeadzoneMaxQ = 1;
+
     void quantize_scaled(const DctBlock& input, DctBlockI16& output, float scale) const {
         for (int i = 0; i < 64; i++) {
             const int zi = ZIGZAG_ORDER[i];
@@ -141,6 +154,7 @@ public:
                 const float q = v * (inv_table_[i] / scale);
                 output[i] = static_cast<int16_t>(
                     (v > 0) ? std::floor(q + 0.5f) : std::ceil(q - 0.5f));
+                zero_chroma_hf_deadzone(i, output[i]);  // #k1
             }
         }
     }
@@ -156,6 +170,14 @@ public:
     [[nodiscard]] const std::array<uint16_t, 64>& steps() const { return table_; }
 
 private:
+    void zero_chroma_hf_deadzone(int zigzag_index, int16_t& q) const {
+        if (bit_depth_ != 8) return;  // #k1: measured on 8-bit only
+        if (is_chroma_ && zigzag_index >= kChromaHfDeadzoneZigzag &&
+            q >= -kChromaHfDeadzoneMaxQ && q <= kChromaHfDeadzoneMaxQ) {
+            q = 0;
+        }
+    }
+
     [[nodiscard]] float chroma_step_scale(int zigzag_index) const {
         if (!is_chroma_) {
             return 1.0f;
@@ -221,6 +243,7 @@ private:
     std::array<float, 64>    inv_table_{};
     float                    quality_ = 75.0f;
     bool                     is_chroma_ = false;
+    uint8_t                  bit_depth_ = 8;
     bool                     refine_low_frequencies_ = false;
 };
 
