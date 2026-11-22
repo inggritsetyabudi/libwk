@@ -34,6 +34,7 @@ src/core/lossy_coeff_stream.cpp
 src/core/lossy_tile_decode.cpp
 src/core/lossy_tile_encode.cpp
 src/core/metrics.cpp
+src/core/meta_compress.cpp
 src/core/mode_span_rans.cpp
 src/core/mode_stream.cpp
 src/core/predict.cpp
