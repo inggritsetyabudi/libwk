@@ -21,6 +21,9 @@
 #include "stb/stb_image_write.h"
 #include <filesystem>
 #include <fstream>
+#include <cstring>
+#include <optional>
+#include <span>
 
 namespace wk::io {
 
@@ -324,6 +327,78 @@ Result<Image> load_jxl(std::string_view path) {
     return jxl::decode(*file_bytes);
 }
 
+// Counts the image descriptors in a GIF byte stream without decoding
+// any pixels: walks the block structure only, so a crafted animated
+// GIF cannot turn the rejection path into a multi-frame allocation.
+// Returns nullopt when the bytes are not a GIF or are malformed — the
+// caller then falls through to the normal stb path, which reports the
+// real error. #anim #fase9
+std::optional<bool> gif_has_multiple_frames(std::span<const uint8_t> bytes)
+{
+    if (bytes.size() < 13) return std::nullopt;
+    const bool is_gif87 = std::memcmp(bytes.data(), "GIF87a", 6) == 0;
+    const bool is_gif89 = std::memcmp(bytes.data(), "GIF89a", 6) == 0;
+    if (!is_gif87 && !is_gif89) return std::nullopt;
+
+    size_t pos = 13;
+    // Logical screen descriptor: width (2), height (2), packed (1) at
+    // offset 10; bit 7 of packed says a global color table follows.
+    const uint8_t packed = bytes[10];
+    if (packed & 0x80)
+    {
+        const size_t gct_size = static_cast<size_t>(3) << (1 + (packed & 0x07));
+        pos += gct_size;
+    }
+    // Skips one run of sub-blocks (each: size byte, then size bytes,
+    // terminated by a zero size byte). False when the stream ends first.
+    const auto skip_sub_blocks = [&]() -> bool {
+        while (true)
+        {
+            if (pos >= bytes.size()) return false;
+            const uint8_t size = bytes[pos++];
+            if (size == 0) return true;
+            if (pos + size > bytes.size()) return false;
+            pos += size;
+        }
+    };
+
+    size_t images = 0;
+    while (true)
+    {
+        if (pos >= bytes.size()) return std::nullopt;
+        const uint8_t marker = bytes[pos++];
+        if (marker == 0x3B) return images > 1;  // trailer
+        if (marker == 0x21)
+        {
+            // Extension: label byte, then sub-blocks.
+            if (pos >= bytes.size()) return std::nullopt;
+            ++pos;
+            if (!skip_sub_blocks()) return std::nullopt;
+            continue;
+        }
+        if (marker == 0x2C)
+        {
+            ++images;
+            // Image descriptor: 9 bytes after the separator, then an
+            // optional local color table, LZW minimum code size, and
+            // image data sub-blocks.
+            if (pos + 9 > bytes.size()) return std::nullopt;
+            const uint8_t img_packed = bytes[pos + 8];
+            pos += 9;
+            if (img_packed & 0x80)
+            {
+                const size_t lct_size = static_cast<size_t>(3) << (1 + (img_packed & 0x07));
+                pos += lct_size;
+            }
+            if (pos >= bytes.size()) return std::nullopt;
+            ++pos;  // LZW minimum code size
+            if (!skip_sub_blocks()) return std::nullopt;
+            continue;
+        }
+        return std::nullopt;  // unknown block type: not a GIF we can scan
+    }
+}
+
 // stb_image decodes JPG/PNG/BMP/TGA/GIF (and more) on every platform,
 // replacing the old Windows-only WIC path: wkenc could only read PPM
 // on Linux/Termux, and wkdec could only write PNG on Windows.
@@ -343,6 +418,19 @@ Result<Image> load_stb_image(std::string_view path) {
     }
     if (channels != 1 && channels != 2 && channels != 3 && channels != 4) {
         return std::unexpected(Error{ErrorCode::UnsupportedFeature, "unsupported channel count"});
+    }
+
+    // Animated GIFs are rejected explicitly, like animated WebP/AVIF/
+    // JXL: stbi_load would silently return only the first frame. The
+    // scan counts image descriptors without decoding pixels, so the
+    // rejection cannot allocate a multi-frame raster. #anim #fase9
+    if (auto file_bytes = read_file_bytes(path)) {
+        if (auto animated = gif_has_multiple_frames(*file_bytes)) {
+            if (*animated) {
+                return std::unexpected(Error{ErrorCode::InvalidHeader,
+                                             "animated GIF not supported"});
+            }
+        }
     }
 
     unsigned char* data = stbi_load(file_path.c_str(), &width, &height, &channels, 0);

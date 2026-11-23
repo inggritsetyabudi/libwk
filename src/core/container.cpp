@@ -186,6 +186,14 @@ namespace wk
         if (!fc)
             return std::unexpected(fc.error());
         anim.frame_count = *fc;
+        // An animation with no frames is not an animation: the flag
+        // claims frames that do not exist, and every consumer would
+        // have to handle the degenerate case. #anim #fase9
+        if (anim.frame_count == 0)
+        {
+            return std::unexpected(Error{ErrorCode::AnimationError,
+                                         "ANIM frame_count must be at least 1"});
+        }
         auto lc = r.read_u16();
         if (!lc)
             return std::unexpected(lc.error());
@@ -226,10 +234,20 @@ namespace wk
             if (!bm)
                 return std::unexpected(bm.error());
             f.blend_mode = *bm;
+            if (f.blend_mode > 1)
+            {
+                return std::unexpected(Error{ErrorCode::AnimationError,
+                                             "ANIM blend_mode must be 0 or 1"});
+            }
             auto ds = r.read_u8();
             if (!ds)
                 return std::unexpected(ds.error());
             f.disposal = *ds;
+            if (f.disposal > 1)
+            {
+                return std::unexpected(Error{ErrorCode::AnimationError,
+                                             "ANIM disposal must be 0 or 1"});
+            }
             auto rx = r.read_u16();
             if (!rx)
                 return std::unexpected(rx.error());
@@ -322,6 +340,143 @@ namespace wk
         chunk.payload.assign(payload->begin(), payload->end());
 
         return chunk;
+    }
+
+    // Validates an ANIM header against the canvas and the TILE list
+    // (SPEC Section 4): frame_count >= 1 and the blend/disposal ranges
+    // are already enforced by parse_anim; this checks what parse_anim
+    // cannot know — the canvas dimensions and the tile chunks. Runs at
+    // the end of parse_container, so every consumer of a .wk file gets
+    // the same rejection. #anim #fase9
+    [[nodiscard]] Result<void> validate_animation(const WkFile& file)
+    {
+        const FrameHeader& hdr = file.header;
+        const AnimHeader& anim = *file.animation;
+        const uint32_t tile_size = hdr.tile_size();
+        const uint32_t total_tiles = static_cast<uint32_t>(file.tile_chunks.size());
+
+        // Offsets and rectangles first: they do not depend on the tile
+        // headers, and a bad offset must fail before coverage is even
+        // attempted.
+        for (size_t k = 0; k < anim.frames.size(); ++k)
+        {
+            const AnimFrame& f = anim.frames[k];
+            if (k == 0)
+            {
+                if (f.tile_offset != 0)
+                {
+                    return std::unexpected(Error{ErrorCode::AnimationError,
+                                                 "first frame tile_offset must be 0"});
+                }
+            }
+            else if (f.tile_offset <= anim.frames[k - 1].tile_offset)
+            {
+                return std::unexpected(Error{ErrorCode::AnimationError,
+                                             "ANIM tile_offset must be strictly increasing"});
+            }
+            if (f.tile_offset >= total_tiles)
+            {
+                return std::unexpected(Error{ErrorCode::AnimationError,
+                                             "ANIM tile_offset out of range"});
+            }
+            if (f.rect_w == 0 || f.rect_h == 0)
+            {
+                return std::unexpected(Error{ErrorCode::AnimationError,
+                                             "ANIM frame rect must be non-empty"});
+            }
+            if (static_cast<uint32_t>(f.rect_x) + f.rect_w > hdr.width ||
+                static_cast<uint32_t>(f.rect_y) + f.rect_h > hdr.height)
+            {
+                return std::unexpected(Error{ErrorCode::AnimationError,
+                                             "ANIM frame rect outside canvas"});
+            }
+            if (f.rect_x % tile_size != 0 || f.rect_y % tile_size != 0)
+            {
+                return std::unexpected(Error{ErrorCode::AnimationError,
+                                             "ANIM frame rect must be tile-aligned"});
+            }
+            if (static_cast<uint32_t>(f.rect_x) + f.rect_w < hdr.width &&
+                f.rect_w % tile_size != 0)
+            {
+                return std::unexpected(Error{ErrorCode::AnimationError,
+                                             "ANIM frame rect width must be tile-aligned"});
+            }
+            if (static_cast<uint32_t>(f.rect_y) + f.rect_h < hdr.height &&
+                f.rect_h % tile_size != 0)
+            {
+                return std::unexpected(Error{ErrorCode::AnimationError,
+                                             "ANIM frame rect height must be tile-aligned"});
+            }
+        }
+
+        // Coverage: each frame's TILE chunks must cover its rectangle's
+        // tile grid exactly once (the per-frame analog of the still-image
+        // grid rule). The count check runs first so a wrong count fails
+        // without parsing tile headers.
+        for (size_t k = 0; k < anim.frames.size(); ++k)
+        {
+            const AnimFrame& f = anim.frames[k];
+            const uint32_t begin = f.tile_offset;
+            const uint32_t end = (k + 1 < anim.frames.size())
+                                     ? anim.frames[k + 1].tile_offset
+                                     : total_tiles;
+            const uint32_t owned = end - begin;
+
+            // Lossless single-tile form (SPEC Section 4.4): one TILE at
+            // (0, 0) holding the whole frame. A single (0, 0) tile is
+            // always read as the whole frame, so its rectangle must be
+            // the full canvas — a sub-rectangle here would be ambiguous.
+            if (hdr.is_lossless() && owned == 1)
+            {
+                auto single = parse_tile_header({file.tile_chunks[begin].payload.data(), 9});
+                if (!single) return std::unexpected(single.error());
+                if (single->tile_x == 0 && single->tile_y == 0)
+                {
+                    if (f.rect_x == 0 && f.rect_y == 0 && f.rect_w == hdr.width &&
+                        f.rect_h == hdr.height)
+                    {
+                        continue;
+                    }
+                    return std::unexpected(Error{ErrorCode::AnimationError,
+                                                 "lossless single-tile frame must cover the full canvas"});
+                }
+            }
+
+            const uint32_t tx0 = f.rect_x / tile_size;
+            const uint32_t ty0 = f.rect_y / tile_size;
+            const uint32_t tx1 = (static_cast<uint32_t>(f.rect_x) + f.rect_w - 1) / tile_size;
+            const uint32_t ty1 = (static_cast<uint32_t>(f.rect_y) + f.rect_h - 1) / tile_size;
+            const uint32_t rect_tiles_x = tx1 - tx0 + 1;
+            const uint32_t rect_tiles_y = ty1 - ty0 + 1;
+            const uint64_t expected = static_cast<uint64_t>(rect_tiles_x) * rect_tiles_y;
+            if (owned != expected)
+            {
+                return std::unexpected(Error{ErrorCode::AnimationError,
+                                             "frame TILE count does not match its rect"});
+            }
+            std::vector<char> seen(static_cast<size_t>(expected), 0);
+            for (uint32_t i = begin; i < end; ++i)
+            {
+                auto tile = parse_tile_header({file.tile_chunks[i].payload.data(), 9});
+                if (!tile) return std::unexpected(tile.error());
+                if (tile->tile_x < tx0 || tile->tile_x > tx1 || tile->tile_y < ty0 ||
+                    tile->tile_y > ty1)
+                {
+                    return std::unexpected(Error{ErrorCode::AnimationError,
+                                                 "frame TILE outside its rect"});
+                }
+                const size_t index = static_cast<size_t>(tile->tile_y - ty0) * rect_tiles_x +
+                                     (tile->tile_x - tx0);
+                if (seen[index])
+                {
+                    return std::unexpected(Error{ErrorCode::AnimationError,
+                                                 "duplicate TILE in frame"});
+                }
+                seen[index] = 1;
+            }
+        }
+
+        return {};
     }
 
     Result<WkFile> parse_container(std::span<const uint8_t> data)
@@ -537,6 +692,12 @@ namespace wk
         {
             return std::unexpected(Error{ErrorCode::InvalidHeader,
                                          "FHDR HAS_C2PA flag does not match PROV chunk presence"});
+        }
+
+        if (file.animation)
+        {
+            auto anim_valid = validate_animation(file);
+            if (!anim_valid) return std::unexpected(anim_valid.error());
         }
 
         return file;

@@ -231,6 +231,62 @@ Followed by `frame_count` frame entries (16 bytes each):
 | 10     | 2    | rect_h     | uint16 |
 | 12     | 4    | tile_offset| uint32 |
 
+### 4.1 Frame-to-tile mapping
+
+Each frame owns a consecutive run of TILE chunks, in file order.
+`tile_offset` is the index of the first TILE chunk owned by the frame
+in the file's TILE chunk list (not a byte offset). The number of TILE
+chunks owned by frame k is the difference between its `tile_offset`
+and the next frame's `tile_offset`; the last frame owns the TILE
+chunks from its `tile_offset` to the end of the TILE list. The first
+frame's `tile_offset` MUST be 0, offsets MUST be strictly increasing,
+and every offset MUST be smaller than the number of TILE chunks in
+the file. No TILE chunk belongs to more than one frame, and no TILE
+chunk belongs to no frame. A decoder MUST reject a file whose offsets
+violate any of these rules.
+
+A frame's TILE chunks are the tiles of its rectangle (Section 4.2):
+the tile coordinates of a frame's TILE chunks MUST cover the tile
+grid of its rectangle exactly once. In version 1 there is no
+inter-frame reference: frames are independent, and a TILE chunk is
+never shared between frames.
+
+### 4.2 Frame rectangles
+
+A frame's rectangle (`rect_x`, `rect_y`, `rect_w`, `rect_h`) MAY be
+smaller than the canvas (a sub-frame); it MUST lie inside the canvas
+(`rect_x + rect_w <= width`, `rect_y + rect_h <= height`) and have
+non-zero width and height. The rectangle MUST be aligned to the tile
+grid: `rect_x` and `rect_y` MUST be multiples of the tile size, and
+`rect_w` and `rect_h` MUST be multiples of the tile size, except where
+the rectangle reaches the canvas edge — there the width or height MAY
+be the smaller remainder (`rect_x + rect_w == width` or
+`rect_y + rect_h == height`). A decoder MUST reject a rectangle that
+violates any of these rules.
+
+### 4.3 Compositing
+
+The canvas starts filled with `background_rgba`. For each frame in
+order, the frame's rectangle is composited onto the canvas according
+to its `blend_mode`: OVER (0) alpha-blends the frame's pixels over
+the canvas; SOURCE (1) replaces the canvas pixels in the rectangle
+with the frame's pixels. After the frame's `delay_ms` has elapsed,
+its `disposal` applies: keep (0) leaves the frame's pixels on the
+canvas for the next frame; restore-bg (1) restores the rectangle to
+`background_rgba`.
+
+### 4.4 Validity
+
+An ANIM payload MUST have `frame_count >= 1`, and every frame entry
+MUST have `blend_mode` and `disposal` in {0, 1}. A decoder MUST
+reject an ANIM payload that violates either rule. A valid animated
+file is one whose ANIM payload satisfies this section, whose
+`tile_offset` values satisfy Section 4.1, and whose every frame's
+TILE chunks cover its rectangle's tile grid exactly once — except for
+a lossless frame, which MAY instead have exactly one TILE chunk at
+(0, 0) holding the whole frame, in which case its rectangle MUST be
+the full canvas.
+
 ---
 
 ## 5. rANS Entropy Coding
@@ -520,7 +576,9 @@ A conforming decoder MUST:
 7. Preserve unknown WKMETA entries on round-trip
 8. Never crash or invoke UB on malformed input
 9. Reject an FHDR payload that is not exactly 19 bytes, and an ANIM
-   payload whose size is not exactly `10 + frame_count * 16` bytes
+   payload whose size is not exactly `10 + frame_count * 16` bytes,
+   whose `frame_count` is 0, or whose `blend_mode` or `disposal` is
+   outside {0, 1}
 10. Reject duplicate META, ICCP, PROV, and ANIM chunks (TILE is the only
     repeatable chunk), and reject a META chunk that fails to parse
     instead of silently dropping it
@@ -544,3 +602,13 @@ A conforming decoder MUST:
     disagree with the chunks present: `HAS_WKMETA` must match the
     presence of a META chunk, `ANIMATED` the presence of an ANIM
     chunk, and `HAS_C2PA` the presence of a PROV chunk
+13. For an animated file, reject TILE chunks that do not belong to
+    exactly one frame: the first frame's `tile_offset` must be 0,
+    offsets must be strictly increasing and smaller than the number
+    of TILE chunks, every frame's rectangle must lie inside the canvas
+    with non-zero width and height and be aligned to the tile grid
+    (Section 4.2), and every frame's TILE chunks must cover its
+    rectangle's tile grid exactly once — except for a lossless frame,
+    which may instead have exactly one TILE chunk at (0, 0) holding
+    the whole frame, in which case its rectangle must be the full
+    canvas (Section 4.4)

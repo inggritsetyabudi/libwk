@@ -38,6 +38,82 @@ Chunk make_tile_chunk(uint32_t claimed_size, uint32_t actual_size) {
     return tile_chunk;
 }
 
+// A TILE chunk at (tile_x, tile_y) with a dummy payload: parse_container
+// only reads the 9-byte tile header, so the payload bytes are never
+// decoded here; the compressed_size must match the payload length.
+Chunk make_anim_tile_chunk(uint16_t tile_x, uint16_t tile_y, uint32_t payload_size) {
+    Chunk tile_chunk;
+    std::memcpy(tile_chunk.type, CHUNK_TILE, 4);
+
+    TileHeader header;
+    header.tile_x = tile_x;
+    header.tile_y = tile_y;
+    header.layer_flags = TILE_HAS_BASE;
+    header.compressed_size = payload_size;
+
+    tile_chunk.payload = serialize_tile_header(header);
+    for (uint32_t i = 0; i < payload_size; ++i) {
+        tile_chunk.payload.push_back(static_cast<uint8_t>(i + 1));
+    }
+    return tile_chunk;
+}
+
+// 128x128 canvas, 64 px tiles: a 2x2 tile grid, small enough that every
+// rect/tile case in the animation tests below is a handful of tiles.
+FrameHeader make_anim_test_header() {
+    FrameHeader hdr;
+    hdr.width = 128;
+    hdr.height = 128;
+    hdr.bit_depth = 8;
+    hdr.cicp_primaries = 1;
+    hdr.cicp_transfer = 1;
+    hdr.cicp_matrix = 1;
+    hdr.flags = FHDR_FLAG_ANIMATED | FHDR_FLAG_TILED | FHDR_FLAG_FULL_RANGE;
+    hdr.tile_size_log2 = 6;
+    return hdr;
+}
+
+AnimFrame make_anim_frame(uint16_t rect_x, uint16_t rect_y, uint16_t rect_w, uint16_t rect_h,
+                          uint32_t tile_offset, uint8_t blend_mode = 0, uint8_t disposal = 0) {
+    AnimFrame frame;
+    frame.delay_ms = 100;
+    frame.blend_mode = blend_mode;
+    frame.disposal = disposal;
+    frame.rect_x = rect_x;
+    frame.rect_y = rect_y;
+    frame.rect_w = rect_w;
+    frame.rect_h = rect_h;
+    frame.tile_offset = tile_offset;
+    return frame;
+}
+
+// A valid 2-frame animated file: frame 0 covers the full 128x128 canvas
+// (4 tiles), frame 1 is a one-tile sub-rect at the origin (1 tile).
+WkFile make_valid_anim_file() {
+    WkFile file;
+    file.header = make_anim_test_header();
+    file.animation = AnimHeader{};
+    file.animation->frame_count = 2;
+    file.animation->loop_count = 0;
+    file.animation->background_rgba = 0xFF000000;
+    file.animation->frames.push_back(make_anim_frame(0, 0, 128, 128, 0));
+    file.animation->frames.push_back(make_anim_frame(0, 0, 64, 64, 4));
+    file.tile_chunks.push_back(make_anim_tile_chunk(0, 0, 4));
+    file.tile_chunks.push_back(make_anim_tile_chunk(1, 0, 4));
+    file.tile_chunks.push_back(make_anim_tile_chunk(0, 1, 4));
+    file.tile_chunks.push_back(make_anim_tile_chunk(1, 1, 4));
+    file.tile_chunks.push_back(make_anim_tile_chunk(0, 0, 4));
+    return file;
+}
+
+// Serializes a hand-built file and parses it back: the round-trip
+// every animation validity test below goes through.
+Result<WkFile> roundtrip_anim_file(const WkFile& file) {
+    auto written = write_container(file);
+    if (!written) return std::unexpected(written.error());
+    return parse_container(*written);
+}
+
 void append_chunk(ByteWriter& writer, const char type[4], uint8_t flags, std::span<const uint8_t> payload) {
     writer.write_bytes({reinterpret_cast<const uint8_t*>(type), 4});
     writer.write_u8(flags);
@@ -76,11 +152,32 @@ std::vector<uint8_t> build_raw_container(const FrameHeader& hdr, bool include_me
         append_chunk(w, CHUNK_PROV, CHUNK_FLAG_OPTIONAL, std::vector<uint8_t>{1});
     }
     if (include_anim) {
-        ByteWriter anim;
-        anim.write_u32(0);  // frame_count 0
-        anim.write_u16(0);  // loop_count
-        anim.write_u32(0);  // background_rgba
-        append_chunk(w, CHUNK_ANIM, 0, anim.finish());
+        // A valid one-frame ANIM: frame_count 1 (0 is rejected), the
+        // frame covers the whole canvas, and the TILE chunks below
+        // cover its grid exactly once — otherwise the file would fail
+        // animation validation before the flag check these tests target.
+        AnimHeader anim;
+        anim.frame_count = 1;
+        anim.loop_count = 0;
+        anim.background_rgba = 0;
+        AnimFrame frame;
+        frame.delay_ms = 0;
+        frame.blend_mode = 0;
+        frame.disposal = 0;
+        frame.rect_x = 0;
+        frame.rect_y = 0;
+        frame.rect_w = static_cast<uint16_t>(hdr.width);
+        frame.rect_h = static_cast<uint16_t>(hdr.height);
+        frame.tile_offset = 0;
+        anim.frames.push_back(frame);
+        append_chunk(w, CHUNK_ANIM, 0, serialize_anim(anim));
+        for (uint32_t ty = 0; ty < hdr.tiles_y(); ++ty) {
+            for (uint32_t tx = 0; tx < hdr.tiles_x(); ++tx) {
+                Chunk tile = make_anim_tile_chunk(static_cast<uint16_t>(tx),
+                                                  static_cast<uint16_t>(ty), 4);
+                append_chunk(w, CHUNK_TILE, CHUNK_FLAG_REPEATABLE, tile.payload);
+            }
+        }
     }
     append_chunk(w, CHUNK_FEND, 0, {});
     return w.finish();
@@ -500,6 +597,58 @@ TEST(ContainerTest, ParseAnimRejectsTrailingBytes) {
     EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
 }
 
+// Slice 1 Fase 9: an ANIM payload with frame_count 0, or with a
+// blend_mode / disposal outside {0, 1}, is not a valid animation.
+TEST(ContainerTest, ParseAnimRejectsZeroFrameCount) {
+    // A 10-byte payload (header only) claims 0 frames.
+    ByteWriter writer;
+    writer.write_u32(0);
+    writer.write_u16(0);
+    writer.write_u32(0);
+
+    auto parsed = parse_anim(writer.finish());
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseAnimRejectsBlendModeOutOfRange) {
+    AnimHeader anim;
+    anim.frame_count = 1;
+    anim.loop_count = 0;
+    anim.background_rgba = 0;
+    anim.frames.push_back(make_anim_frame(0, 0, 64, 64, 0, /*blend_mode=*/2));
+
+    auto parsed = parse_anim(serialize_anim(anim));
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseAnimRejectsDisposalOutOfRange) {
+    AnimHeader anim;
+    anim.frame_count = 1;
+    anim.loop_count = 0;
+    anim.background_rgba = 0;
+    anim.frames.push_back(make_anim_frame(0, 0, 64, 64, 0, /*blend_mode=*/0, /*disposal=*/2));
+
+    auto parsed = parse_anim(serialize_anim(anim));
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseAnimAcceptsBlendModeAndDisposalOne) {
+    // Control: the 1 values (SOURCE blend, restore-bg disposal) parse.
+    AnimHeader anim;
+    anim.frame_count = 1;
+    anim.loop_count = 0;
+    anim.background_rgba = 0;
+    anim.frames.push_back(make_anim_frame(0, 0, 64, 64, 0, /*blend_mode=*/1, /*disposal=*/1));
+
+    auto parsed = parse_anim(serialize_anim(anim));
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    EXPECT_EQ(parsed->frames[0].blend_mode, 1u);
+    EXPECT_EQ(parsed->frames[0].disposal, 1u);
+}
+
 TEST(ContainerTest, ParseContainerRejectsMalformedMeta) {
     // An empty META payload cannot even hold the 3-byte envelope, so
     // MetaBlock::parse fails -- and that failure must surface instead of
@@ -567,10 +716,15 @@ TEST(ContainerTest, ParseContainerRejectsDuplicateProv) {
 }
 
 TEST(ContainerTest, ParseContainerRejectsDuplicateAnim) {
+    // A valid one-frame ANIM (frame_count 0 would fail parse_anim
+    // before the duplicate check runs, so it cannot exercise this path).
     AnimHeader anim;
-    anim.frame_count = 0;
+    anim.frame_count = 1;
     anim.loop_count = 0;
     anim.background_rgba = 0;
+    AnimFrame frame;
+    frame.delay_ms = 0;
+    anim.frames.push_back(frame);
     const auto anim_bytes = serialize_anim(anim);
 
     ByteWriter writer;
@@ -591,23 +745,41 @@ TEST(ContainerTest, ParseContainerAcceptsSingletonsOnce) {
     meta::MetaBlock meta;
     ASSERT_TRUE(meta.set(meta::Namespace::Geo, meta::geo::LAT, 1.234).has_value());
 
-    AnimHeader anim;
-    anim.frame_count = 0;
-    anim.loop_count = 0;
-    anim.background_rgba = 0;
-
-    ByteWriter writer;
-    writer.write_bytes({WK_MAGIC, 5});
-    writer.write_u16(WK_VERSION);
     // The flags must match the chunks present (see the cross-checks in
     // parse_container): this file carries META, PROV, and ANIM.
     FrameHeader hdr = make_test_header();
     hdr.flags |= FHDR_FLAG_HAS_WKMETA | FHDR_FLAG_ANIMATED | FHDR_FLAG_HAS_C2PA;
+
+    AnimHeader anim;
+    anim.frame_count = 1;
+    anim.loop_count = 0;
+    anim.background_rgba = 0;
+    AnimFrame frame;
+    frame.delay_ms = 0;
+    frame.rect_x = 0;
+    frame.rect_y = 0;
+    frame.rect_w = static_cast<uint16_t>(hdr.width);
+    frame.rect_h = static_cast<uint16_t>(hdr.height);
+    frame.tile_offset = 0;
+    anim.frames.push_back(frame);
+
+    ByteWriter writer;
+    writer.write_bytes({WK_MAGIC, 5});
+    writer.write_u16(WK_VERSION);
     append_chunk(writer, CHUNK_FHDR, 0, serialize_fhdr(hdr));
     append_chunk(writer, CHUNK_WKMETA, CHUNK_FLAG_OPTIONAL | CHUNK_FLAG_META_ONLY, meta.serialize());
     append_chunk(writer, CHUNK_ICCP, CHUNK_FLAG_OPTIONAL, std::vector<uint8_t>{0x01, 0x02, 0x03});
     append_chunk(writer, CHUNK_PROV, CHUNK_FLAG_OPTIONAL, std::vector<uint8_t>{0x0A, 0x0B});
     append_chunk(writer, CHUNK_ANIM, 0, serialize_anim(anim));
+    // The one frame covers the whole 640x480 canvas, so its grid needs
+    // the 2 tiles below (tile size 512).
+    for (uint32_t ty = 0; ty < hdr.tiles_y(); ++ty) {
+        for (uint32_t tx = 0; tx < hdr.tiles_x(); ++tx) {
+            Chunk tile = make_anim_tile_chunk(static_cast<uint16_t>(tx),
+                                              static_cast<uint16_t>(ty), 4);
+            append_chunk(writer, CHUNK_TILE, CHUNK_FLAG_REPEATABLE, tile.payload);
+        }
+    }
     append_chunk(writer, CHUNK_FEND, 0, {});
 
     auto parsed = parse_container(writer.finish());
@@ -700,4 +872,175 @@ TEST(ContainerTest, ParseContainerAcceptsConsistentFlags) {
     EXPECT_TRUE(parsed->metadata.has_value());
     EXPECT_TRUE(parsed->animation.has_value());
     EXPECT_FALSE(parsed->c2pa_manifest.empty());
+}
+
+// Slice 1 Fase 9: a valid animated file (SPEC Section 4) parses, and
+// every way to break the frame-to-tile mapping is rejected with
+// AnimationError.
+TEST(ContainerTest, ParseContainerAcceptsValidAnimatedFile) {
+    auto parsed = roundtrip_anim_file(make_valid_anim_file());
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    EXPECT_TRUE(parsed->header.is_animated());
+    ASSERT_TRUE(parsed->animation.has_value());
+    EXPECT_EQ(parsed->animation->frame_count, 2u);
+    EXPECT_EQ(parsed->tile_chunks.size(), 5u);
+}
+
+TEST(ContainerTest, ParseContainerAcceptsLosslessSingleTileAnimatedFile) {
+    // The lossless exception (SPEC Section 4.4): one TILE at (0, 0)
+    // holding the whole frame, with a full-canvas rect.
+    WkFile file;
+    file.header = make_anim_test_header();
+    file.header.flags |= FHDR_FLAG_LOSSLESS;
+    file.animation = AnimHeader{};
+    file.animation->frame_count = 1;
+    file.animation->loop_count = 0;
+    file.animation->background_rgba = 0xFF000000;
+    file.animation->frames.push_back(make_anim_frame(0, 0, 128, 128, 0));
+    file.tile_chunks.push_back(make_anim_tile_chunk(0, 0, 4));
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    EXPECT_EQ(parsed->animation->frame_count, 1u);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimRectOutsideCanvas) {
+    WkFile file = make_valid_anim_file();
+    file.animation->frames[0] = make_anim_frame(64, 0, 128, 128, 0);
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimRectZeroWidth) {
+    WkFile file = make_valid_anim_file();
+    file.animation->frames[1] = make_anim_frame(0, 0, 0, 64, 4);
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimRectZeroHeight) {
+    WkFile file = make_valid_anim_file();
+    file.animation->frames[1] = make_anim_frame(0, 0, 64, 0, 4);
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimRectNotTileAligned) {
+    WkFile file = make_valid_anim_file();
+    file.animation->frames[1] = make_anim_frame(32, 0, 64, 64, 4);
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimRectWidthNotTileAligned) {
+    // Width 32 is not a multiple of the 64 px tile size, and the rect
+    // does not reach the canvas edge, so the remainder is not allowed.
+    WkFile file = make_valid_anim_file();
+    file.animation->frames[1] = make_anim_frame(0, 0, 32, 64, 4);
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimTileOffsetNotIncreasing) {
+    WkFile file = make_valid_anim_file();
+    file.animation->frames[1].tile_offset = 0;
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimFirstTileOffsetNonZero) {
+    WkFile file = make_valid_anim_file();
+    file.animation->frames[0].tile_offset = 1;
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimTileOffsetOutOfRange) {
+    WkFile file = make_valid_anim_file();
+    file.animation->frames[1].tile_offset = 5;  // only 5 TILE chunks
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimFrameCoverageGap) {
+    // Frame 0 owns tiles 0..2 but its full-canvas rect needs 4.
+    WkFile file = make_valid_anim_file();
+    file.animation->frames[1].tile_offset = 3;
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimFrameCoverageDuplicate) {
+    // Frame 0 owns 4 tiles, but (0, 0) appears twice and (1, 0) never.
+    WkFile file = make_valid_anim_file();
+    file.tile_chunks[1] = make_anim_tile_chunk(0, 0, 4);
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimExtraTileChunks) {
+    // One frame whose rect needs 4 tiles, but the file carries 5: the
+    // last frame owns to the end of the list, so the extra tile makes
+    // its count wrong.
+    WkFile file = make_valid_anim_file();
+    file.animation->frame_count = 1;
+    file.animation->frames.resize(1);
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimLosslessSingleTileSubRect) {
+    // The lossless single-tile exception requires a full-canvas rect:
+    // one tile at (0, 0) cannot hold a sub-rect frame.
+    WkFile file;
+    file.header = make_anim_test_header();
+    file.header.flags |= FHDR_FLAG_LOSSLESS;
+    file.animation = AnimHeader{};
+    file.animation->frame_count = 1;
+    file.animation->loop_count = 0;
+    file.animation->background_rgba = 0xFF000000;
+    file.animation->frames.push_back(make_anim_frame(0, 0, 64, 64, 0));
+    file.tile_chunks.push_back(make_anim_tile_chunk(0, 0, 4));
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
+}
+
+TEST(ContainerTest, ParseContainerRejectsAnimLosslessSingleTileNotAtOrigin) {
+    WkFile file;
+    file.header = make_anim_test_header();
+    file.header.flags |= FHDR_FLAG_LOSSLESS;
+    file.animation = AnimHeader{};
+    file.animation->frame_count = 1;
+    file.animation->loop_count = 0;
+    file.animation->background_rgba = 0xFF000000;
+    file.animation->frames.push_back(make_anim_frame(0, 0, 128, 128, 0));
+    file.tile_chunks.push_back(make_anim_tile_chunk(1, 0, 4));
+
+    auto parsed = roundtrip_anim_file(file);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code, ErrorCode::AnimationError);
 }
