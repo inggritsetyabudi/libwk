@@ -29,6 +29,7 @@
 #include "../src/core/coeff_table_stream.h"
 #include "../src/core/image_io.h"
 #include "../src/core/lossless.h"
+#include "../src/core/tile_util.h"
 #include "../src/core/metrics.h"
 #include "../src/core/mode_span_rans.h"
 #include "../src/core/mode_stream.h"
@@ -2920,4 +2921,488 @@ TEST(RoundtripTest, NoQualityScoreOptOutRemovesMetaChunk) {
     ASSERT_TRUE(dec_with.has_value());
     ASSERT_TRUE(dec_without.has_value());
     EXPECT_TRUE(std::ranges::equal(dec_with->pixels(), dec_without->pixels()));
+}
+
+namespace {
+
+Image make_solid_rgb(uint32_t width, uint32_t height, uint8_t r, uint8_t g, uint8_t b) {
+    Image image(width, height, BitDepth::Bits8, false);
+    for (uint32_t y = 0; y < height; ++y) {
+        uint8_t* row = image.row(y);
+        for (uint32_t x = 0; x < width; ++x) {
+            row[x * 3 + 0] = r;
+            row[x * 3 + 1] = g;
+            row[x * 3 + 2] = b;
+        }
+    }
+    return image;
+}
+
+Image make_solid_rgba(uint32_t width, uint32_t height, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    Image image(width, height, BitDepth::Bits8, true);
+    for (uint32_t y = 0; y < height; ++y) {
+        uint8_t* row = image.row(y);
+        for (uint32_t x = 0; x < width; ++x) {
+            row[x * 4 + 0] = r;
+            row[x * 4 + 1] = g;
+            row[x * 4 + 2] = b;
+            row[x * 4 + 3] = a;
+        }
+    }
+    return image;
+}
+
+// One frame of a hand-built animated fixture: the source image is exactly
+// rect-sized; its tiles are relabelled to the rect's position in the canvas.
+struct AnimFrameSpec {
+    Image image;
+    uint16_t rect_x = 0;
+    uint16_t rect_y = 0;
+    uint8_t blend_mode = 0;  // 0 OVER, 1 SOURCE
+    uint8_t disposal = 0;    // 0 keep, 1 restore-bg
+};
+
+// Encodes each frame image as a still (real tiles), then repackages the
+// tiles into one animated container. All frames share one tile size and
+// one lossless/alpha setting, taken from the first frame's encode.
+struct AnimFixture {
+    std::vector<uint8_t> bytes;                 // animated container
+    std::vector<std::vector<uint8_t>> stills;   // per-frame still encodes
+};
+
+AnimFixture build_anim_fixture(const std::vector<AnimFrameSpec>& specs,
+                               uint32_t canvas_w, uint32_t canvas_h,
+                               uint32_t tile_size_log2, bool lossless,
+                               uint32_t background_rgba,
+                               Subsampling subsampling = Subsampling::YUV444,
+                               bool adaptive_chroma = true) {
+    AnimFixture out;
+    const uint32_t tile_size = 1u << tile_size_log2;
+    WkFile file;
+    bool first = true;
+    uint32_t tile_offset = 0;
+    file.animation = AnimHeader{};
+    file.animation->loop_count = 0;
+    file.animation->background_rgba = background_rgba;
+
+    for (const auto& spec : specs) {
+        EncoderConfig config;
+        config.lossless = lossless;
+        config.tile_size_log2 = static_cast<uint8_t>(tile_size_log2);
+        config.subsampling = subsampling;
+        config.adaptive_chroma_subsampling = adaptive_chroma;
+        auto encoded = encode(spec.image, config);
+        EXPECT_TRUE(encoded.has_value());
+        if (!encoded) return out;
+        out.stills.push_back(*encoded);
+
+        auto parsed = parse_container(*encoded);
+        EXPECT_TRUE(parsed.has_value());
+        if (!parsed) return out;
+        if (first) {
+            file.header = parsed->header;
+            file.header.width = canvas_w;
+            file.header.height = canvas_h;
+            file.header.flags |= FHDR_FLAG_ANIMATED;
+            // The repackage drops the encoder's META chunk (quality
+            // score of the still image), so the FHDR flag claiming it
+            // must go too, or parse_container rejects the fixture
+            // (flags must agree with the chunks actually present).
+            file.header.flags &= ~FHDR_FLAG_HAS_WKMETA;
+            first = false;
+        }
+
+        AnimFrame frame;
+        frame.delay_ms = 100;
+        frame.blend_mode = spec.blend_mode;
+        frame.disposal = spec.disposal;
+        frame.rect_x = spec.rect_x;
+        frame.rect_y = spec.rect_y;
+        frame.rect_w = static_cast<uint16_t>(spec.image.width());
+        frame.rect_h = static_cast<uint16_t>(spec.image.height());
+        frame.tile_offset = tile_offset;
+        file.animation->frames.push_back(frame);
+
+        // Relabel each tile header from the still's local grid to the
+        // rect's position in the canvas grid (payloads are position-free).
+        for (auto chunk : parsed->tile_chunks) {
+            TileHeader header;
+            auto view = tile_payload_view(chunk, header);
+            EXPECT_TRUE(view.has_value());
+            if (!view) return out;
+            header.tile_x = static_cast<uint16_t>(spec.rect_x / tile_size + header.tile_x);
+            header.tile_y = static_cast<uint16_t>(spec.rect_y / tile_size + header.tile_y);
+            std::vector<uint8_t> payload = serialize_tile_header(header);
+            payload.insert(payload.end(), view->begin(), view->end());
+            chunk.payload = std::move(payload);
+            file.tile_chunks.push_back(std::move(chunk));
+            ++tile_offset;
+        }
+    }
+    file.animation->frame_count = static_cast<uint32_t>(specs.size());
+    auto written = write_container(file);
+    EXPECT_TRUE(written.has_value());
+    if (written) out.bytes = *written;
+    return out;
+}
+
+// Pixel (r,g,b,a) of an 8-bit decoded image; a=255 when the image has no alpha.
+std::array<uint8_t, 4> pixel_rgba(const Image& image, uint32_t x, uint32_t y) {
+    const uint8_t* p = image.row(y) + static_cast<size_t>(x) * image.bytes_per_pixel();
+    if (image.has_alpha()) return {p[0], p[1], p[2], p[3]};
+    return {p[0], p[1], p[2], 255};
+}
+
+void expect_pixel(const Image& image, uint32_t x, uint32_t y,
+                  uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
+    const auto got = pixel_rgba(image, x, y);
+    EXPECT_EQ(got[0], r) << "R at (" << x << "," << y << ")";
+    EXPECT_EQ(got[1], g) << "G at (" << x << "," << y << ")";
+    EXPECT_EQ(got[2], b) << "B at (" << x << "," << y << ")";
+    EXPECT_EQ(got[3], a) << "A at (" << x << "," << y << ")";
+}
+
+// Straight-alpha Porter-Duff "over" (8-bit), mirroring the decoder:
+// out_a = sa + da*(1-sa); out_c = (src_c*sa + dst_c*da*(1-sa))/out_a.
+std::array<uint8_t, 4> blend_over(std::array<uint8_t, 4> src, std::array<uint8_t, 4> dst) {
+    const uint32_t sa = src[3];
+    const uint32_t da = dst[3];
+    const uint32_t out_a = sa + (da * (255 - sa) + 127) / 255;
+    std::array<uint8_t, 4> out{};
+    if (out_a == 0) return out;
+    for (int c = 0; c < 3; ++c) {
+        out[c] = static_cast<uint8_t>((static_cast<uint32_t>(src[c]) * sa * 255 +
+                                       static_cast<uint32_t>(dst[c]) * da * (255 - sa) +
+                                       (255 * out_a) / 2) / (255 * out_a));
+    }
+    out[3] = static_cast<uint8_t>(out_a);
+    return out;
+}
+
+void expect_region(const Image& image, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h,
+                   uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
+    for (uint32_t y = y0; y < y0 + h; ++y) {
+        for (uint32_t x = x0; x < x0 + w; ++x) {
+            expect_pixel(image, x, y, r, g, b, a);
+        }
+    }
+}
+
+// Compares a rectangle of image a against the same-sized rectangle of
+// image b, pixel by pixel. Lossy decodes are only exact against another
+// decode of the same tiles, never against the solid input (off by 1 is
+// normal lossy error), so regions of frame 0 are checked this way.
+void expect_region_matches(const Image& a, uint32_t ax, uint32_t ay, uint32_t w, uint32_t h,
+                           const Image& b, uint32_t bx, uint32_t by) {
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            const auto want = pixel_rgba(b, bx + x, by + y);
+            expect_pixel(a, ax + x, ay + y, want[0], want[1], want[2], want[3]);
+        }
+    }
+}
+
+void expect_images_equal(const Image& got, const Image& want) {
+    ASSERT_EQ(got.width(), want.width());
+    ASSERT_EQ(got.height(), want.height());
+    ASSERT_EQ(got.bit_depth(), want.bit_depth());
+    ASSERT_EQ(got.has_alpha(), want.has_alpha());
+    ASSERT_EQ(got.pixels().size(), want.pixels().size());
+    EXPECT_EQ(std::memcmp(got.pixels().data(), want.pixels().data(), got.pixels().size()), 0);
+}
+}  // namespace
+
+TEST(RoundtripTest, DecodeFrameStillImageEqualsDecode) {
+    // Lossy still: frame 0 is the whole image; any other index is rejected.
+    auto still = make_rgb_gradient(128, 128);
+    EncoderConfig config;
+    config.tile_size_log2 = 6;
+    auto encoded = encode(still, config);
+    ASSERT_TRUE(encoded.has_value());
+    auto decoded = decode(*encoded);
+    ASSERT_TRUE(decoded.has_value());
+    auto frame0 = decode_frame(*encoded, 0);
+    ASSERT_TRUE(frame0.has_value()) << frame0.error().message;
+    expect_images_equal(*frame0, *decoded);
+    auto frame1 = decode_frame(*encoded, 1);
+    ASSERT_FALSE(frame1.has_value());
+    EXPECT_EQ(frame1.error().code, ErrorCode::InvalidParameter);
+
+    // Lossless still: same contract.
+    EncoderConfig lossless_config;
+    lossless_config.lossless = true;
+    lossless_config.tile_size_log2 = 6;
+    auto encoded_lossless = encode(still, lossless_config);
+    ASSERT_TRUE(encoded_lossless.has_value());
+    auto decoded_lossless = decode(*encoded_lossless);
+    ASSERT_TRUE(decoded_lossless.has_value());
+    auto frame0_lossless = decode_frame(*encoded_lossless, 0);
+    ASSERT_TRUE(frame0_lossless.has_value()) << frame0_lossless.error().message;
+    expect_images_equal(*frame0_lossless, *decoded_lossless);
+}
+
+TEST(RoundtripTest, DecodeAnimatedReturnsFirstFrame) {
+    AnimFixture fixture = build_anim_fixture(
+        {{make_solid_rgb(128, 128, 200, 30, 30), 0, 0, 0, 0},
+         {make_solid_rgb(128, 128, 30, 30, 200), 0, 0, 1, 0}},
+        128, 128, 6, false, 0xFFFFFFFFu);
+    ASSERT_FALSE(fixture.bytes.empty());
+    auto plain = decode(fixture.bytes);
+    ASSERT_TRUE(plain.has_value()) << plain.error().message;
+    auto frame0 = decode_frame(fixture.bytes, 0);
+    ASSERT_TRUE(frame0.has_value()) << frame0.error().message;
+    expect_images_equal(*plain, *frame0);
+}
+
+TEST(RoundtripTest, DecodeFrameLossyMultiFrame) {
+    AnimFixture fixture = build_anim_fixture(
+        {{make_solid_rgb(128, 128, 200, 30, 30), 0, 0, 0, 0},
+         {make_solid_rgb(128, 128, 30, 30, 200), 0, 0, 1, 0}},
+        128, 128, 6, false, 0xFFFFFFFFu);
+    ASSERT_FALSE(fixture.bytes.empty());
+    // Each full-canvas frame decodes exactly like its still encode: the
+    // frame's tiles are the still's tiles, and the rect is the canvas.
+    auto still0 = decode(fixture.stills[0]);
+    ASSERT_TRUE(still0.has_value());
+    auto frame0 = decode_frame(fixture.bytes, 0);
+    ASSERT_TRUE(frame0.has_value()) << frame0.error().message;
+    expect_images_equal(*frame0, *still0);
+    auto still1 = decode(fixture.stills[1]);
+    ASSERT_TRUE(still1.has_value());
+    auto frame1 = decode_frame(fixture.bytes, 1);
+    ASSERT_TRUE(frame1.has_value()) << frame1.error().message;
+    expect_images_equal(*frame1, *still1);
+}
+
+TEST(RoundtripTest, DecodeFrameOverBlendsAlpha) {
+    // Lossless, bit-exact: opaque red frame 0, semi-transparent blue
+    // frame 1 OVER it. Hand-computed: (0*128 + 255*127 + 127)/255 = 127
+    // for R, (255*128 + 127)/255 = 128 for B, A = 255.
+    AnimFixture fixture = build_anim_fixture(
+        {{make_solid_rgba(128, 128, 255, 0, 0, 255), 0, 0, 0, 0},
+         {make_solid_rgba(128, 128, 0, 0, 255, 128), 0, 0, 0, 0}},
+        128, 128, 6, true, 0xFFFFFFFFu);
+    ASSERT_FALSE(fixture.bytes.empty());
+    auto frame1 = decode_frame(fixture.bytes, 1);
+    ASSERT_TRUE(frame1.has_value()) << frame1.error().message;
+    EXPECT_TRUE(frame1->has_alpha());
+    expect_pixel(*frame1, 0, 0, 127, 0, 128, 255);
+    expect_pixel(*frame1, 127, 127, 127, 0, 128, 255);
+    // The blend helper agrees with the hand-computed value.
+    EXPECT_EQ(blend_over({0, 0, 255, 128}, {255, 0, 0, 255}),
+              (std::array<uint8_t, 4>{127, 0, 128, 255}));
+}
+
+TEST(RoundtripTest, DecodeFrameSourceReplaces) {
+    AnimFixture fixture = build_anim_fixture(
+        {{make_solid_rgba(128, 128, 255, 0, 0, 255), 0, 0, 0, 0},
+         {make_solid_rgba(128, 128, 0, 0, 255, 128), 0, 0, 1, 0}},
+        128, 128, 6, true, 0xFFFFFFFFu);
+    ASSERT_FALSE(fixture.bytes.empty());
+    auto frame1 = decode_frame(fixture.bytes, 1);
+    ASSERT_TRUE(frame1.has_value()) << frame1.error().message;
+    // SOURCE replaces, alpha included: the semi-transparent blue lands verbatim.
+    expect_pixel(*frame1, 0, 0, 0, 0, 255, 128);
+    expect_pixel(*frame1, 64, 64, 0, 0, 255, 128);
+}
+
+TEST(RoundtripTest, DecodeFrameSubRectOnlyChangesRect) {
+    AnimFixture fixture = build_anim_fixture(
+        {{make_solid_rgb(128, 128, 200, 30, 30), 0, 0, 0, 0},
+         {make_solid_rgb(64, 64, 30, 200, 30), 64, 0, 0, 0}},
+        128, 128, 6, false, 0xFFFFFFFFu);
+    ASSERT_FALSE(fixture.bytes.empty());
+    auto frame1 = decode_frame(fixture.bytes, 1);
+    ASSERT_TRUE(frame1.has_value()) << frame1.error().message;
+    // Outside the sub-rect: frame 0's pixels, untouched (compared
+    // against frame 0's own still decode — lossy, so never the solid).
+    auto still0 = decode(fixture.stills[0]);
+    ASSERT_TRUE(still0.has_value());
+    expect_region_matches(*frame1, 0, 0, 64, 128, *still0, 0, 0);
+    expect_region_matches(*frame1, 0, 64, 128, 64, *still0, 0, 64);
+    // Inside: the sub-rect frame's pixels (same tiles as its still).
+    auto still1 = decode(fixture.stills[1]);
+    ASSERT_TRUE(still1.has_value());
+    for (uint32_t y = 0; y < 64; ++y) {
+        for (uint32_t x = 0; x < 64; ++x) {
+            const auto want = pixel_rgba(*still1, x, y);
+            expect_pixel(*frame1, 64 + x, y, want[0], want[1], want[2], want[3]);
+        }
+    }
+}
+
+TEST(RoundtripTest, DecodeFrameKeepLeavesPixels) {
+    AnimFixture fixture = build_anim_fixture(
+        {{make_solid_rgb(128, 128, 200, 30, 30), 0, 0, 0, 0},
+         {make_solid_rgb(64, 64, 30, 200, 30), 64, 0, 0, 0},
+         {make_solid_rgb(64, 64, 30, 30, 200), 0, 64, 0, 0}},
+        128, 128, 6, false, 0xFFFFFFFFu);
+    ASSERT_FALSE(fixture.bytes.empty());
+    auto frame2 = decode_frame(fixture.bytes, 2);
+    ASSERT_TRUE(frame2.has_value()) << frame2.error().message;
+    auto still0 = decode(fixture.stills[0]);
+    ASSERT_TRUE(still0.has_value());
+    // Frame 1 (keep) is still there under frame 2's region.
+    auto still1 = decode(fixture.stills[1]);
+    ASSERT_TRUE(still1.has_value());
+    for (uint32_t y = 0; y < 64; ++y) {
+        for (uint32_t x = 0; x < 64; ++x) {
+            const auto want = pixel_rgba(*still1, x, y);
+            expect_pixel(*frame2, 64 + x, y, want[0], want[1], want[2], want[3]);
+        }
+    }
+    // Frame 2's own region, and the untouched corner stays frame 0.
+    auto still2 = decode(fixture.stills[2]);
+    ASSERT_TRUE(still2.has_value());
+    for (uint32_t y = 0; y < 64; ++y) {
+        for (uint32_t x = 0; x < 64; ++x) {
+            const auto want = pixel_rgba(*still2, x, y);
+            expect_pixel(*frame2, x, 64 + y, want[0], want[1], want[2], want[3]);
+        }
+    }
+    expect_region_matches(*frame2, 64, 64, 64, 64, *still0, 64, 64);
+}
+
+TEST(RoundtripTest, DecodeFrameRestoreBgClearsRect) {
+    // Background white opaque (0xRRGGBBAA). Frame 1 green sub-rect with
+    // disposal restore-bg; frame 2 blue sub-rect elsewhere. Frame 1's
+    // own display still shows green; by frame 2 its rect is background.
+    AnimFixture fixture = build_anim_fixture(
+        {{make_solid_rgb(128, 128, 200, 30, 30), 0, 0, 0, 0},
+         {make_solid_rgb(64, 64, 30, 200, 30), 64, 0, 0, 1},
+         {make_solid_rgb(64, 64, 30, 30, 200), 0, 64, 0, 0}},
+        128, 128, 6, false, 0xFFFFFFFFu);
+    ASSERT_FALSE(fixture.bytes.empty());
+    auto frame1 = decode_frame(fixture.bytes, 1);
+    ASSERT_TRUE(frame1.has_value()) << frame1.error().message;
+    auto still1 = decode(fixture.stills[1]);
+    ASSERT_TRUE(still1.has_value());
+    for (uint32_t y = 0; y < 64; ++y) {
+        for (uint32_t x = 0; x < 64; ++x) {
+            const auto want = pixel_rgba(*still1, x, y);
+            expect_pixel(*frame1, 64 + x, y, want[0], want[1], want[2], want[3]);
+        }
+    }
+    auto frame2 = decode_frame(fixture.bytes, 2);
+    ASSERT_TRUE(frame2.has_value()) << frame2.error().message;
+    // Frame 1's rect is background now — not green, not frame 0's red.
+    expect_region(*frame2, 64, 0, 64, 64, 255, 255, 255);
+    // Frame 2's own region and the untouched corner are unaffected.
+    auto still0 = decode(fixture.stills[0]);
+    ASSERT_TRUE(still0.has_value());
+    auto still2 = decode(fixture.stills[2]);
+    ASSERT_TRUE(still2.has_value());
+    for (uint32_t y = 0; y < 64; ++y) {
+        for (uint32_t x = 0; x < 64; ++x) {
+            const auto want = pixel_rgba(*still2, x, y);
+            expect_pixel(*frame2, x, 64 + y, want[0], want[1], want[2], want[3]);
+        }
+    }
+    expect_region_matches(*frame2, 64, 64, 64, 64, *still0, 64, 64);
+}
+
+TEST(RoundtripTest, DecodeFrameOutOfRangeRejected) {
+    AnimFixture fixture = build_anim_fixture(
+        {{make_solid_rgb(128, 128, 200, 30, 30), 0, 0, 0, 0},
+         {make_solid_rgb(128, 128, 30, 30, 200), 0, 0, 1, 0}},
+        128, 128, 6, false, 0xFFFFFFFFu);
+    ASSERT_FALSE(fixture.bytes.empty());
+    auto at_count = decode_frame(fixture.bytes, 2);
+    ASSERT_FALSE(at_count.has_value());
+    EXPECT_EQ(at_count.error().code, ErrorCode::InvalidParameter);
+    auto huge = decode_frame(fixture.bytes, 0xFFFFFFFFu);
+    ASSERT_FALSE(huge.has_value());
+    EXPECT_EQ(huge.error().code, ErrorCode::InvalidParameter);
+}
+
+TEST(RoundtripTest, DecodeFrameLosslessMultiFrame) {
+    // Each frame is one tile at (0,0) holding the whole frame (SPEC
+    // Section 4.4 lossless exception): tile size 128 on a 128 canvas.
+    AnimFixture fixture = build_anim_fixture(
+        {{make_solid_rgb(128, 128, 200, 30, 30), 0, 0, 0, 0},
+         {make_solid_rgb(128, 128, 30, 30, 200), 0, 0, 1, 0}},
+        128, 128, 7, true, 0xFFFFFFFFu);
+    ASSERT_FALSE(fixture.bytes.empty());
+    auto still0 = decode(fixture.stills[0]);
+    ASSERT_TRUE(still0.has_value());
+    auto frame0 = decode_frame(fixture.bytes, 0);
+    ASSERT_TRUE(frame0.has_value()) << frame0.error().message;
+    expect_images_equal(*frame0, *still0);
+    auto still1 = decode(fixture.stills[1]);
+    ASSERT_TRUE(still1.has_value());
+    auto frame1 = decode_frame(fixture.bytes, 1);
+    ASSERT_TRUE(frame1.has_value()) << frame1.error().message;
+    expect_images_equal(*frame1, *still1);
+}
+
+TEST(RoundtripTest, DecodeFrameLosslessSubRect) {
+    // Lossless per-tile frames: frame 1 is one tile at canvas (1,0).
+    AnimFixture fixture = build_anim_fixture(
+        {{make_solid_rgb(128, 128, 200, 30, 30), 0, 0, 0, 0},
+         {make_solid_rgb(64, 64, 30, 200, 30), 64, 0, 0, 0}},
+        128, 128, 6, true, 0xFFFFFFFFu);
+    ASSERT_FALSE(fixture.bytes.empty());
+    auto frame1 = decode_frame(fixture.bytes, 1);
+    ASSERT_TRUE(frame1.has_value()) << frame1.error().message;
+    expect_region(*frame1, 0, 0, 64, 128, 200, 30, 30);
+    expect_region(*frame1, 0, 64, 128, 64, 200, 30, 30);
+    auto still1 = decode(fixture.stills[1]);
+    ASSERT_TRUE(still1.has_value());
+    for (uint32_t y = 0; y < 64; ++y) {
+        for (uint32_t x = 0; x < 64; ++x) {
+            const auto want = pixel_rgba(*still1, x, y);
+            expect_pixel(*frame1, 64 + x, y, want[0], want[1], want[2], want[3]);
+        }
+    }
+}
+TEST(RoundtripTest, DecodeFrameOverBlendsOntoTransparent) {
+    // Frame 0 SOURCE semi-transparent red; frame 1 OVER semi-transparent
+    // blue. The canvas itself is semi-transparent after frame 0, so this
+    // exercises the general Porter-Duff "over" (dst alpha < opaque),
+    // not just the opaque-destination shortcut.
+    AnimFixture fixture = build_anim_fixture(
+        {{make_solid_rgba(128, 128, 255, 0, 0, 128), 0, 0, 1, 0},
+         {make_solid_rgba(128, 128, 0, 0, 255, 128), 0, 0, 0, 0}},
+        128, 128, 6, false, 0xFFFFFFFFu);
+    ASSERT_FALSE(fixture.bytes.empty());
+    auto frame1 = decode_frame(fixture.bytes, 1);
+    ASSERT_TRUE(frame1.has_value()) << frame1.error().message;
+    // The helper's arithmetic, pinned by hand: out_a = 128 +
+    // 128*127/255 = 192; out_R = (255*0.5*0.5)/0.75 = 85, out_B =
+    // (255*0.5)/0.75 = 170; out = (85, 0, 170, 192).
+    EXPECT_EQ(blend_over({0, 0, 255, 128}, {255, 0, 0, 128}),
+              (std::array<uint8_t, 4>{85, 0, 170, 192}));
+    // The frame itself: blend the two still decodes (lossy-exact), so
+    // any lossy wobble in the alpha planes cancels out.
+    auto still0 = decode(fixture.stills[0]);
+    auto still1 = decode(fixture.stills[1]);
+    ASSERT_TRUE(still0.has_value());
+    ASSERT_TRUE(still1.has_value());
+    for (uint32_t y = 0; y < 128; ++y) {
+        for (uint32_t x = 0; x < 128; ++x) {
+            const auto want = blend_over(pixel_rgba(*still1, x, y), pixel_rgba(*still0, x, y));
+            expect_pixel(*frame1, x, y, want[0], want[1], want[2], want[3]);
+        }
+    }
+}
+
+TEST(RoundtripTest, DecodeFrameLegacy420FullCanvas) {
+    // Forced YUV420 with adaptive chroma off writes V10 (legacy) tiles:
+    // the frame decode takes the image-wide upsample path, which for a
+    // full-canvas frame must equal the still decode exactly.
+    AnimFixture fixture = build_anim_fixture(
+        {{make_solid_rgb(128, 128, 200, 30, 30), 0, 0, 0, 0},
+         {make_solid_rgb(128, 128, 30, 30, 200), 0, 0, 1, 0}},
+        128, 128, 6, false, 0xFFFFFFFFu, Subsampling::YUV420, false);
+    ASSERT_FALSE(fixture.bytes.empty());
+    auto frame0 = decode_frame(fixture.bytes, 0);
+    auto frame1 = decode_frame(fixture.bytes, 1);
+    ASSERT_TRUE(frame0.has_value()) << frame0.error().message;
+    ASSERT_TRUE(frame1.has_value()) << frame1.error().message;
+    auto still0 = decode(fixture.stills[0]);
+    auto still1 = decode(fixture.stills[1]);
+    ASSERT_TRUE(still0.has_value());
+    ASSERT_TRUE(still1.has_value());
+    expect_images_equal(*frame0, *still0);
+    expect_images_equal(*frame1, *still1);
 }
