@@ -19,11 +19,14 @@
 #include "../src/core/container.h"
 #include "../src/core/image_io.h"
 #include "../src/core/metrics.h"
+#include <charconv>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 #include "tool_common.h"
 #include "tool_log.h"
@@ -77,6 +80,7 @@ void print_usage() {
         << "Usage: wkdec [options] <input.wk> [output.{png,ppm}]\n\n"
         << "Options:\n"
         << "  --info               Print image info only\n"
+        << "  --frame N            Decode frame N of an animated file (default: frame 0)\n"
         << "  --export-meta FILE   Export WKMETA as JSON\n"
         << "  --metrics FILE       Decode, then report PSNR/SSIM vs FILE (reference image)\n"
         << "  -v, --verbose        Show debug logs (per-step detail)\n"
@@ -94,12 +98,26 @@ int main(int argc, char* argv[]) {
     std::string output_path;
     std::string metadata_path;
     std::string metrics_path;
+    std::optional<uint32_t> frame_index;
     bool info_only = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--info") {
             info_only = true;
+        } else if (arg == "--frame") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --frame requires a frame index\n";
+                return 1;
+            }
+            const std::string value = argv[++i];
+            uint32_t parsed = 0;
+            const auto res = std::from_chars(value.data(), value.data() + value.size(), parsed);
+            if (res.ec != std::errc() || res.ptr != value.data() + value.size()) {
+                std::cerr << "Error: --frame requires a non-negative integer, got '" << value << "'\n";
+                return 1;
+            }
+            frame_index = parsed;
         } else if (arg == "--export-meta") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --export-meta requires a file path\n";
@@ -194,7 +212,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    auto image = wk::decode(*input_bytes);
+    // Without --frame an animated file decodes as frame 0 (the composited
+    // first frame); the log line says so and points at --frame. A still
+    // image ignores --frame 0 and rejects any other index, via
+    // decode_frame itself. #anim #fase9
+    if (!frame_index.has_value() && info->is_animated) {
+        wk::tool::log_info("animated file with " + std::to_string(info->frame_count) +
+                           " frames; decoded frame 0 (use --frame N for another frame)");
+    }
+    auto image = frame_index.has_value() ? wk::decode_frame(*input_bytes, *frame_index)
+                                         : wk::decode(*input_bytes);
     if (!image) {
         wk::tool::log_error("decode failed: " + image.error().message);
         return 1;
@@ -207,7 +234,8 @@ int main(int argc, char* argv[]) {
     }
 
     wk::tool::log_ok("decoded " + input_path + " -> " + output_path + " (" +
-                     std::to_string(image->width()) + "x" + std::to_string(image->height()) + ")");
+                     std::to_string(image->width()) + "x" + std::to_string(image->height()) + ")" +
+                     (frame_index.has_value() ? " frame " + std::to_string(*frame_index) : ""));
 
     if (!metrics_path.empty()) {
         // Decode + metrics in one run: a bad decode is visible at once.

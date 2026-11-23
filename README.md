@@ -324,8 +324,10 @@ lossless uses 256 px tiles (since v0.2.8); `--tile-size N` overrides both.
 wkdec [options] <input.wk> [output.{png,ppm}]
 ```
 
-Main options: `--info`, `--export-meta FILE`, `--metrics FILE` (decode, then
-report PSNR/SSIM vs a reference image). `.png` output is currently limited
+Main options: `--info`, `--frame N`, `--export-meta FILE`, `--metrics FILE` (decode, then
+report PSNR/SSIM vs a reference image). `--frame N` decodes frame N of an animated file
+(the composited canvas of that frame); without it an animated file decodes as frame 0.
+`.png` output is currently limited
 to 8-bit decoded images; higher bit depths should use `.ppm` for now.
 
 ### `wkmetric`

@@ -266,7 +266,9 @@ violates any of these rules.
 
 ### 4.3 Compositing
 
-The canvas starts filled with `background_rgba`. For each frame in
+The canvas starts filled with `background_rgba`. `background_rgba` is
+0xRRGGBBAA: red in the most significant byte, alpha in the least
+significant byte. For each frame in
 order, the frame's rectangle is composited onto the canvas according
 to its `blend_mode`: OVER (0) alpha-blends the frame's pixels over
 the canvas; SOURCE (1) replaces the canvas pixels in the rectangle

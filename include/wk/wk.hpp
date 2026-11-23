@@ -297,6 +297,16 @@ namespace wk
 
     [[nodiscard]] Result<Image> decode(std::span<const uint8_t> data, const DecoderConfig &config = {});
 
+    // Decodes one frame of an animated file (SPEC Section 4.3): the
+    // composited canvas of frame frame_index — frames 0..frame_index
+    // composited in order onto a canvas filled with background_rgba,
+    // with the disposals of frames 0..frame_index-1 applied between
+    // frames. A still image has exactly one frame, so frame_index must
+    // be 0 (identical to decode()). Out of range -> InvalidParameter.
+    // #anim #fase9
+    [[nodiscard]] Result<Image> decode_frame(std::span<const uint8_t> data, uint32_t frame_index,
+                                             const DecoderConfig &config = {});
+
     constexpr std::string_view version() { return "0.2.8"; }
 
 }
