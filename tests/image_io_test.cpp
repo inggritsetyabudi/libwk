@@ -997,6 +997,33 @@ TEST(ImageIoTest, LoadJxlRejectsAnimated) {
         << loaded.error().message;
 }
 
+TEST(ImageIoTest, LoadGifRejectsAnimated) {
+    // Real 2-frame GIF (16x16, red then blue): the one-shot decode
+    // API cannot handle animation, reject with an error that says so
+    // — not a silent first frame, like WebP/AVIF/JXL.
+    const auto bytes = read_fixture_bytes("anim_2frame.gif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_anim.gif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_NE(loaded.error().message.find("animated"), std::string::npos)
+        << loaded.error().message;
+}
+
+TEST(ImageIoTest, LoadGifAcceptsSingleFrame) {
+    // A 1-frame GIF still loads like any other still image.
+    const auto bytes = read_fixture_bytes("single_frame.gif.hex");
+    ASSERT_FALSE(bytes.empty());
+    auto path = write_temp_bytes("wk_single.gif", bytes);
+    auto loaded = io::load_image_file(path.string());
+    remove_temp(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+    EXPECT_EQ(loaded->width(), 16u);
+    EXPECT_EQ(loaded->height(), 16u);
+    EXPECT_EQ(loaded->bit_depth(), BitDepth::Bits8);
+}
+
 TEST(ImageIoTest, LoadJxlRejects12Bit) {
     // 12-bit JXL: out of scope for this slice (8/10-bit only),
     // rejected with an explicit error.
