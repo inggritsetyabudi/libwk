@@ -51,6 +51,10 @@ struct LossyCoeffStreamConfig {
     bool split_magnitude_signs = false;
     bool use_table_bank = false;
     bool use_table_cluster_selection = false;
+    // #m3: try replacing bank entries with fitted parametric M3 entries
+    // after clustering, winning-only per entry. Default off: the tile
+    // encoder enables it for its bank configs.
+    bool use_parametric_m3_tables = false;
     bool elide_single_symbol_streams = false;
     bool use_significance_maps = false;
     bool use_adaptive_sign_streams = false;

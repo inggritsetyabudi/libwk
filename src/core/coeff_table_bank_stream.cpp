@@ -31,9 +31,10 @@ struct TableBankEntry {
 }
 
 [[nodiscard]] Result<std::vector<uint8_t>> serialize_table(const LossyCoeffTable& table,
-                                                           int num_symbols) {
+                                                           int num_symbols,
+                                                           const std::optional<ParametricM3> params = std::nullopt) {
     ByteWriter writer;
-    auto written = write_coefficient_table(writer, table, num_symbols);
+    auto written = write_coefficient_table(writer, table, num_symbols, nullptr, params);
     if (!written) {
         return std::unexpected(written.error());
     }
@@ -112,6 +113,7 @@ struct TableBankEntry {
 
 [[nodiscard]] Result<std::vector<TableBankEntry>> build_table_bank(std::span<const LossyCoeffTable> tables,
                                                                    int num_symbols,
+                                                                   std::span<const std::optional<ParametricM3>> params,
                                                                    std::vector<uint8_t>& table_indices,
                                                                    size_t& inline_size) {
     std::vector<TableBankEntry> bank;
@@ -119,8 +121,13 @@ struct TableBankEntry {
     table_indices.reserve(tables.size());
     inline_size = 1u;
 
-    for (const auto& table : tables) {
-        auto serialized = serialize_table(table, num_symbols);
+    for (size_t table_index = 0; table_index < tables.size(); ++table_index) {
+        const auto& table = tables[table_index];
+        // #m3: a parametric position serializes to its 8 fitted bytes,
+        // so identical parameters dedup to one bank entry naturally.
+        const std::optional<ParametricM3> param =
+            table_index < params.size() ? params[table_index] : std::nullopt;
+        auto serialized = serialize_table(table, num_symbols, param);
         if (!serialized) {
             return std::unexpected(serialized.error());
         }
@@ -144,10 +151,14 @@ struct TableBankEntry {
 
 [[nodiscard]] Result<void> write_inline_tables(ByteWriter& writer,
                                                std::span<const LossyCoeffTable> tables,
-                                               int num_symbols) {
+                                               int num_symbols,
+                                               std::span<const std::optional<ParametricM3>> params) {
     writer.write_u8(static_cast<uint8_t>(CoeffTableBankMode::InlineTables));
-    for (const auto& table : tables) {
-        auto written = write_coefficient_table(writer, table, num_symbols);
+    for (size_t table_index = 0; table_index < tables.size(); ++table_index) {
+        const std::optional<ParametricM3> param =
+            table_index < params.size() ? params[table_index] : std::nullopt;
+        auto written = write_coefficient_table(writer, tables[table_index], num_symbols,
+                                               nullptr, param);
         if (!written) {
             return std::unexpected(written.error());
         }
@@ -191,7 +202,9 @@ struct TableBankEntry {
 [[nodiscard]] Result<std::vector<TableBankEntry>> read_bank_entries(ByteReader& reader,
                                                                     uint8_t bank_size,
                                                                     int num_symbols,
-                                                                    std::string_view label) {
+                                                                    std::string_view label,
+                                                                    int limit,
+                                                                    bool split) {
     if (bank_size == 0) {
         return std::unexpected(invalid_bank_error(label, "declares zero bank entries"));
     }
@@ -199,7 +212,7 @@ struct TableBankEntry {
     std::vector<TableBankEntry> bank;
     bank.reserve(bank_size);
     for (uint8_t bank_index = 0; bank_index < bank_size; ++bank_index) {
-        auto table = read_coefficient_table(reader, num_symbols, label);
+        auto table = read_coefficient_table(reader, num_symbols, label, limit, split);
         if (!table) {
             return std::unexpected(table.error());
         }
@@ -233,14 +246,19 @@ struct TableBankEntry {
 
 Result<void> write_coefficient_table_bank(ByteWriter& writer,
                                           std::span<const LossyCoeffTable> tables,
-                                          int num_symbols) {
+                                          int num_symbols,
+                                          std::span<const std::optional<ParametricM3>> params) {
     if (tables.empty()) {
         return {};
+    }
+    if (!params.empty() && params.size() != tables.size()) {
+        return std::unexpected(Error{ErrorCode::InvalidParameter,
+                                     "coefficient table bank params must align with tables"});
     }
 
     std::vector<uint8_t> table_indices;
     size_t inline_size = 0;
-    auto bank = build_table_bank(tables, num_symbols, table_indices, inline_size);
+    auto bank = build_table_bank(tables, num_symbols, params, table_indices, inline_size);
     if (!bank) {
         return std::unexpected(bank.error());
     }
@@ -294,7 +312,7 @@ Result<void> write_coefficient_table_bank(ByteWriter& writer,
     }
 
     if (best_mode == CoeffTableBankMode::InlineTables) {
-        return write_inline_tables(writer, tables, num_symbols);
+        return write_inline_tables(writer, tables, num_symbols, params);
     }
     return write_bank_tables(writer, *bank, best_mode, table_indices);
 }
@@ -302,7 +320,9 @@ Result<void> write_coefficient_table_bank(ByteWriter& writer,
 Result<std::vector<LossyCoeffTable>> read_coefficient_table_bank(ByteReader& reader,
                                                                  size_t expected_count,
                                                                  int num_symbols,
-                                                                 std::string_view label) {
+                                                                 std::string_view label,
+                                                                 int limit,
+                                                                 bool split) {
     if (expected_count == 0) {
         return std::vector<LossyCoeffTable>{};
     }
@@ -318,7 +338,7 @@ Result<std::vector<LossyCoeffTable>> read_coefficient_table_bank(ByteReader& rea
         tables.reserve(expected_count);
         std::optional<LossyCoeffTable> previous_table;
         for (size_t index = 0; index < expected_count; ++index) {
-            auto table = read_coefficient_table(reader, num_symbols, label,
+            auto table = read_coefficient_table(reader, num_symbols, label, limit, split,
                                                 previous_table ? &*previous_table : nullptr);
             if (!table) {
                 return std::unexpected(table.error());
@@ -329,7 +349,7 @@ Result<std::vector<LossyCoeffTable>> read_coefficient_table_bank(ByteReader& rea
         return tables;
     }
     case CoeffTableBankMode::SingleTable: {
-        auto table = read_coefficient_table(reader, num_symbols, label);
+        auto table = read_coefficient_table(reader, num_symbols, label, limit, split);
         if (!table) {
             return std::unexpected(table.error());
         }
@@ -343,7 +363,7 @@ Result<std::vector<LossyCoeffTable>> read_coefficient_table_bank(ByteReader& rea
         if (*bank_size > 16u) {
             return std::unexpected(invalid_bank_error(label, "has too many nibble bank entries"));
         }
-        auto bank = read_bank_entries(reader, *bank_size, num_symbols, label);
+        auto bank = read_bank_entries(reader, *bank_size, num_symbols, label, limit, split);
         if (!bank) {
             return std::unexpected(bank.error());
         }
@@ -369,7 +389,7 @@ Result<std::vector<LossyCoeffTable>> read_coefficient_table_bank(ByteReader& rea
         if (*bank_size > max_bank_size) {
             return std::unexpected(invalid_bank_error(label, "has too many packed bank entries"));
         }
-        auto bank = read_bank_entries(reader, *bank_size, num_symbols, label);
+        auto bank = read_bank_entries(reader, *bank_size, num_symbols, label, limit, split);
         if (!bank) {
             return std::unexpected(bank.error());
         }
@@ -391,7 +411,7 @@ Result<std::vector<LossyCoeffTable>> read_coefficient_table_bank(ByteReader& rea
         if (!bank_size) {
             return std::unexpected(bank_size.error());
         }
-        auto bank = read_bank_entries(reader, *bank_size, num_symbols, label);
+        auto bank = read_bank_entries(reader, *bank_size, num_symbols, label, limit, split);
         if (!bank) {
             return std::unexpected(bank.error());
         }

@@ -29,10 +29,13 @@ enum class CoeffTableBankMode : uint8_t {
 
 [[nodiscard]] Result<void> write_coefficient_table_bank(ByteWriter& writer,
                                                         std::span<const LossyCoeffTable> tables,
-                                                        int num_symbols);
+                                                        int num_symbols,
+                                                        std::span<const std::optional<ParametricM3>> params = {});
 [[nodiscard]] Result<std::vector<LossyCoeffTable>> read_coefficient_table_bank(ByteReader& reader,
                                                                                 size_t expected_count,
                                                                                 int num_symbols,
-                                                                                std::string_view label);
+                                                                                std::string_view label,
+                                                                                int limit,
+                                                                                bool split);
 
 }

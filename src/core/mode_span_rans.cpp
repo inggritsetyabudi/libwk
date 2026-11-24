@@ -60,7 +60,11 @@ namespace {
 // Read a rANS table + size-prefixed stream and decode `count` symbols.
 [[nodiscard]] Result<std::vector<int>> read_rans_stream(ByteReader& reader, int num_symbols,
                                                         size_t count, std::string_view label) {
-    auto table = read_coefficient_table(reader, num_symbols, label, nullptr);
+    // #m3: mode/span streams never carry tag 7; limit/split only
+    // matter for rebuilding parametric entries, so the symbol range is
+    // expressed as split limit num_symbols - 1.
+    auto table = read_coefficient_table(reader, num_symbols, label, num_symbols - 1, true,
+                                        nullptr);
     if (!table) {
         return std::unexpected(table.error());
     }

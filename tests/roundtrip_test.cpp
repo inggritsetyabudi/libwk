@@ -1059,7 +1059,7 @@ TEST(RoundtripTest, CoefficientSignCorruptionRejected) {
 
     std::vector<LossyCoeffTable> y_tables;
     if (syntax->coefficient_table_bank) {
-        auto tables = read_coefficient_table_bank(reader, y_extent, 1025, "lossy");
+        auto tables = read_coefficient_table_bank(reader, y_extent, 1025, "lossy", 1024, true);
         ASSERT_TRUE(tables.has_value()) << tables.error().message;
         ASSERT_FALSE(tables->empty());
         y_tables = std::move(*tables);
@@ -1079,7 +1079,7 @@ TEST(RoundtripTest, CoefficientSignCorruptionRejected) {
         if (syntax->coefficient_table_bank) {
             table = y_tables[coeff_index];
         } else {
-            auto table_read = read_coefficient_table(reader, 1025, "lossy");
+            auto table_read = read_coefficient_table(reader, 1025, "lossy", 1024, true);
             ASSERT_TRUE(table_read.has_value()) << table_read.error().message;
             table = std::move(*table_read);
         }

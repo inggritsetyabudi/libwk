@@ -15,6 +15,7 @@
 #pragma once
 
 #include "common.h"
+#include "parametric_table.h"
 #include "rans.h"
 
 namespace wk {
@@ -27,6 +28,7 @@ enum class CoeffTableEncoding : uint8_t {
     SparsePairsU8 = 4,
     ReusePrevious = 5,
     DeltaSparseI8 = 6,
+    ParametricM3 = 7,
 };
 
 using LossyCoeffTable = RansTable<RANS_PRECISION_BITS>;
@@ -34,10 +36,13 @@ using LossyCoeffTable = RansTable<RANS_PRECISION_BITS>;
 [[nodiscard]] Result<void> write_coefficient_table(ByteWriter& writer,
                                                    const LossyCoeffTable& table,
                                                    int num_symbols,
-                                                   const LossyCoeffTable* previous_table = nullptr);
+                                                   const LossyCoeffTable* previous_table = nullptr,
+                                                   const std::optional<ParametricM3> params = std::nullopt);
 [[nodiscard]] Result<LossyCoeffTable> read_coefficient_table(ByteReader& reader,
                                                              int num_symbols,
                                                              std::string_view label,
+                                                             int limit,
+                                                             bool split,
                                                              const LossyCoeffTable* previous_table = nullptr);
 
 }

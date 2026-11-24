@@ -491,7 +491,10 @@ Result<std::vector<uint8_t>> lossless_decode(
         for (int ch = 0; ch < 4; ch++) {
             RansTable<RANS_PRECISION_BITS> table;
             if (adaptive_tables) {
-                auto table_r = read_coefficient_table(reader, 256, "lossless");
+                // #m3: lossless never writes tag 7; limit/split only
+                // matter for rebuilding parametric entries, so the
+                // 256-symbol range is expressed as split limit 255.
+                auto table_r = read_coefficient_table(reader, 256, "lossless", 255, true);
                 if (!table_r) return std::unexpected(table_r.error());
                 table = std::move(*table_r);
             } else {
