@@ -37,6 +37,7 @@ src/core/metrics.cpp
 src/core/meta_compress.cpp
 src/core/mode_span_rans.cpp
 src/core/mode_stream.cpp
+src/core/parametric_table.cpp
 src/core/predict.cpp
 src/core/rans.cpp
 src/core/superblock_quant.cpp

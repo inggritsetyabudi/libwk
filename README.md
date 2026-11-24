@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="SPEC.md"><img src="https://img.shields.io/badge/version-0.2.9-blue" alt="Version 0.2.9" /></a>
+  <a href="SPEC.md"><img src="https://img.shields.io/badge/version-0.2.10-blue" alt="Version 0.2.10" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License Apache-2.0" /></a>
   <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-23-blue" alt="C++23" /></a>
   <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/CMake-%3E%3D_3.28-blue" alt="CMake >= 3.28" /></a>
@@ -149,7 +149,7 @@ flowchart LR
 ```
 
 Optional chunks (`META`, `ICCP`, `PROV`, `ANIM`) sit between `FHDR` and the
-`TILE` chunks. The full bitstream specification is `SPEC.md` (v0.2.9).
+`TILE` chunks. The full bitstream specification is `SPEC.md` (v0.2.10).
 
 | Chunk | Contents |
 | --- | --- |

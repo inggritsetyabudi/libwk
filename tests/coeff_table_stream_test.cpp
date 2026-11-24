@@ -56,7 +56,7 @@ TEST(CoeffTableStreamTest, SingleSymbolRoundTrip) {
     EXPECT_EQ(bytes.front(), static_cast<uint8_t>(CoeffTableEncoding::SingleSymbol));
 
     ByteReader reader(bytes);
-    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit");
+    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit", 7, true);
     ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
     EXPECT_EQ(parsed->symbol(3).freq, LossyCoeffTable::TABLE_SIZE);
 }
@@ -78,7 +78,7 @@ TEST(CoeffTableStreamTest, SparsePairsU8RoundTrip) {
     EXPECT_EQ(bytes.front(), static_cast<uint8_t>(CoeffTableEncoding::SparsePairsU8));
 
     ByteReader reader(bytes);
-    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit");
+    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit", 255, true);
     ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
     for (int i = 0; i < kNumSymbols; ++i) {
         EXPECT_EQ(parsed->symbol(i).freq, table.symbol(i).freq);
@@ -103,7 +103,7 @@ TEST(CoeffTableStreamTest, DenseRangeU8RoundTrip) {
     EXPECT_EQ(bytes.front(), static_cast<uint8_t>(CoeffTableEncoding::DenseRangeU8));
 
     ByteReader reader(bytes);
-    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit");
+    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit", 63, true);
     ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
     for (int i = 0; i < kNumSymbols; ++i) {
         EXPECT_EQ(parsed->symbol(i).freq, table.symbol(i).freq);
@@ -123,7 +123,7 @@ TEST(CoeffTableStreamTest, FallsBackToDenseRangeU16ForWideFrequencies) {
     EXPECT_EQ(bytes.front(), static_cast<uint8_t>(CoeffTableEncoding::DenseRange));
 
     ByteReader reader(bytes);
-    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit");
+    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit", 31, true);
     ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
     for (int i = 0; i < kNumSymbols; ++i) {
         EXPECT_EQ(parsed->symbol(i).freq, table.symbol(i).freq);
@@ -143,7 +143,7 @@ TEST(CoeffTableStreamTest, FallsBackToSparsePairsU16ForWideFrequencies) {
     EXPECT_EQ(bytes.front(), static_cast<uint8_t>(CoeffTableEncoding::SparsePairs));
 
     ByteReader reader(bytes);
-    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit");
+    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit", 31, true);
     ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
     for (int i = 0; i < kNumSymbols; ++i) {
         EXPECT_EQ(parsed->symbol(i).freq, table.symbol(i).freq);
@@ -163,7 +163,7 @@ TEST(CoeffTableStreamTest, ReusesPreviousTableWhenFrequenciesMatch) {
     EXPECT_EQ(bytes.front(), static_cast<uint8_t>(CoeffTableEncoding::ReusePrevious));
 
     ByteReader reader(bytes);
-    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit", &table);
+    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit", 31, true, &table);
     ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
     expect_tables_equal(*parsed, table, kNumSymbols);
 }
@@ -182,7 +182,7 @@ TEST(CoeffTableStreamTest, DeltaEncodesSmallSequentialTableChanges) {
     EXPECT_EQ(bytes.front(), static_cast<uint8_t>(CoeffTableEncoding::DeltaSparseI8));
 
     ByteReader reader(bytes);
-    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit", &previous);
+    auto parsed = read_coefficient_table(reader, kNumSymbols, "unit", 511, true, &previous);
     ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
     expect_tables_equal(*parsed, current, kNumSymbols);
 }
@@ -193,7 +193,7 @@ TEST(CoeffTableStreamTest, RejectsReuseWithoutPreviousTable) {
     const auto bytes = writer.finish();
 
     ByteReader reader(bytes);
-    auto parsed = read_coefficient_table(reader, 8, "unit");
+    auto parsed = read_coefficient_table(reader, 8, "unit", 7, true);
     ASSERT_FALSE(parsed.has_value());
     EXPECT_EQ(parsed.error().code, ErrorCode::RansError);
     EXPECT_NE(parsed.error().message.find("missing previous table"), std::string::npos);
@@ -208,7 +208,7 @@ TEST(CoeffTableStreamTest, RejectsDeltaWithoutPreviousTable) {
     const auto bytes = writer.finish();
 
     ByteReader reader(bytes);
-    auto parsed = read_coefficient_table(reader, 32, "unit");
+    auto parsed = read_coefficient_table(reader, 32, "unit", 31, true);
     ASSERT_FALSE(parsed.has_value());
     EXPECT_EQ(parsed.error().code, ErrorCode::RansError);
     EXPECT_NE(parsed.error().message.find("without a previous table"), std::string::npos);
@@ -220,7 +220,7 @@ TEST(CoeffTableStreamTest, RejectsUnknownEncoding) {
     const auto bytes = writer.finish();
 
     ByteReader reader(bytes);
-    auto parsed = read_coefficient_table(reader, 8, "unit");
+    auto parsed = read_coefficient_table(reader, 8, "unit", 7, true);
     EXPECT_FALSE(parsed.has_value());
     EXPECT_EQ(parsed.error().code, ErrorCode::RansError);
 }

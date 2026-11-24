@@ -18,6 +18,7 @@
 #include "coeff_table_bank_stream.h"
 #include "coeff_sign_stream.h"
 #include "coeff_table_stream.h"
+#include "parametric_table.h"
 #include "rans.h"
 #include <algorithm>
 #include <optional>
@@ -598,7 +599,8 @@ struct CoeffContextAnalysis {
     const LossyCoeffStreamConfig& config,
     const LossyCoeffTable* previous_table) {
     if (config.adaptive_coefficient_tables) {
-        return read_coefficient_table(reader, coding.num_symbols, "lossy", previous_table);
+        return read_coefficient_table(reader, coding.num_symbols, "lossy", coding.offset,
+                                      coding.split_magnitude_signs, previous_table);
     }
 
     auto first_read = reader.read_u16();
@@ -857,9 +859,10 @@ struct CoeffContextAnalysis {
     std::span<const LossyCoeffTable> tables,
     std::span<const EncodedCoeffContextStream> streams,
     const SymbolCoding& coding,
-    const LossyCoeffStreamConfig& config) {
+    const LossyCoeffStreamConfig& config,
+    std::span<const std::optional<ParametricM3>> params = {}) {
     ByteWriter writer;
-    auto bank_result = write_coefficient_table_bank(writer, tables, coding.num_symbols);
+    auto bank_result = write_coefficient_table_bank(writer, tables, coding.num_symbols, params);
     if (!bank_result) {
         return std::unexpected(bank_result.error());
     }
@@ -878,9 +881,10 @@ struct CoeffContextAnalysis {
     std::span<const EncodedCoeffContextStream> cb_streams,
     std::span<const EncodedCoeffContextStream> cr_streams,
     const SymbolCoding& coding,
-    const LossyCoeffStreamConfig& config) {
+    const LossyCoeffStreamConfig& config,
+    std::span<const std::optional<ParametricM3>> params = {}) {
     ByteWriter writer;
-    auto bank_result = write_coefficient_table_bank(writer, tables, coding.num_symbols);
+    auto bank_result = write_coefficient_table_bank(writer, tables, coding.num_symbols, params);
     if (!bank_result) {
         return std::unexpected(bank_result.error());
     }
@@ -1028,6 +1032,202 @@ struct CoeffContextAnalysis {
         return true;
     }
     return false;
+}
+
+// #m3: group positions by the serialized bytes of their current table
+// (the bank's dedup key), then try one fitted parametric entry per
+// group. Positions in a group share one bank entry, so they convert or
+// stay together. The fit pools each position's own counts in its own
+// significance-map mode; the fitted table must support the pooled
+// counts, and the group converts only if the total serialized payload
+// (bank + streams, measured with true rANS-coded sizes) is strictly
+// smaller. Winning-only per group: a bad fit stays a regular table.
+[[nodiscard]] std::vector<uint8_t> serialize_table_bytes(const LossyCoeffTable& table,
+                                                         int num_symbols) {
+    ByteWriter writer;
+    auto written = write_coefficient_table(writer, table, num_symbols);
+    return written ? writer.finish() : std::vector<uint8_t>{};
+}
+
+[[nodiscard]] Result<bool> try_parametric_m3_plane_tables(
+    std::span<const DctBlockI16> blocks,
+    std::span<const uint8_t> spans,
+    std::span<LossyCoeffTable> tables,
+    std::span<EncodedCoeffContextStream> streams,
+    std::span<std::optional<ParametricM3>> params,
+    const SymbolCoding& coding,
+    const LossyCoeffStreamConfig& config,
+    size_t& best_payload_size) {
+    std::vector<std::vector<size_t>> groups;
+    std::vector<std::vector<uint8_t>> group_keys;
+    for (size_t pos = 0; pos < tables.size(); ++pos) {
+        if (streams[pos].active_blocks == 0) {
+            continue;
+        }
+        const std::vector<uint8_t> key = serialize_table_bytes(tables[pos], coding.num_symbols);
+        size_t group_index = 0;
+        while (group_index < groups.size() && group_keys[group_index] != key) {
+            ++group_index;
+        }
+        if (group_index == groups.size()) {
+            groups.push_back({});
+            group_keys.push_back(key);
+        }
+        groups[group_index].push_back(pos);
+    }
+
+    bool changed = false;
+    for (const auto& group : groups) {
+        std::vector<uint32_t> pooled(static_cast<size_t>(coding.num_symbols), 0);
+        for (size_t pos : group) {
+            const std::vector<uint32_t> counts = build_plane_counts(
+                blocks, spans, static_cast<int>(pos), coding, streams[pos].use_significance_map);
+            for (size_t symbol = 0; symbol < counts.size(); ++symbol) {
+                pooled[symbol] += counts[symbol];
+            }
+        }
+        auto fitted_params =
+            fit_parametric_m3(pooled, coding.offset, coding.split_magnitude_signs);
+        if (!fitted_params) {
+            continue;
+        }
+        const LossyCoeffTable fitted = reconstruct_parametric_m3(
+            *fitted_params, coding.offset, coding.split_magnitude_signs);
+        if (!table_supports_counts(fitted, pooled)) {
+            continue;
+        }
+
+        std::vector<LossyCoeffTable> trial_tables(tables.begin(), tables.end());
+        std::vector<EncodedCoeffContextStream> trial_streams(streams.begin(), streams.end());
+        std::vector<std::optional<ParametricM3>> trial_params(params.begin(), params.end());
+        for (size_t pos : group) {
+            const CoeffContextAnalysis analysis = analyze_coeff_context(
+                blocks, spans, static_cast<int>(pos), streams[pos].use_significance_map);
+            auto trial_stream = encode_coeff_context_stream(
+                blocks, spans, static_cast<int>(pos), analysis, fitted, coding, config,
+                streams[pos].use_significance_map);
+            if (!trial_stream) {
+                return std::unexpected(trial_stream.error());
+            }
+            trial_tables[pos] = fitted;
+            trial_streams[pos] = std::move(*trial_stream);
+            trial_params[pos] = *fitted_params;
+        }
+        auto trial_size = serialized_plane_bank_payload_size(trial_tables, trial_streams,
+                                                             coding, config, trial_params);
+        if (!trial_size) {
+            return std::unexpected(trial_size.error());
+        }
+        if (*trial_size < best_payload_size) {
+            for (size_t pos = 0; pos < tables.size(); ++pos) {
+                tables[pos] = trial_tables[pos];
+                streams[pos] = trial_streams[pos];
+                params[pos] = trial_params[pos];
+            }
+            best_payload_size = *trial_size;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+[[nodiscard]] Result<bool> try_parametric_m3_chroma_tables(
+    std::span<const DctBlockI16> cb_blocks,
+    std::span<const DctBlockI16> cr_blocks,
+    std::span<const uint8_t> spans,
+    std::span<LossyCoeffTable> tables,
+    std::span<EncodedCoeffContextStream> cb_streams,
+    std::span<EncodedCoeffContextStream> cr_streams,
+    std::span<std::optional<ParametricM3>> params,
+    const SymbolCoding& coding,
+    const LossyCoeffStreamConfig& config,
+    size_t& best_payload_size) {
+    std::vector<std::vector<size_t>> groups;
+    std::vector<std::vector<uint8_t>> group_keys;
+    for (size_t pos = 0; pos < tables.size(); ++pos) {
+        if (cb_streams[pos].active_blocks == 0 && cr_streams[pos].active_blocks == 0) {
+            continue;
+        }
+        const std::vector<uint8_t> key = serialize_table_bytes(tables[pos], coding.num_symbols);
+        size_t group_index = 0;
+        while (group_index < groups.size() && group_keys[group_index] != key) {
+            ++group_index;
+        }
+        if (group_index == groups.size()) {
+            groups.push_back({});
+            group_keys.push_back(key);
+        }
+        groups[group_index].push_back(pos);
+    }
+
+    bool changed = false;
+    for (const auto& group : groups) {
+        // Shared chroma: one pooled fit over Cb+Cr magnitudes.
+        std::vector<uint32_t> pooled(static_cast<size_t>(coding.num_symbols), 0);
+        for (size_t pos : group) {
+            const std::vector<uint32_t> counts = build_chroma_counts(
+                cb_blocks, cr_blocks, spans, static_cast<int>(pos), coding,
+                cb_streams[pos].use_significance_map);
+            for (size_t symbol = 0; symbol < counts.size(); ++symbol) {
+                pooled[symbol] += counts[symbol];
+            }
+        }
+        auto fitted_params =
+            fit_parametric_m3(pooled, coding.offset, coding.split_magnitude_signs);
+        if (!fitted_params) {
+            continue;
+        }
+        const LossyCoeffTable fitted = reconstruct_parametric_m3(
+            *fitted_params, coding.offset, coding.split_magnitude_signs);
+        if (!table_supports_counts(fitted, pooled)) {
+            continue;
+        }
+
+        std::vector<LossyCoeffTable> trial_tables(tables.begin(), tables.end());
+        std::vector<EncodedCoeffContextStream> trial_cb_streams(cb_streams.begin(),
+                                                                 cb_streams.end());
+        std::vector<EncodedCoeffContextStream> trial_cr_streams(cr_streams.begin(),
+                                                                 cr_streams.end());
+        std::vector<std::optional<ParametricM3>> trial_params(params.begin(), params.end());
+        for (size_t pos : group) {
+            const CoeffContextAnalysis cb_analysis = analyze_coeff_context(
+                cb_blocks, spans, static_cast<int>(pos), cb_streams[pos].use_significance_map);
+            const CoeffContextAnalysis cr_analysis = analyze_coeff_context(
+                cr_blocks, spans, static_cast<int>(pos), cb_streams[pos].use_significance_map);
+            auto trial_cb_stream = encode_coeff_context_stream(
+                cb_blocks, spans, static_cast<int>(pos), cb_analysis, fitted, coding, config,
+                cb_streams[pos].use_significance_map);
+            if (!trial_cb_stream) {
+                return std::unexpected(trial_cb_stream.error());
+            }
+            auto trial_cr_stream = encode_coeff_context_stream(
+                cr_blocks, spans, static_cast<int>(pos), cr_analysis, fitted, coding, config,
+                cb_streams[pos].use_significance_map);
+            if (!trial_cr_stream) {
+                return std::unexpected(trial_cr_stream.error());
+            }
+            trial_tables[pos] = fitted;
+            trial_cb_streams[pos] = std::move(*trial_cb_stream);
+            trial_cr_streams[pos] = std::move(*trial_cr_stream);
+            trial_params[pos] = *fitted_params;
+        }
+        auto trial_size = serialized_chroma_bank_payload_size(
+            trial_tables, trial_cb_streams, trial_cr_streams, coding, config, trial_params);
+        if (!trial_size) {
+            return std::unexpected(trial_size.error());
+        }
+        if (*trial_size < best_payload_size) {
+            for (size_t pos = 0; pos < tables.size(); ++pos) {
+                tables[pos] = trial_tables[pos];
+                cb_streams[pos] = trial_cb_streams[pos];
+                cr_streams[pos] = trial_cr_streams[pos];
+                params[pos] = trial_params[pos];
+            }
+            best_payload_size = *trial_size;
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 [[nodiscard]] Result<void> optimize_plane_table_clusters(
@@ -1344,6 +1544,22 @@ Result<std::vector<uint8_t>> encode_lossy_plane_payload(
         return std::unexpected(cluster_result.error());
     }
 
+    // #m3: parametric entries, winning-only per bank entry, after clustering.
+    std::vector<std::optional<ParametricM3>> table_params(tables.size());
+    if (config.use_table_bank && config.use_parametric_m3_tables) {
+        auto best_payload_size =
+            serialized_plane_bank_payload_size(tables, streams, coding, config);
+        if (!best_payload_size) {
+            return std::unexpected(best_payload_size.error());
+        }
+        auto m3_result = try_parametric_m3_plane_tables(blocks, spans, tables, streams,
+                                                        table_params, coding, config,
+                                                        *best_payload_size);
+        if (!m3_result) {
+            return std::unexpected(m3_result.error());
+        }
+    }
+
     // Byte breakdown (Phase 1 diagnostic): measure each section as it is
     // written, so the caller can see whether tables or coded data dominate.
     size_t flag_bytes = 0;
@@ -1368,7 +1584,8 @@ Result<std::vector<uint8_t>> encode_lossy_plane_payload(
 
     if (config.use_table_bank) {
         const size_t before = writer.size();
-        auto bank_result = write_coefficient_table_bank(writer, tables, coding.num_symbols);
+        auto bank_result = write_coefficient_table_bank(writer, tables, coding.num_symbols,
+                                                        table_params);
         if (!bank_result) {
             return std::unexpected(bank_result.error());
         }
@@ -1570,6 +1787,22 @@ Result<std::vector<uint8_t>> encode_lossy_chroma_payload(
         return std::unexpected(cluster_result.error());
     }
 
+    // #m3: parametric entries, winning-only per bank entry, after clustering.
+    std::vector<std::optional<ParametricM3>> table_params(tables.size());
+    if (config.use_table_bank && config.use_parametric_m3_tables) {
+        auto best_payload_size = serialized_chroma_bank_payload_size(tables, cb_streams,
+                                                                     cr_streams, coding, config);
+        if (!best_payload_size) {
+            return std::unexpected(best_payload_size.error());
+        }
+        auto m3_result = try_parametric_m3_chroma_tables(
+            cb_blocks, cr_blocks, spans, tables, cb_streams, cr_streams, table_params, coding,
+            config, *best_payload_size);
+        if (!m3_result) {
+            return std::unexpected(m3_result.error());
+        }
+    }
+
     // Byte breakdown (Phase 1 diagnostic): see encode_lossy_plane_payload.
     size_t flag_bytes = 0;
     size_t table_bytes = 0;
@@ -1599,7 +1832,8 @@ Result<std::vector<uint8_t>> encode_lossy_chroma_payload(
 
     if (config.use_table_bank) {
         const size_t before = writer.size();
-        auto bank_result = write_coefficient_table_bank(writer, tables, coding.num_symbols);
+        auto bank_result = write_coefficient_table_bank(writer, tables, coding.num_symbols,
+                                                        table_params);
         if (!bank_result) {
             return std::unexpected(bank_result.error());
         }
@@ -1687,7 +1921,8 @@ Result<std::vector<DctBlockI16>> decode_lossy_plane_payload(
 
     if (config.use_table_bank) {
         auto tables = read_coefficient_table_bank(reader, static_cast<size_t>(coeff_limit),
-                                                  coding.num_symbols, "lossy");
+                                                  coding.num_symbols, "lossy", coding.offset,
+                                                  coding.split_magnitude_signs);
         if (!tables) {
             return std::unexpected(tables.error());
         }
@@ -1766,7 +2001,8 @@ Result<DecodedLossyChromaPayload> decode_lossy_chroma_payload(
 
     if (config.use_table_bank) {
         auto tables = read_coefficient_table_bank(reader, static_cast<size_t>(coeff_limit),
-                                                  coding.num_symbols, "lossy");
+                                                  coding.num_symbols, "lossy", coding.offset,
+                                                  coding.split_magnitude_signs);
         if (!tables) {
             return std::unexpected(tables.error());
         }

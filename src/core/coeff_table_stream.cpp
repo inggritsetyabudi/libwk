@@ -104,10 +104,18 @@ namespace {
 Result<void> write_coefficient_table(ByteWriter& writer,
                                      const LossyCoeffTable& table,
                                      int num_symbols,
-                                     const LossyCoeffTable* previous_table) {
+                                     const LossyCoeffTable* previous_table,
+                                     const std::optional<ParametricM3> params) {
     if (num_symbols <= 0) {
         return std::unexpected(Error{ErrorCode::InvalidParameter,
                                      "coefficient table symbol count must be positive"});
+    }
+
+    // #m3: a parametric entry replaces the table entirely with its 8
+    // fitted bytes; the reader rebuilds the same table from them.
+    if (params.has_value()) {
+        write_parametric_m3_entry(writer, *params);
+        return {};
     }
 
     if (previous_table != nullptr && tables_match_exactly(table, *previous_table, num_symbols)) {
@@ -236,6 +244,8 @@ Result<void> write_coefficient_table(ByteWriter& writer,
 Result<LossyCoeffTable> read_coefficient_table(ByteReader& reader,
                                                int num_symbols,
                                                std::string_view label,
+                                               int limit,
+                                               bool split,
                                                const LossyCoeffTable* previous_table) {
     if (num_symbols <= 0) {
         return std::unexpected(
@@ -245,6 +255,18 @@ Result<LossyCoeffTable> read_coefficient_table(ByteReader& reader,
     auto encoding = reader.read_u8();
     if (!encoding) {
         return std::unexpected(encoding.error());
+    }
+
+    // #m3: a parametric entry carries no exact counts, so the normalized
+    // fitted table IS the definition and skips the exact-count checks
+    // below. limit/split come from the decoder config, never the file,
+    // which is what makes the reconstruction deterministic.
+    if (static_cast<CoeffTableEncoding>(*encoding) == CoeffTableEncoding::ParametricM3) {
+        auto params = read_parametric_m3_params(reader, limit, label);
+        if (!params) {
+            return std::unexpected(params.error());
+        }
+        return reconstruct_parametric_m3(*params, limit, split);
     }
 
     std::vector<uint32_t> counts(static_cast<size_t>(num_symbols), 0);

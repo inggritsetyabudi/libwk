@@ -17,7 +17,9 @@
 #include <array>
 #include <utility>
 
+#include "../src/core/coeff_table_bank_stream.h"
 #include "../src/core/lossy_coeff_stream.h"
+#include "../src/core/parametric_table.h"
 
 using namespace wk;
 
@@ -418,4 +420,169 @@ TEST(LossyCoeffStreamTest, AdaptiveSignModesShrinkUniformSignPayload) {
     auto decoded = decode_lossy_plane_payload(reader, spans, 3, adaptive_sign_config);
     ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
     expect_blocks_equal(*decoded, blocks);
+}
+
+TEST(LossyCoeffStreamTest, ParametricM3ShrinksBankedPlanePayload) {
+    // 64 blocks x 16 positions. Each position has a distinct wide table
+    // (zeros ~72%, ones ~15%, a geometric-like tail out to magnitude
+    // 6..10 that differs per position), so plain clustering cannot
+    // collapse them, while one 8-byte parametric entry replaces each
+    // ~47-byte dense-range table.
+    std::array<DctBlockI16, 64> blocks{};
+    for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+        for (int pos = 0; pos < 16; ++pos) {
+            const int v = static_cast<int>(
+                (block_index * 5 + static_cast<size_t>(pos) * 11) % 97);
+            int16_t magnitude = 0;
+            if (v >= 70 && v < 85) {
+                magnitude = 1;
+            } else if (v >= 85 && v < 93) {
+                magnitude = 2;
+            } else if (v >= 93 && v < 96) {
+                magnitude = 3;
+            } else if (v >= 96) {
+                magnitude = static_cast<int16_t>(6 + (pos % 5));
+            }
+            blocks[block_index][static_cast<size_t>(pos)] =
+                ((block_index + static_cast<size_t>(pos)) % 2 == 0)
+                    ? magnitude
+                    : static_cast<int16_t>(-magnitude);
+        }
+    }
+    const std::array<uint8_t, 64> spans = {
+        16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+        16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+        16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+        16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    };
+
+    const LossyCoeffStreamConfig base_config{
+        .use_plane_max_coeff_span = false,
+        .adaptive_coefficient_tables = true,
+        .split_magnitude_signs = false,
+        .use_table_bank = true,
+    };
+    const LossyCoeffStreamConfig parametric_config{
+        .use_plane_max_coeff_span = false,
+        .adaptive_coefficient_tables = true,
+        .split_magnitude_signs = false,
+        .use_table_bank = true,
+        .use_parametric_m3_tables = true,
+    };
+
+    auto base_payload = encode_lossy_plane_payload(blocks, spans, 16, base_config);
+    ASSERT_TRUE(base_payload.has_value()) << base_payload.error().message;
+    auto parametric_payload =
+        encode_lossy_plane_payload(blocks, spans, 16, parametric_config);
+    ASSERT_TRUE(parametric_payload.has_value()) << parametric_payload.error().message;
+
+    EXPECT_LT(parametric_payload->size(), base_payload->size());
+
+    ByteReader reader(*parametric_payload);
+    auto decoded = decode_lossy_plane_payload(reader, spans, 16, parametric_config);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    expect_blocks_equal(*decoded, blocks);
+}
+
+TEST(LossyCoeffStreamTest, ParametricM3KeepsBadFitsAsRegularTables) {
+    // Position 0 has a distribution a geometric tail cannot fit: two
+    // spikes of equal mass at magnitudes 1 and 40 and nothing between.
+    // The trial must leave it a regular table (winning-only), while the
+    // well-behaved position 1 still converts. The bank is the first
+    // thing in the payload for this config (no significance maps, no
+    // adaptive sign streams), so the test reads it back directly.
+    std::array<DctBlockI16, 64> blocks{};
+    for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+        for (int pos = 0; pos < 16; ++pos) {
+            int16_t magnitude = 0;
+            if (pos == 0) {
+                magnitude = (block_index % 2 == 0) ? 1 : 40;
+            } else {
+                const int v = static_cast<int>(
+                    (block_index * 5 + static_cast<size_t>(pos) * 11) % 97);
+                if (v >= 70 && v < 85) {
+                    magnitude = 1;
+                } else if (v >= 85 && v < 93) {
+                    magnitude = 2;
+                } else if (v >= 93 && v < 96) {
+                    magnitude = 3;
+                } else if (v >= 96) {
+                    magnitude = static_cast<int16_t>(6 + (pos % 5));
+                }
+            }
+            blocks[block_index][static_cast<size_t>(pos)] =
+                ((block_index + static_cast<size_t>(pos)) % 2 == 0)
+                    ? magnitude
+                    : static_cast<int16_t>(-magnitude);
+        }
+    }
+    const std::array<uint8_t, 64> spans = {
+        16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+        16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+        16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+        16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    };
+
+    const LossyCoeffStreamConfig parametric_config{
+        .use_plane_max_coeff_span = false,
+        .adaptive_coefficient_tables = true,
+        .split_magnitude_signs = false,
+        .use_table_bank = true,
+        .use_parametric_m3_tables = true,
+    };
+
+    auto parametric_payload =
+        encode_lossy_plane_payload(blocks, spans, 16, parametric_config);
+    ASSERT_TRUE(parametric_payload.has_value()) << parametric_payload.error().message;
+
+    ByteReader reader(*parametric_payload);
+    auto decoded = decode_lossy_plane_payload(reader, spans, 16, parametric_config);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    expect_blocks_equal(*decoded, blocks);
+
+    // The bank leads the payload: position 0 must still hold its
+    // regular two-symbol table, position 1 the fitted parametric one.
+    ByteReader bank_reader(*parametric_payload);
+    auto bank_tables = read_coefficient_table_bank(bank_reader, 16, 2049, "lossy",
+                                                    /*limit=*/1024, /*split=*/false);
+    ASSERT_TRUE(bank_tables.has_value()) << bank_tables.error().message;
+
+    std::vector<uint32_t> pos0_counts(2049, 0);
+    pos0_counts[1025] = 32;  // +1 on even blocks
+    pos0_counts[984] = 32;   // -40 on odd blocks
+    LossyCoeffTable pos0_regular;
+    pos0_regular.build_from_counts(pos0_counts.data(), 2049);
+    for (int symbol = 0; symbol < 2049; ++symbol) {
+        EXPECT_EQ((*bank_tables)[0].symbol(symbol).freq,
+                  pos0_regular.symbol(symbol).freq)
+            << "position 0 must stay a regular table, symbol " << symbol;
+    }
+
+    std::vector<uint32_t> pos1_counts(2049, 0);
+    for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+        const int v = static_cast<int>((block_index * 5 + 11) % 97);
+        int16_t magnitude = 0;
+        if (v >= 70 && v < 85) {
+            magnitude = 1;
+        } else if (v >= 85 && v < 93) {
+            magnitude = 2;
+        } else if (v >= 93 && v < 96) {
+            magnitude = 3;
+        } else if (v >= 96) {
+            magnitude = 7;
+        }
+        const int16_t value = ((block_index + 1) % 2 == 0)
+                                  ? magnitude
+                                  : static_cast<int16_t>(-magnitude);
+        pos1_counts[static_cast<size_t>(value + 1024)]++;
+    }
+    auto pos1_params = fit_parametric_m3(pos1_counts, /*limit=*/1024, /*split=*/false);
+    ASSERT_TRUE(pos1_params.has_value());
+    const auto pos1_fitted =
+        reconstruct_parametric_m3(*pos1_params, /*limit=*/1024, /*split=*/false);
+    for (int symbol = 0; symbol < 2049; ++symbol) {
+        EXPECT_EQ((*bank_tables)[1].symbol(symbol).freq,
+                  pos1_fitted.symbol(symbol).freq)
+            << "position 1 must convert to a parametric entry, symbol " << symbol;
+    }
 }
