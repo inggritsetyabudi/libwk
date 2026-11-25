@@ -524,7 +524,10 @@ Result<TileEncodeResult> encode_lossy_tile(
     quant_y.build(luma_quality, false, bit_depth);
     quant_c.build(chroma_quality, true, bit_depth, smooth_ramp_tile);
     if (has_alpha) {
-        quant_a.build(std::min(100.0f, quality + 10.0f), false, bit_depth);
+        // #qtab: the alpha plane keeps the unshaped luma table; the
+        // measured shape covers luma Y and chroma, not alpha.
+        quant_a.build(std::min(100.0f, quality + 10.0f), false, bit_depth,
+                      false, false);
     }
 
     std::vector<int16_t> reconstructed_y(tw * th, 0);

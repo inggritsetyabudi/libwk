@@ -267,7 +267,7 @@ What is in a good working state right now:
 - PNG output for 8-bit decode
 - side-by-side compare viewer with file and format information
 - C and C++ public APIs, and a WebAssembly build under `web/`
-- 39 test binaries passing in the current tree (Release and ASan/UBSan)
+- 40 test binaries passing in the current tree (Release and ASan/UBSan)
 
 What is intentionally not claimed as finished yet:
 
@@ -402,7 +402,7 @@ Main entry points: `wk_encode(...)`, `wk_decode(...)`, `wk_get_info(...)`,
 
 ## Tests
 
-39 test binaries, run with `ctest --test-dir build --output-on-failure`:
+40 test binaries, run with `ctest --test-dir build --output-on-failure`:
 
 - core: `rans_test`, `dct_test`, `predict_test`, `quantize_test`,
   `container_test`, `roundtrip_test`, `geo_roundtrip_test`
@@ -492,7 +492,7 @@ the same `stb`-based code on all platforms.
 include/    public headers (wk.hpp, wk.h, wkmeta.hpp)
 src/        core/ (portable codec), arch/ (per-target code), stb/ (vendored image I/O)
 tools/      CLI tools and viewer (wkenc, wkdec, wkmetric, wkmeta-dump, wkmeta-edit, wkview)
-tests/      unit and integration tests (39 test binaries)
+tests/      unit and integration tests (40 test binaries)
 photos/     sample corpus split into people/ and scenery/
 benchmark/  RD harness (rd_bench.py), baselines, and generated outputs
 extra/      screenshots, demo assets, and the WK logo

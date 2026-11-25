@@ -63,8 +63,71 @@ class QuantTable {
 public:
     QuantTable() = default;
 
+    // Luma + chroma quant-table shape (#qtab): the pass-2 table from the
+    // 2026-11-25 encoder-side coordinate descent at q75, pass 2 with ramp
+    // constraints. Luma applies as a per-position ratio against the
+    // nominal q75 luma table:
+    //   new[i] = lround(pass2[i] * built[i] / nominal75[i])
+    // where built[i] is the unshaped step at the tile's (possibly
+    // adapted) quality. This is the measured table rescaled per tile
+    // by the same quality adaptation that built the nominal table.
+    // Why ratios, not the band multipliers (Y{1..3} x1.08, Y{4..7} and
+    // Y{8..15} x1.25, Y{16..31} x0.8, Y{32..63} x0.7) the descent
+    // searched over: applying the multipliers directly rounds
+    // differently on quality-adapted tiles (ember tile at q~77.7:
+    // zigzag 4/8 give 6, the measured table gives 7) and costs
+    // +1,109 B on the q75 corpus for the pass-1 table. The ratios
+    // reproduce the measured q75 table exactly, on every tile.
+    // Chroma applies as a multiplier on the nominal table at the
+    // tile's bit depth, NOT as a ratio against the q75 table scaled
+    // by bd_mul:
+    //   new[i] = lround(built[i] * pass2c[i] / nominalC75[i])
+    // The two formulas must not be unified: the nominal chroma table
+    // does not scale by exactly 4/16 (truncation), so scaling the
+    // chroma fit by bd_mul silently smooths chroma by up to 20% at
+    // 12-bit (measured 2026-11-25: the pass-1 12-bit gradient SSIM
+    // read 0.98991 instead of the true 0.98831). The fit is scaled
+    // to the current bit depth through built[i], so the q75 table is
+    // the pass-2 table at every depth. The alpha plane uses the
+    // unshaped luma table (apply_quant_shape = false at its call
+    // site): its steps were not part of the measurement, so they stay
+    // exactly as before.
+    static constexpr std::array<uint16_t, 64> kQuantPass2Luma = {{
+        8, 5, 6, 8, 8, 6, 10, 9,
+        8, 9, 11, 10, 10, 11, 15, 25,
+        10, 10, 9, 9, 10, 16, 14, 14,
+        11, 16, 16, 16, 16, 16, 16, 16,
+        14, 14, 14, 14, 14, 14, 14, 14,
+        14, 14, 14, 14, 14, 14, 14, 14,
+        14, 14, 14, 14, 14, 14, 14, 14,
+        14, 14, 14, 14, 14, 14, 14, 14}};
+
+    static constexpr std::array<uint16_t, 64> kQuantPass2Chroma = {{
+        5, 6, 6, 8, 6, 6, 8, 7,
+        6, 8, 11, 9, 8, 9, 11, 12,
+        12, 11, 11, 12, 12, 12, 12, 12,
+        15, 15, 15, 15, 15, 15, 15, 15,
+        12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12}};
+
+    // Nominal chroma table at q75, 8-bit (the divisor for the chroma
+    // multiplier above). Verified against build(75, true, 8) with the
+    // shape disabled.
+    static constexpr std::array<uint16_t, 64> kQuantNominalChromaQ75 = {{
+        5, 5, 5, 6, 6, 6, 8, 7,
+        6, 8, 11, 9, 8, 9, 11, 12,
+        12, 11, 11, 12, 12, 12, 12, 12,
+        15, 15, 15, 15, 15, 15, 15, 15,
+        15, 15, 15, 15, 15, 15, 15, 15,
+        15, 15, 15, 15, 15, 15, 15, 15,
+        15, 15, 15, 15, 15, 15, 15, 15,
+        15, 15, 15, 15, 15, 15, 15, 15}};
+
     void build(float quality, bool is_chroma, uint8_t bit_depth,
-              bool refine_low_frequencies = false) {
+              bool refine_low_frequencies = false,
+              bool apply_quant_shape = true) {
         quality_ = std::clamp(quality, 1.0f, 100.0f);
         is_chroma_ = is_chroma;
         bit_depth_ = bit_depth;
@@ -96,6 +159,35 @@ public:
             }
             const float v = (base_value * scale / 100.0f) * bd_mul;
             table_[i] = static_cast<uint16_t>(std::max(v, 1.0f));
+            if (apply_quant_shape && !is_chroma_) {
+                // Nominal q75 step at this bit depth (same formula with
+                // scale 50), for the #qtab ratio above.
+                const float v75 = (base_value * 50.0f / 100.0f) * bd_mul;
+                const uint16_t nominal75 =
+                    static_cast<uint16_t>(std::max(v75, 1.0f));
+                const double fit =
+                    static_cast<double>(kQuantPass2Luma[static_cast<size_t>(i)]) *
+                    static_cast<double>(bd_mul);
+                table_[i] = static_cast<uint16_t>(std::max(
+                    static_cast<int>(std::lround(
+                        fit * static_cast<double>(table_[i]) /
+                        static_cast<double>(nominal75))),
+                    1));
+            } else if (apply_quant_shape && is_chroma_) {
+                // Chroma multiplier semantics (#qtab): the shaped step is
+                // the built step times the pass-2/nominal ratio at q75
+                // 8-bit. The built step already carries this tile's
+                // quality adaptation and bit depth, so no bd_mul is
+                // applied to the fit here — scaling the fit by bd_mul
+                // would silently smooth chroma at 10/12-bit (see the
+                // comment on kQuantPass2Chroma above).
+                table_[i] = static_cast<uint16_t>(std::max(
+                    static_cast<int>(std::lround(
+                        static_cast<double>(table_[i]) *
+                        static_cast<double>(kQuantPass2Chroma[static_cast<size_t>(i)]) /
+                        static_cast<double>(kQuantNominalChromaQ75[static_cast<size_t>(i)]))),
+                    1));
+            }
             inv_table_[i] = 1.0f / table_[i];
         }
     }
