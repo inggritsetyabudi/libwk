@@ -23,11 +23,11 @@ TEST(QuantizeTest, UsesNaturalMatrixInZigzagOrder) {
 
     // The base table is capped at kMaxBaseQuantValue (q90-anomaly fix,
     // 2026-11-13): steps are min(base, cap), zigzag order unchanged,
-    // then reshaped by the luma quant-table shape (#qtab): the pass-2
-    // table rescaled by the per-position ratio to nominal q75.
+    // then reshaped by the luma quant-table shape (#qtab): the q50
+    // size table rescaled by the per-position ratio to nominal q75.
     const std::array<uint16_t, 64> expected = {{
-        16, 11, 12, 16, 16, 12, 20, 18,
-        17, 18, 22, 21, 20, 23, 30, 50,
+        16, 11, 12, 16, 20, 16, 24, 22,
+        22, 22, 28, 26, 24, 30, 38, 62,
         20, 20, 18, 18, 20, 32, 29, 29,
         23, 32, 32, 32, 32, 32, 32, 32,
         28, 28, 28, 28, 28, 28, 28, 28,
@@ -48,8 +48,8 @@ TEST(QuantizeTest, BitDepthScalingPreservesZigzagMapping) {
     // Capped base (see above) times the 10-bit multiplier 4, then the
     // luma quant-table shape (#qtab) as in the 8-bit test.
     const std::array<uint16_t, 64> expected = {{
-        64, 40, 48, 64, 64, 48, 80, 72,
-        64, 72, 88, 80, 80, 88, 120, 200,
+        64, 40, 48, 64, 80, 64, 96, 88,
+        80, 88, 112, 96, 96, 112, 152, 248,
         80, 80, 72, 72, 80, 128, 112, 112,
         88, 128, 128, 128, 128, 128, 128, 128,
         112, 112, 112, 112, 112, 112, 112, 112,
@@ -65,23 +65,24 @@ TEST(QuantizeTest, BitDepthScalingPreservesZigzagMapping) {
 
 // The low-frequency chroma refinement is opt-in per tile (the encoder only
 // enables it for smooth chroma ramps). Default: the historical steps,
-// reshaped by the chroma quant-table shape (#qtab, pass-2).
+// reshaped by the chroma quant-table shape (#qtab, q50 size table).
 TEST(QuantizeTest, ChromaLowFrequencyRefinementIsOptIn) {
     QuantTable quant;
     quant.build(50.0f, true, 8);
-    EXPECT_EQ(quant.steps()[0], 12);
+    EXPECT_EQ(quant.steps()[0], 14);
     EXPECT_EQ(quant.steps()[1], 14);
 
     quant.build(50.0f, true, 8, true);
-    const uint16_t expected_low[8] = {6, 7, 7, 9, 7, 7, 10, 8};
+    const uint16_t expected_low[8] = {7, 7, 7, 9, 7, 7, 10, 8};
     for (int i = 0; i < 8; ++i) {
         EXPECT_EQ(quant.steps()[i], expected_low[i])
             << "Unexpected refined chroma quant step at zigzag index " << i;
     }
-    // zigzag 8+ unchanged: 21 * 0.74 = 15, and 46 is capped to 40 first
-    // (kMaxBaseQuantValue), so 40 * 0.86 = 34.
-    EXPECT_EQ(quant.steps()[8], 15);
-    EXPECT_EQ(quant.steps()[24], 34);
+    // zigzag 8+ unchanged by refine: built 15 x 8/6 shape ratio = 20,
+    // and built 34 (46 capped to 40 first, kMaxBaseQuantValue, x 0.86)
+    // x 19/15 shape ratio = 43.
+    EXPECT_EQ(quant.steps()[8], 20);
+    EXPECT_EQ(quant.steps()[24], 43);
 
     // q>=90: the refinement never applies, even when requested.
     quant.build(90.0f, true, 8, true);
@@ -89,20 +90,20 @@ TEST(QuantizeTest, ChromaLowFrequencyRefinementIsOptIn) {
     EXPECT_EQ(quant.steps()[1], 1);
 }
 
-// Quant-table shape (#qtab, measured 2026-11-25 by encoder-side coordinate
-// descent at q75, pass 2 with ramp constraints): the luma table is reshaped
-// per zigzag band on top of the nominal table — Y{1..3} x1.08, Y{4..7} and
-// Y{8..15} x1.25, Y{16..31} x0.8, Y{32..63} x0.7; the chroma table is
-// reshaped too — C{1..3} x1.25, C{32..63} x0.8, the rest unchanged.
+// Quant-table shape (#qtab, measured 2026-11-26 by encoder-side coordinate
+// descent at q50, size criterion with ramp constraints): the luma table is
+// reshaped per zigzag band on top of the nominal table — Y{4..7} and
+// Y{8..15} x1.25, the rest unchanged; the chroma table is reshaped too —
+// C DC x1.25, C{8..15}, C{16..31} and C{32..63} x1.25, the rest unchanged.
 // Luma applies as a per-position ratio against the nominal q75 table
 // (variant A); chroma applies as a multiplier on the nominal table at the
 // tile's bit depth, so the q75 table below is reproduced exactly.
-TEST(QuantizeTest, QuantTableShapePass2Q75Luma) {
+TEST(QuantizeTest, QuantTableShapeQ50SizeLuma) {
     QuantTable quant;
     quant.build(75.0f, false, 8);
     const std::array<uint16_t, 64> expected = {{
-        8, 5, 6, 8, 8, 6, 10, 9,
-        8, 9, 11, 10, 10, 11, 15, 25,
+        8, 5, 6, 8, 10, 8, 12, 11,
+        10, 11, 14, 12, 12, 14, 19, 31,
         10, 10, 9, 9, 10, 16, 14, 14,
         11, 16, 16, 16, 16, 16, 16, 16,
         14, 14, 14, 14, 14, 14, 14, 14,
@@ -116,20 +117,20 @@ TEST(QuantizeTest, QuantTableShapePass2Q75Luma) {
     }
 }
 
-// The shape covers chroma too: the q75 chroma table is the pass-2 table,
-// not the nominal one (the pass-1 slice left chroma unchanged).
-TEST(QuantizeTest, QuantTableShapePass2Q75Chroma) {
+// The shape covers chroma too: the q75 chroma table is the q50 size table,
+// not the nominal one.
+TEST(QuantizeTest, QuantTableShapeQ50SizeChroma) {
     QuantTable quant;
     quant.build(75.0f, true, 8);
     const std::array<uint16_t, 64> expected = {{
-        5, 6, 6, 8, 6, 6, 8, 7,
-        6, 8, 11, 9, 8, 9, 11, 12,
-        12, 11, 11, 12, 12, 12, 12, 12,
+        6, 6, 6, 8, 6, 6, 8, 7,
+        8, 10, 14, 11, 10, 11, 14, 15,
+        15, 14, 14, 15, 15, 15, 15, 15,
+        19, 19, 19, 19, 19, 19, 19, 19,
         15, 15, 15, 15, 15, 15, 15, 15,
-        12, 12, 12, 12, 12, 12, 12, 12,
-        12, 12, 12, 12, 12, 12, 12, 12,
-        12, 12, 12, 12, 12, 12, 12, 12,
-        12, 12, 12, 12, 12, 12, 12, 12}};
+        15, 15, 15, 15, 15, 15, 15, 15,
+        15, 15, 15, 15, 15, 15, 15, 15,
+        15, 15, 15, 15, 15, 15, 15, 15}};
     const auto& steps = quant.steps();
     for (int i = 0; i < 64; ++i) {
         EXPECT_EQ(steps[i], expected[i])
@@ -137,14 +138,14 @@ TEST(QuantizeTest, QuantTableShapePass2Q75Chroma) {
     }
 }
 
-// The 10-bit q75 luma table is the pass-2 table times the 10-bit
+// The 10-bit q75 luma table is the q50 size table times the 10-bit
 // multiplier 4, exactly (#qtab scales the fit to the bit depth).
-TEST(QuantizeTest, QuantTableShapePass2Q75Luma10Bit) {
+TEST(QuantizeTest, QuantTableShapeQ50SizeLuma10Bit) {
     QuantTable quant;
     quant.build(75.0f, false, 10);
     const std::array<uint16_t, 64> expected = {{
-        32, 20, 24, 32, 32, 24, 40, 36,
-        32, 36, 44, 40, 40, 44, 60, 100,
+        32, 20, 24, 32, 40, 32, 48, 44,
+        40, 44, 56, 48, 48, 56, 76, 124,
         40, 40, 36, 36, 40, 64, 56, 56,
         44, 64, 64, 64, 64, 64, 64, 64,
         56, 56, 56, 56, 56, 56, 56, 56,
@@ -158,22 +159,22 @@ TEST(QuantizeTest, QuantTableShapePass2Q75Luma10Bit) {
     }
 }
 
-// The 10-bit q75 chroma table is NOT the pass-2 table times 4: the
+// The 10-bit q75 chroma table is NOT the q50 size table times 4: the
 // nominal chroma table does not scale by exactly 4 (truncation), so the
 // chroma multiplier is applied on the nominal 10-bit table instead.
-// E.g. zigzag 0: lround(20 * 5/5) = 21, not 5 * 4 = 20.
-TEST(QuantizeTest, QuantTableShapePass2Q75Chroma10Bit) {
+// E.g. zigzag 0: lround(21 * 6/5) = 25, not 6 * 4 = 24.
+TEST(QuantizeTest, QuantTableShapeQ50SizeChroma10Bit) {
     QuantTable quant;
     quant.build(75.0f, true, 10);
     const std::array<uint16_t, 64> expected = {{
-        21, 25, 25, 33, 24, 25, 35, 28,
-        26, 33, 46, 38, 33, 38, 46, 51,
-        51, 46, 46, 51, 51, 51, 51, 51,
+        25, 25, 25, 33, 24, 25, 35, 28,
+        35, 41, 59, 46, 41, 46, 59, 64,
+        64, 59, 59, 64, 64, 64, 64, 64,
+        76, 76, 76, 76, 76, 76, 76, 76,
         60, 60, 60, 60, 60, 60, 60, 60,
-        48, 48, 48, 48, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48,
-        48, 48, 48, 48, 48, 48, 48, 48}};
+        60, 60, 60, 60, 60, 60, 60, 60,
+        60, 60, 60, 60, 60, 60, 60, 60,
+        60, 60, 60, 60, 60, 60, 60, 60}};
     const auto& steps = quant.steps();
     for (int i = 0; i < 64; ++i) {
         EXPECT_EQ(steps[i], expected[i])
@@ -182,16 +183,16 @@ TEST(QuantizeTest, QuantTableShapePass2Q75Chroma10Bit) {
 }
 
 // A quality-adapted tile (ember's tile builds at q~77.7) must reproduce
-// the measured pass-2 tile table exactly. This is what separates the
+// the measured q50 size tile table exactly. This is what separates the
 // #qtab ratio mechanism from plain band multipliers: at zigzag 4, 8
-// the multipliers round to 6, the measured table has 7.
-TEST(QuantizeTest, QuantTableShapeAdaptedQualityReproducesPass2Tile) {
+// the multipliers round to 6, the measured table has 8.
+TEST(QuantizeTest, QuantTableShapeAdaptedQualityReproducesQ50SizeTile) {
     QuantTable quant;
     quant.build(77.7f, false, 8);
 
     const std::array<uint16_t, 64> expected = {{
-        7, 4, 5, 7, 7, 5, 9, 8,
-        7, 8, 10, 9, 9, 10, 13, 21,
+        7, 4, 5, 7, 8, 6, 11, 9,
+        8, 9, 12, 11, 11, 12, 16, 26,
         8, 8, 7, 7, 8, 14, 12, 12,
         9, 14, 14, 14, 14, 14, 14, 14,
         12, 12, 12, 12, 12, 12, 12, 12,
@@ -207,23 +208,22 @@ TEST(QuantizeTest, QuantTableShapeAdaptedQualityReproducesPass2Tile) {
 }
 
 // Same adapted-quality check for chroma: ember's tile builds its chroma
-// table at q~81.8 (interval 81.78-81.90 reproduces the measured table;
-// the diag's printed chroma_q=86.11 is derived from the DC step, not
-// the build quality). The multiplier semantics must reproduce the
-// measured pass-2 chroma tile table exactly.
-TEST(QuantizeTest, QuantTableShapeAdaptedQualityReproducesPass2ChromaTile) {
+// table at q~81.8. The multiplier semantics must reproduce the measured
+// q50 size chroma tile table exactly: at zigzag 1, 2 the multipliers
+// round to 3, the measured table has 4.
+TEST(QuantizeTest, QuantTableShapeAdaptedQualityReproducesQ50SizeChromaTile) {
     QuantTable quant;
     quant.build(81.8f, true, 8);
 
     const std::array<uint16_t, 64> expected = {{
-        3, 4, 4, 5, 4, 4, 6, 5,
-        4, 6, 8, 6, 6, 6, 8, 9,
-        9, 8, 8, 9, 9, 9, 9, 9,
+        4, 4, 4, 5, 4, 4, 6, 5,
+        5, 8, 10, 7, 8, 7, 10, 11,
+        11, 10, 10, 11, 11, 11, 11, 11,
+        14, 14, 14, 14, 14, 14, 14, 14,
         11, 11, 11, 11, 11, 11, 11, 11,
-        9, 9, 9, 9, 9, 9, 9, 9,
-        9, 9, 9, 9, 9, 9, 9, 9,
-        9, 9, 9, 9, 9, 9, 9, 9,
-        9, 9, 9, 9, 9, 9, 9, 9}};
+        11, 11, 11, 11, 11, 11, 11, 11,
+        11, 11, 11, 11, 11, 11, 11, 11,
+        11, 11, 11, 11, 11, 11, 11, 11}};
     const auto& steps = quant.steps();
     for (int i = 0; i < 64; ++i) {
         EXPECT_EQ(steps[i], expected[i])

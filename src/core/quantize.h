@@ -63,20 +63,21 @@ class QuantTable {
 public:
     QuantTable() = default;
 
-    // Luma + chroma quant-table shape (#qtab): the pass-2 table from the
-    // 2026-11-25 encoder-side coordinate descent at q75, pass 2 with ramp
-    // constraints. Luma applies as a per-position ratio against the
-    // nominal q75 luma table:
+    // Luma + chroma quant-table shape (#qtab): the q50 size table from
+    // the 2026-11-26 encoder-side coordinate descent at q50 (size
+    // criterion, ramp constraints), replacing the pass-2 table of
+    // 2026-11-25. Band multipliers over zigzag bands [DC, 1-3, 4-7,
+    // 8-15, 16-31, 32-63]: Y [1.00; 1.00; 1.25; 1.25; 1.00; 1.00],
+    // C [1.25; 1.00; 1.00; 1.25; 1.25; 1.25]. Luma applies as a
+    // per-position ratio against the nominal q75 luma table:
     //   new[i] = lround(pass2[i] * built[i] / nominal75[i])
     // where built[i] is the unshaped step at the tile's (possibly
     // adapted) quality. This is the measured table rescaled per tile
     // by the same quality adaptation that built the nominal table.
-    // Why ratios, not the band multipliers (Y{1..3} x1.08, Y{4..7} and
-    // Y{8..15} x1.25, Y{16..31} x0.8, Y{32..63} x0.7) the descent
-    // searched over: applying the multipliers directly rounds
-    // differently on quality-adapted tiles (ember tile at q~77.7:
-    // zigzag 4/8 give 6, the measured table gives 7) and costs
-    // +1,109 B on the q75 corpus for the pass-1 table. The ratios
+    // Why ratios, not the band multipliers the descent searched
+    // over: applying the multipliers directly rounds differently on
+    // quality-adapted tiles and costs bytes on the q75 corpus for
+    // the pass-1 table (+1,109 B, measured 2026-11-25). The ratios
     // reproduce the measured q75 table exactly, on every tile.
     // Chroma applies as a multiplier on the nominal table at the
     // tile's bit depth, NOT as a ratio against the q75 table scaled
@@ -88,13 +89,13 @@ public:
     // 12-bit (measured 2026-11-25: the pass-1 12-bit gradient SSIM
     // read 0.98991 instead of the true 0.98831). The fit is scaled
     // to the current bit depth through built[i], so the q75 table is
-    // the pass-2 table at every depth. The alpha plane uses the
+    // the shape table at every depth. The alpha plane uses the
     // unshaped luma table (apply_quant_shape = false at its call
     // site): its steps were not part of the measurement, so they stay
     // exactly as before.
     static constexpr std::array<uint16_t, 64> kQuantPass2Luma = {{
-        8, 5, 6, 8, 8, 6, 10, 9,
-        8, 9, 11, 10, 10, 11, 15, 25,
+        8, 5, 6, 8, 10, 8, 12, 11,
+        10, 11, 14, 12, 12, 14, 19, 31,
         10, 10, 9, 9, 10, 16, 14, 14,
         11, 16, 16, 16, 16, 16, 16, 16,
         14, 14, 14, 14, 14, 14, 14, 14,
@@ -103,14 +104,14 @@ public:
         14, 14, 14, 14, 14, 14, 14, 14}};
 
     static constexpr std::array<uint16_t, 64> kQuantPass2Chroma = {{
-        5, 6, 6, 8, 6, 6, 8, 7,
-        6, 8, 11, 9, 8, 9, 11, 12,
-        12, 11, 11, 12, 12, 12, 12, 12,
+        6, 6, 6, 8, 6, 6, 8, 7,
+        8, 10, 14, 11, 10, 11, 14, 15,
+        15, 14, 14, 15, 15, 15, 15, 15,
+        19, 19, 19, 19, 19, 19, 19, 19,
         15, 15, 15, 15, 15, 15, 15, 15,
-        12, 12, 12, 12, 12, 12, 12, 12,
-        12, 12, 12, 12, 12, 12, 12, 12,
-        12, 12, 12, 12, 12, 12, 12, 12,
-        12, 12, 12, 12, 12, 12, 12, 12}};
+        15, 15, 15, 15, 15, 15, 15, 15,
+        15, 15, 15, 15, 15, 15, 15, 15,
+        15, 15, 15, 15, 15, 15, 15, 15}};
 
     // Nominal chroma table at q75, 8-bit (the divisor for the chroma
     // multiplier above). Verified against build(75, true, 8) with the
