@@ -204,6 +204,15 @@ void print_usage() {
         << "  --import-prov FILE      Embed a C2PA manifest (PROV chunk)\n"
         << "  --no-quality-score      Do not write RATING.QUALITY_SCORE into META\n"
         << "  --metrics               Decode the output and report PSNR/SSIM vs the source\n"
+        << "Animation (Fase 9 Slice 3):\n"
+        << "  wkenc [options] <frame1> <frame2> ... <output.wk>\n"
+        << "                          Encode an animation (3+ positional arguments: all but the\n"
+        << "                          last are frames, the last is the output). All frames must\n"
+        << "                          share the first frame's dimensions and bit depth; frames\n"
+        << "                          are full-canvas, OVER blend, keep disposal.\n"
+        << "  --loop N                Loop count, 0 = infinite (default: 0)\n"
+        << "  --delay-ms N            Frame delay in ms, same for all frames (default: 100)\n"
+        << "  --background RRGGBBAA   Canvas background as 8 hex digits (default: 00000000)\n"
         << "  -v, --verbose           Show debug logs (per-step detail)\n"
         << "  -q, --quiet             Only warnings and errors\n"
         << "  --color                 Force colored log output\n"
@@ -280,8 +289,165 @@ void print_coeff_stats(const wk::EncodeStats& stats) {
 }
 
 
+// Animation CLI path (Fase 9 Slice 3): load the frame files, build
+// config.animation (full-canvas frames, OVER blend, keep disposal,
+// uniform delay), encode, and write the .wk. All frames must share
+// the first frame's dimensions and bit depth. #anim #fase9
+int encode_animation_cli(const std::vector<std::string>& frame_paths,
+                         const std::string& output_path, wk::EncoderConfig config,
+                         uint16_t loop_count, uint16_t delay_ms, uint32_t background_rgba,
+                         bool metrics, bool tile_stats, const std::string& exif_source_path,
+                         const std::string& icc_source_path, const std::string& prov_source_path,
+                         std::optional<uint8_t> bit_depth_flag, std::optional<wk::CICP> cicp_flag) {
+    if (tile_stats) {
+        wk::tool::log_warn("tile stats are not supported for animation; ignoring --tile-stats");
+    }
+
+    std::vector<wk::Image> frames;
+    for (const auto& path : frame_paths) {
+        auto image = wk::io::load_image_file(path);
+        if (!image) {
+            wk::tool::log_error("failed to load frame image: " + image.error().message);
+            return 1;
+        }
+        wk::tool::log_info("loaded frame " + path + " (" + std::to_string(image->width()) + "x" +
+                           std::to_string(image->height()) + ", " +
+                           (image->has_alpha() ? "RGBA" : "RGB") + ")");
+        frames.push_back(std::move(*image));
+    }
+
+    const wk::Image& first = frames[0];
+    for (size_t k = 1; k < frames.size(); ++k) {
+        if (frames[k].width() != first.width() || frames[k].height() != first.height()) {
+            wk::tool::log_error("all animation frames must share the first frame's dimensions");
+            return 1;
+        }
+        if (frames[k].bit_depth() != first.bit_depth()) {
+            wk::tool::log_error("all animation frames must share the first frame's bit depth");
+            return 1;
+        }
+    }
+
+    // Bit depth comes from the first frame unless --bit-depth says
+    // otherwise; a flag that disagrees with the input is an error,
+    // not an upscale (the encoder reads samples at the config's
+    // depth, so a mismatch would misread the pixels).
+    if (bit_depth_flag.has_value()) {
+        const auto flag_depth = *bit_depth_flag == 10 ? wk::BitDepth::Bits10 : wk::BitDepth::Bits8;
+        if (flag_depth != first.bit_depth()) {
+            wk::tool::log_error("--bit-depth " + std::to_string(*bit_depth_flag) +
+                                " does not match the frame images' bit depth (" +
+                                std::to_string(static_cast<unsigned>(first.bit_depth())) + ")");
+            return 1;
+        }
+        config.bit_depth = flag_depth;
+    } else {
+        config.bit_depth = first.bit_depth();
+    }
+    if (cicp_flag.has_value()) {
+        config.cicp = *cicp_flag;
+    } else {
+        config.cicp = first.info().cicp;
+    }
+    if (!icc_source_path.empty()) {
+        auto icc_bytes = wk::tool::read_file_bytes(icc_source_path);
+        if (!icc_bytes) {
+            wk::tool::log_error("failed to read ICC profile: " + icc_bytes.error().message);
+            return 1;
+        }
+        config.icc_profile = std::move(*icc_bytes);
+    }
+    if (!prov_source_path.empty()) {
+        auto prov_bytes = wk::tool::read_file_bytes(prov_source_path);
+        if (!prov_bytes) {
+            wk::tool::log_error("failed to read provenance manifest: " + prov_bytes.error().message);
+            return 1;
+        }
+        config.c2pa_manifest = std::move(*prov_bytes);
+    }
+
+    // Copy the first frame before the move loop below: the frames are
+    // moved into config.animation there, so afterwards only a copy
+    // still has pixels (for --metrics, which compares frame 0).
+    const wk::Image first_copy = first;
+    const uint32_t first_w = first.width();
+    const uint32_t first_h = first.height();
+
+    for (auto& image : frames) {
+        wk::AnimFrameInput frame;
+        frame.image = std::move(image);
+        frame.delay_ms = delay_ms;
+        frame.blend_mode = 0;  // OVER
+        frame.disposal = 0;    // keep
+        frame.rect_x = 0;
+        frame.rect_y = 0;
+        config.animation.frames.push_back(std::move(frame));
+    }
+    config.animation.loop_count = loop_count;
+    config.animation.background_rgba = background_rgba;
+
+    wk::tool::log_debug(std::string("encoding animation: ") + std::to_string(frames.size()) +
+                        " frames, " + (config.lossless ? "lossless" : "lossy") +
+                        (config.lossless ? "" : " q" + std::to_string(static_cast<int>(config.quality))) +
+                        ", loop " + std::to_string(loop_count) +
+                        ", delay " + std::to_string(delay_ms) + " ms");
+
+    auto encoded = wk::encode_animation(config);
+    if (!encoded) {
+        wk::tool::log_error("encode failed: " + encoded.error().message);
+        return 1;
+    }
+    std::vector<uint8_t> output_bytes = std::move(*encoded);
+    wk::tool::log_debug("encoded to " + std::to_string(output_bytes.size()) + " B in memory");
+
+    if (!exif_source_path.empty()) {
+        auto with_exif = apply_exif_metadata(output_bytes, exif_source_path);
+        if (!with_exif) {
+            wk::tool::log_error("EXIF import failed: " + with_exif.error().message);
+            return 1;
+        }
+        output_bytes = std::move(*with_exif);
+    }
+
+    std::ofstream output(output_path, std::ios::binary);
+    if (!output) {
+        wk::tool::log_error("failed to open output file " + output_path);
+        return 1;
+    }
+    output.write(reinterpret_cast<const char*>(output_bytes.data()), static_cast<std::streamsize>(output_bytes.size()));
+    if (!output) {
+        wk::tool::log_error("failed to write output file " + output_path);
+        return 1;
+    }
+
+    wk::tool::log_ok("encoded " + std::to_string(config.animation.frames.size()) + " frames -> " +
+                     output_path + " (" + std::to_string(first_w) + "x" +
+                     std::to_string(first_h) + ", " +
+                     (config.lossless ? "lossless" : "lossy") + ", " +
+                     std::to_string(output_bytes.size()) + " B)");
+
+    if (metrics) {
+        // decode() returns frame 0 of an animated file, so metrics
+        // compare the first frame only.
+        auto decoded = wk::decode(output_bytes);
+        if (!decoded) {
+            wk::tool::log_warn("metrics skipped: could not decode output: " + decoded.error().message);
+            return 0;
+        }
+        auto m = wk::metrics::compare_images(first_copy, *decoded);
+        if (!m) {
+            wk::tool::log_warn("metrics skipped: compare failed: " + m.error().message);
+            return 0;
+        }
+        wk::tool::log_info("metrics (frame 0): PSNR " + wk::tool::color_psnr(m->psnr, wk::tool::log_color_enabled()) +
+                           " dB, SSIM " + wk::tool::color_ssim(m->ssim, wk::tool::log_color_enabled()));
+    }
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     wk::EncoderConfig config;
+    std::vector<std::string> positional;
     std::string input_path;
     std::string output_path;
     std::string exif_source_path;
@@ -292,6 +458,11 @@ int main(int argc, char* argv[]) {
     bool tile_stats = false;
     bool coeff_stats = false;
     bool metrics = false;
+    // Animation flags (Fase 9 Slice 3): uniform delay for all frames,
+    // loop count, and the canvas background. #anim #fase9
+    uint16_t anim_loop_count = 0;
+    uint16_t anim_delay_ms = 100;
+    uint32_t anim_background_rgba = 0x00000000u;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -483,6 +654,52 @@ int main(int argc, char* argv[]) {
             config.write_quality_score = false;
         } else if (arg == "--metrics") {
             metrics = true;
+        } else if (arg == "--loop") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --loop requires a value\n";
+                return 1;
+            }
+            uint32_t value = 0;
+            try {
+                value = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } catch (...) {
+                std::cerr << "Error: invalid loop count\n";
+                return 1;
+            }
+            if (value > 65535) {
+                std::cerr << "Error: --loop must be 0..65535 (0 = infinite)\n";
+                return 1;
+            }
+            anim_loop_count = static_cast<uint16_t>(value);
+        } else if (arg == "--delay-ms") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --delay-ms requires a value\n";
+                return 1;
+            }
+            uint32_t value = 0;
+            try {
+                value = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } catch (...) {
+                std::cerr << "Error: invalid delay\n";
+                return 1;
+            }
+            if (value > 65535) {
+                std::cerr << "Error: --delay-ms must be 0..65535\n";
+                return 1;
+            }
+            anim_delay_ms = static_cast<uint16_t>(value);
+        } else if (arg == "--background") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --background requires a value\n";
+                return 1;
+            }
+            const std::string text = argv[++i];
+            if (text.size() != 8 ||
+                text.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+                std::cerr << "Error: --background expects 8 hex digits RRGGBBAA, e.g. 00000000\n";
+                return 1;
+            }
+            anim_background_rgba = static_cast<uint32_t>(std::stoul(text, nullptr, 16));
         } else if (arg == "-v" || arg == "--verbose") {
             wk::tool::set_log_level(wk::tool::LogLevel::Debug);
         } else if (arg == "-q" || arg == "--quiet") {
@@ -501,22 +718,32 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: unknown option " << arg << '\n';
             print_usage();
             return 1;
-        } else if (input_path.empty()) {
-            input_path = arg;
-        } else if (output_path.empty()) {
-            output_path = arg;
         } else {
-            std::cerr << "Error: unexpected extra argument " << arg << '\n';
-            return 1;
+            positional.push_back(arg);
         }
     }
 
-    if (input_path.empty()) {
+    if (positional.empty()) {
         print_usage();
         return 1;
     }
-    if (output_path.empty()) {
-        output_path = default_output_path(input_path);
+    // Three or more positionals mean animation: all but the last are
+    // frames, the last is the output. One or two positionals stay the
+    // still-image form (input, optional output). #anim #fase9
+    const bool animation_mode = positional.size() >= 3;
+    if (animation_mode) {
+        output_path = positional.back();
+        positional.pop_back();
+    } else {
+        input_path = positional[0];
+        output_path = positional.size() == 2 ? positional[1] : default_output_path(input_path);
+    }
+
+    if (animation_mode) {
+        return encode_animation_cli(positional, output_path, config, anim_loop_count,
+                                    anim_delay_ms, anim_background_rgba, metrics,
+                                    tile_stats, exif_source_path, icc_source_path,
+                                    prov_source_path, bit_depth_flag, cicp_flag);
     }
 
     auto image = wk::io::load_image_file(input_path);

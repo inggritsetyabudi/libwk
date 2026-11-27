@@ -155,6 +155,31 @@ namespace wk
         std::vector<uint8_t> pixels_;
     };
 
+    // One animation frame (SPEC Section 4): the frame's own pixels
+    // (its rectangle), composited onto the canvas at (rect_x, rect_y)
+    // per blend_mode, then disposed per disposal. rect_w/rect_h are the
+    // image's dimensions; frame 0 defines the canvas and must sit at
+    // the origin. #anim #fase9
+    struct AnimFrameInput
+    {
+        Image image;
+        uint16_t delay_ms = 100;
+        uint8_t blend_mode = 0;  // 0=OVER, 1=SOURCE
+        uint8_t disposal = 0;    // 0=keep, 1=restore-bg
+        uint16_t rect_x = 0;
+        uint16_t rect_y = 0;
+    };
+
+    // Animation-level settings (SPEC Section 4): loop_count 0 means
+    // infinite; background_rgba is 0xRRGGBBAA, the canvas fill before
+    // frame 0 and the restore-bg target. #anim #fase9
+    struct AnimationConfig
+    {
+        std::vector<AnimFrameInput> frames;
+        uint16_t loop_count = 0;
+        uint32_t background_rgba = 0x00000000u;
+    };
+
     struct EncoderConfig
     {
         float quality = 75.0f;
@@ -238,6 +263,10 @@ namespace wk
         // SSIMULACRA2-targeted mode exists yet (the wkenc flag was
         // removed rather than advertise a no-op).
         float target_ssimulacra2 = 0.0f;
+        // Animation input (Fase 9 Slice 3): when frames is non-empty,
+        // encode_animation() writes an animated file (SPEC Section 4)
+        // instead of a still. Ignored by encode(). #anim #fase9
+        AnimationConfig animation;
     };
 
     [[nodiscard]] Result<std::vector<uint8_t>> encode(const Image &image, const EncoderConfig &config = {});
@@ -285,6 +314,21 @@ namespace wk
     // payloads per tile, so use it for diagnostics, not production.
     [[nodiscard]] Result<std::vector<uint8_t>> encode_with_stats(
         const Image &image, const EncoderConfig &config, EncodeStats &stats);
+
+    // Encodes an animation (SPEC Section 4) from config.animation:
+    // frame 0 defines the canvas, later frames may be sub-rectangles.
+    // v1 has no inter-frame reference: every frame's tiles are encoded
+    // independently, exactly as if the frame's rectangle were a still
+    // (a lossy frame decodes pixel-identically to that still), and a
+    // lossless frame always uses per-tile encoding (never the
+    // whole-frame palette tile), so each frame owns exactly its
+    // rectangle's tile grid. Frames must share the canvas bit depth
+    // and alpha; a lossless frame whose rectangle is a single tile at
+    // (0, 0) is rejected, because the decoder reads such a tile as
+    // the whole frame (SPEC 4.4). Empty frames, or an empty
+    // config.animation, -> InvalidParameter.
+    // #anim #fase9
+    [[nodiscard]] Result<std::vector<uint8_t>> encode_animation(const EncoderConfig &config);
 
     struct DecoderConfig
     {
