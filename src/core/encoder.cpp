@@ -121,6 +121,375 @@ static std::vector<uint8_t> expand_rgb8_to_rgba8(const Image& image) {
 // five, with ~2-3x margin on each.
 
 
+// One image's TILE chunks: a still's whole frame, or one animation
+// frame's rectangle. tile_x0/tile_y0 are the image's origin in canvas
+// tiles; the chunks carry absolute canvas coordinates, while the tile
+// payloads are encoded from the image's own pixels exactly as if the
+// image were a still (so a lossy animation frame decodes
+// pixel-identically to that still). When allow_single_tile_at_origin
+// is false, a single TILE at (0, 0) is rejected: the decoder reads it
+// as the whole frame (SPEC 4.4), so a sub-rectangle frame must never
+// produce one. When allow_palette is false (animation frames), the
+// lossless whole-frame palette tile is never used: every frame owns
+// exactly its rectangle's tile grid, so the container shape is uniform
+// and predictable. #anim #fase9
+struct FrameTiles {
+    std::vector<Chunk> chunks;
+    float avg_quality_score = 0.0f;  // lossy mean per-tile score; 0 when lossless
+};
+
+static Result<FrameTiles> encode_image_tiles(
+    const Image& image, const EncoderConfig& config, uint8_t tile_size_log2,
+    uint32_t tile_x0, uint32_t tile_y0, bool allow_single_tile_at_origin,
+    bool allow_palette, EncodeStats* stats = nullptr) {
+    const uint32_t width = image.width();
+    const uint32_t height = image.height();
+
+    if (width == 0 || height == 0) {
+        return std::unexpected(Error{ErrorCode::InvalidParameter, "zero dimensions"});
+    }
+
+    // The config bit depth is the claim about the pixel data's sample
+    // size (rgb_to_ycbcr reads uint16 samples above 8-bit): a
+    // mismatch would read the buffer at the wrong stride, past its
+    // end. The C API validates this too; the C++ entry point must
+    // not trust the caller either.
+    if (config.bit_depth != image.bit_depth()) {
+        return std::unexpected(Error{ErrorCode::InvalidParameter,
+            "config bit depth does not match image bit depth"});
+    }
+
+    const uint32_t tile_size = 1u << tile_size_log2;
+    const uint32_t tiles_x = (width + tile_size - 1) / tile_size;
+    const uint32_t tiles_y = (height + tile_size - 1) / tile_size;
+    const bool source_has_alpha = image.has_alpha();
+    const uint8_t bit_depth = static_cast<uint8_t>(config.bit_depth);
+
+    FrameTiles out;
+
+    if (config.lossless) {
+        if (bit_depth != 8) {
+            return std::unexpected(Error{ErrorCode::UnsupportedFeature,
+                "lossless currently only supports 8-bit"});
+        }
+
+        std::vector<uint8_t> expanded_rgb;
+        const uint8_t* lossless_pixels = image.pixels().data();
+        if (!source_has_alpha && config.bit_depth == BitDepth::Bits8) {
+            expanded_rgb = expand_rgb8_to_rgba8(image);
+            lossless_pixels = expanded_rgb.data();
+        }
+
+        // Per-tile lossless (v0.2.8): the predictor path is split into
+        // tiles, each encoded independently via lossless_encode (which
+        // picks palette-vs-predictor per tile, so a tile that fits a
+        // palette uses it). The whole-image palette is compared
+        // against the per-tile total instead: a palette image keeps
+        // its single whole-image tile when that is smaller.
+        // Per-tile container overhead: 9 B chunk framing + 9 B tile
+        // header per TILE chunk; counted in the comparison so the
+        // choice is by true file size.
+        constexpr size_t kPerTileOverhead = 18;
+
+        auto palette_payload =
+            lossless_encode_palette(lossless_pixels, width, height);
+
+        std::vector<std::vector<uint8_t>> tile_payloads;
+        tile_payloads.reserve(static_cast<size_t>(tiles_x) * tiles_y);
+        size_t per_tile_total = 0;
+        for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+            for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+                const uint32_t tw = std::min(tile_size, width - tx * tile_size);
+                const uint32_t th = std::min(tile_size, height - ty * tile_size);
+                std::vector<uint8_t> tile_rgba(
+                    static_cast<size_t>(tw) * th * 4);
+                for (uint32_t y = 0; y < th; ++y) {
+                    std::memcpy(tile_rgba.data() + static_cast<size_t>(y) * tw * 4,
+                                lossless_pixels +
+                                    (static_cast<size_t>(ty * tile_size + y) * width +
+                                     tx * tile_size) * 4,
+                                static_cast<size_t>(tw) * 4);
+                }
+                auto encoded_tile = lossless_encode(tile_rgba.data(), tw, th,
+                                                    bit_depth);
+                if (!encoded_tile) return std::unexpected(encoded_tile.error());
+                per_tile_total += encoded_tile->size() + kPerTileOverhead;
+                tile_payloads.push_back(std::move(*encoded_tile));
+            }
+        }
+
+        // The palette wins ties (same rule as the whole-image choice
+        // before 0.2.8). A palette payload is flags(1) + pred_mode(1)
+        // + inner payload, in one tile. A palette tile lands at the
+        // frame's origin tile: when that is the canvas (0, 0) and the
+        // rectangle is not the full canvas, the decoder reads the
+        // single tile as the whole frame (SPEC 4.4), so the palette
+        // form is not usable there -- per-tile wins by default.
+        // Animation frames never use the palette form at all (see
+        // encode_image_tiles): their tile grid is always explicit.
+        const bool use_palette =
+            allow_palette && palette_payload.has_value() &&
+            (palette_payload->size() + 2 + kPerTileOverhead) <= per_tile_total &&
+            (allow_single_tile_at_origin || tile_x0 != 0 || tile_y0 != 0);
+
+        if (use_palette) {
+            Chunk tile_chunk;
+            std::memcpy(tile_chunk.type, CHUNK_TILE, 4);
+
+            TileHeader th;
+            th.tile_x = static_cast<uint16_t>(tile_x0);
+            th.tile_y = static_cast<uint16_t>(tile_y0);
+            th.layer_flags = TILE_HAS_BASE;
+            th.compressed_size =
+                static_cast<uint32_t>(palette_payload->size() + 2);
+
+            ByteWriter tw;
+            auto th_data = serialize_tile_header(th);
+            tw.write_bytes(th_data);
+            tw.write_u8(kLosslessTransformFlagPalette);
+            // The predictor mode is ignored on the palette path; SELECT
+            // is a valid value that keeps the byte well-formed.
+            tw.write_u8(static_cast<uint8_t>(LosslessPred::SELECT));
+            tw.write_bytes(*palette_payload);
+            tile_chunk.payload = tw.finish();
+
+            out.chunks.push_back(std::move(tile_chunk));
+        } else {
+            size_t tile_index = 0;
+            for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+                for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+                    Chunk tile_chunk;
+                    std::memcpy(tile_chunk.type, CHUNK_TILE, 4);
+
+                    TileHeader th;
+                    th.tile_x = static_cast<uint16_t>(tx + tile_x0);
+                    th.tile_y = static_cast<uint16_t>(ty + tile_y0);
+                    th.layer_flags = TILE_HAS_BASE;
+                    th.compressed_size = static_cast<uint32_t>(
+                        tile_payloads[tile_index].size());
+
+                    ByteWriter tw;
+                    auto th_data = serialize_tile_header(th);
+                    tw.write_bytes(th_data);
+                    tw.write_bytes(tile_payloads[tile_index]);
+                    tile_chunk.payload = tw.finish();
+
+                    out.chunks.push_back(std::move(tile_chunk));
+                    ++tile_index;
+                }
+            }
+        }
+
+        // SPEC Section 4.4: one TILE at (0, 0) is always read as the
+        // whole frame, so a sub-rectangle frame must never produce
+        // exactly that (a single-tile rectangle at the origin).
+        if (!allow_single_tile_at_origin && out.chunks.size() == 1 &&
+            tile_x0 == 0 && tile_y0 == 0) {
+            return std::unexpected(Error{ErrorCode::InvalidParameter,
+                "lossless single-tile sub-rectangle frame at (0, 0) would be read as the whole frame"});
+        }
+    } else {
+        size_t pixel_count = static_cast<size_t>(width) * height;
+
+        std::vector<int16_t> y_plane(pixel_count);
+        std::vector<int16_t> cb_plane_full(pixel_count);
+        std::vector<int16_t> cr_plane_full(pixel_count);
+
+        rgb_to_ycbcr(y_plane.data(), cb_plane_full.data(), cr_plane_full.data(),
+                      image.pixels().data(), width, height,
+                      config.cicp.matrix, bit_depth, config.cicp.full_range,
+                      source_has_alpha);
+
+        // Full-resolution chroma for the control-field classification:
+        // the tile planes handed to encode_lossy_tile below are at the
+        // tile's subsampling resolution (half-res for a 420 tile), but
+        // the classifier was measured on full-res chroma. Saved here,
+        // before the moves below: the buffers move into cb_plane /
+        // cr_plane (444 case) or stay put (420 case), but the
+        // allocation outlives the tile futures either way.
+        const int16_t* classify_cb_plane = cb_plane_full.data();
+        const int16_t* classify_cr_plane = cr_plane_full.data();
+
+        std::vector<int16_t> cb_plane;
+        std::vector<int16_t> cr_plane;
+        std::vector<int16_t> alpha_plane;
+        if (source_has_alpha) {
+            alpha_plane.resize(pixel_count);
+            if (bit_depth == 8) {
+                const auto pixels = image.pixels();
+                for (size_t i = 0; i < pixel_count; ++i) {
+                    alpha_plane[i] = pixels[i * 4 + 3];
+                }
+            } else {
+                const uint16_t* pixels = reinterpret_cast<const uint16_t*>(image.pixels().data());
+                for (size_t i = 0; i < pixel_count; ++i) {
+                    alpha_plane[i] = static_cast<int16_t>(pixels[i * 4 + 3]);
+                }
+            }
+        }
+
+        // YUV420 is undecodable when the first tile is 8x8 or smaller:
+        // the decoder infers subsampling from the first tile's chroma
+        // block counts, and at <=8px the 4:4:4 and 4:2:0 counts coincide,
+        // so it defaults to 4:4:4 and decodes the chroma wrong. FHDR
+        // carries no subsampling field, so for tiny images fall back to
+        // 4:4:4 instead of writing a file no decoder can read correctly.
+        // Normal-size images are unaffected.
+        const bool use_yuv420 =
+            config.subsampling == Subsampling::YUV420 && (width > 8 || height > 8);
+
+        // Adaptive subsampling applies only when the image is not
+        // already image-wide 420 (then every tile is 420 by definition).
+        const bool use_adaptive_chroma =
+            config.adaptive_chroma_subsampling && config.subsampling == Subsampling::YUV444;
+
+        // The 420 planes are built image-wide (identical to the
+        // image-wide 420 path) so a 420 tile's chroma matches what
+        // --yuv420 would have written for that region.
+        std::vector<int16_t> cb_plane_420, cr_plane_420;
+        if (use_yuv420 || use_adaptive_chroma) {
+            const uint32_t chroma_w = (width + 1) / 2;
+            const uint32_t chroma_h = (height + 1) / 2;
+            cb_plane_420.resize(chroma_w * chroma_h);
+            cr_plane_420.resize(chroma_w * chroma_h);
+            subsample_420(cb_plane_full.data(), cb_plane_420.data(), width, height);
+            subsample_420(cr_plane_full.data(), cr_plane_420.data(), width, height);
+        }
+
+        if (use_yuv420) {
+            cb_plane = std::move(cb_plane_420);
+            cr_plane = std::move(cr_plane_420);
+        } else {
+            cb_plane = std::move(cb_plane_full);
+            cr_plane = std::move(cr_plane_full);
+        }
+
+        uint32_t num_tx = tiles_x;
+        uint32_t num_ty = tiles_y;
+
+        // Skin false-positive pre-pass (#skin-fp): the W+C3 rule needs
+        // the Skin components of the whole frame, so the frame is
+        // classified once here and a per-block drop mask is handed to
+        // the tiles. The mask only refines which Skin blocks get the
+        // 0.5 scale; the per-tile field stays the authority for what
+        // counts as Skin. Runs only when the flag is on.
+        std::vector<uint8_t> skin_drop_mask;
+        if (config.use_control_field) {
+            const std::vector<BlockControl> frame_field = analyze_control_field(
+                y_plane.data(), width, height,
+                classify_cb_plane, classify_cr_plane, bit_depth);
+            skin_drop_mask = skin_false_positive_mask(
+                frame_field, (width + 7) / 8, (height + 7) / 8);
+        }
+
+        ThreadPool pool(config.threads);
+        std::vector<std::future<Result<TileEncodeResult>>> futures;
+
+        for (uint32_t ty = 0; ty < num_ty; ty++) {
+            for (uint32_t tx = 0; tx < num_tx; tx++) {
+                auto future = pool.submit([&, tx, ty]() {
+                    // Stats are collected only when the caller asked for
+                    // them; otherwise encode_lossy_tile skips the work.
+                    TileStats tile_stats{};
+                    TileStats* tile_stats_ptr = (stats != nullptr) ? &tile_stats : nullptr;
+                    ChromaSubsampling tile_subsampling =
+                        use_yuv420 ? ChromaSubsampling::YUV420 : ChromaSubsampling::YUV444;
+                    const int16_t* tile_cb = cb_plane.data();
+                    const int16_t* tile_cr = cr_plane.data();
+                    if (use_adaptive_chroma) {
+                        // Per-tile decision from the source chroma
+                        // (cb_plane is full-resolution here, since the
+                        // image is not image-wide 420). The thresholds
+                        // are calibrated in 8-bit code values, but the
+                        // Laplacian stats grow with the code-value
+                        // range, so the thresholds scale with it (x4
+                        // at 10-bit, x16 at 12-bit) — measured slice
+                        // 0: unscaled thresholds waste 171,943 B
+                        // (10.9%) on the corpus by keeping 444 where
+                        // the oracle says 420.
+                        const double thr_scale = static_cast<double>(
+                            1 << std::max(0, static_cast<int>(bit_depth) - 8));
+                        const uint32_t x0 = tx * tile_size;
+                        const uint32_t y0 = ty * tile_size;
+                        const uint32_t tw = std::min(tile_size, width - x0);
+                        const uint32_t th = std::min(tile_size, height - y0);
+                        tile_subsampling = should_subsample_chroma_420(
+                            cb_plane.data(), cr_plane.data(), width, height,
+                            x0, y0, tw, th,
+                            static_cast<double>(config.adaptive_chroma_laplacian_threshold) * thr_scale,
+                            static_cast<double>(config.adaptive_chroma_lap_p999_threshold) * thr_scale,
+                            static_cast<double>(config.adaptive_chroma_lap_sat_p999_threshold) * thr_scale,
+                            bit_depth,
+                            // Fractions: no thr_scale (dimensionless).
+                            static_cast<double>(config.adaptive_chroma_lap_frac_gt2_threshold),
+                            static_cast<double>(config.adaptive_chroma_dct_band_threshold))
+                            ? ChromaSubsampling::YUV420 : ChromaSubsampling::YUV444;
+                        if (tile_subsampling == ChromaSubsampling::YUV420) {
+                            tile_cb = cb_plane_420.data();
+                            tile_cr = cr_plane_420.data();
+                        }
+                    }
+                    return encode_lossy_tile(
+                        y_plane.data(), tile_cb, tile_cr,
+                        classify_cb_plane, classify_cr_plane,
+                        alpha_plane.empty() ? nullptr : alpha_plane.data(),
+                        width, height, tx, ty, tile_size,
+                        config.quality, bit_depth,
+                        source_has_alpha,
+                        tile_subsampling,
+                        config.use_control_field,
+                        config.use_cclm,
+                        use_adaptive_chroma,
+                        tile_stats_ptr,
+                        skin_drop_mask.empty() ? nullptr : skin_drop_mask.data());
+                });
+                futures.push_back(std::move(future));
+            }
+        }
+
+        float total_score = 0;
+        int tile_count = 0;
+
+        for (auto& future : futures) {
+            auto result = future.get();
+            if (!result) return std::unexpected(result.error());
+
+            if (stats != nullptr) {
+                stats->tiles.push_back(result->stats);
+            }
+
+            Chunk tile_chunk;
+            std::memcpy(tile_chunk.type, CHUNK_TILE, 4);
+
+            TileHeader th;
+            th.tile_x = static_cast<uint16_t>(result->tile_x + tile_x0);
+            th.tile_y = static_cast<uint16_t>(result->tile_y + tile_y0);
+            th.layer_flags = static_cast<uint8_t>(
+                TILE_HAS_BASE | (source_has_alpha ? TILE_HAS_ALPHA : 0) |
+                ((result->is_v11 && result->subsampling == ChromaSubsampling::YUV420)
+                     ? TILE_CHROMA_420
+                     : 0));
+            th.compressed_size = static_cast<uint32_t>(result->compressed.size());
+
+            ByteWriter tw;
+            auto th_data = serialize_tile_header(th);
+            tw.write_bytes(th_data);
+            tw.write_bytes(result->compressed);
+            tile_chunk.payload = tw.finish();
+
+            out.chunks.push_back(std::move(tile_chunk));
+            total_score += result->quality_score;
+            tile_count++;
+        }
+
+        if (tile_count > 0) {
+            out.avg_quality_score = total_score / tile_count;
+        }
+    }
+
+    return out;
+}
+
 Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig& config,
                                          EncodeStats* stats = nullptr) {
     uint32_t width = image.width();
@@ -198,316 +567,18 @@ Result<std::vector<uint8_t>> encode_impl(const Image& image, const EncoderConfig
     file.icc_profile = config.icc_profile;
     file.c2pa_manifest = config.c2pa_manifest;
 
-    if (config.lossless) {
-        if (fhdr.bit_depth != 8) {
-            return std::unexpected(Error{ErrorCode::UnsupportedFeature,
-                "lossless currently only supports 8-bit"});
-        }
+    auto frame_tiles = encode_image_tiles(image, config, *tile_size_log2, 0, 0,
+                                          /*allow_single_tile_at_origin=*/true,
+                                          /*allow_palette=*/true, stats);
+    if (!frame_tiles) return std::unexpected(frame_tiles.error());
+    file.tile_chunks = std::move(frame_tiles->chunks);
 
-        std::vector<uint8_t> expanded_rgb;
-        const uint8_t* lossless_pixels = image.pixels().data();
-        if (!source_has_alpha && config.bit_depth == BitDepth::Bits8) {
-            expanded_rgb = expand_rgb8_to_rgba8(image);
-            lossless_pixels = expanded_rgb.data();
-        }
-
-        // Per-tile lossless (v0.2.8): the predictor path is split into
-        // tiles, each encoded independently via lossless_encode (which
-        // picks palette-vs-predictor per tile, so a tile that fits a
-        // palette uses it). The whole-image palette is compared
-        // against the per-tile total instead: a palette image keeps
-        // its single whole-image tile when that is smaller.
-        // Per-tile container overhead: 9 B chunk framing + 9 B tile
-        // header per TILE chunk; counted in the comparison so the
-        // choice is by true file size.
-        constexpr size_t kPerTileOverhead = 18;
-        const uint32_t tile_size = fhdr.tile_size();
-        const uint32_t tiles_x = fhdr.tiles_x();
-        const uint32_t tiles_y = fhdr.tiles_y();
-
-        auto palette_payload =
-            lossless_encode_palette(lossless_pixels, width, height);
-
-        std::vector<std::vector<uint8_t>> tile_payloads;
-        tile_payloads.reserve(static_cast<size_t>(tiles_x) * tiles_y);
-        size_t per_tile_total = 0;
-        for (uint32_t ty = 0; ty < tiles_y; ++ty) {
-            for (uint32_t tx = 0; tx < tiles_x; ++tx) {
-                const uint32_t tw = std::min(tile_size, width - tx * tile_size);
-                const uint32_t th = std::min(tile_size, height - ty * tile_size);
-                std::vector<uint8_t> tile_rgba(
-                    static_cast<size_t>(tw) * th * 4);
-                for (uint32_t y = 0; y < th; ++y) {
-                    std::memcpy(tile_rgba.data() + static_cast<size_t>(y) * tw * 4,
-                                lossless_pixels +
-                                    (static_cast<size_t>(ty * tile_size + y) * width +
-                                     tx * tile_size) * 4,
-                                static_cast<size_t>(tw) * 4);
-                }
-                auto encoded_tile = lossless_encode(tile_rgba.data(), tw, th,
-                                                    fhdr.bit_depth);
-                if (!encoded_tile) return std::unexpected(encoded_tile.error());
-                per_tile_total += encoded_tile->size() + kPerTileOverhead;
-                tile_payloads.push_back(std::move(*encoded_tile));
-            }
-        }
-
-        // The palette wins ties (same rule as the whole-image choice
-        // before 0.2.8). A palette payload is flags(1) + pred_mode(1)
-        // + inner payload, in one tile.
-        const bool use_palette =
-            palette_payload.has_value() &&
-            (palette_payload->size() + 2 + kPerTileOverhead) <= per_tile_total;
-
-        if (use_palette) {
-            Chunk tile_chunk;
-            std::memcpy(tile_chunk.type, CHUNK_TILE, 4);
-
-            TileHeader th;
-            th.tile_x = 0;
-            th.tile_y = 0;
-            th.layer_flags = TILE_HAS_BASE;
-            th.compressed_size =
-                static_cast<uint32_t>(palette_payload->size() + 2);
-
-            ByteWriter tw;
-            auto th_data = serialize_tile_header(th);
-            tw.write_bytes(th_data);
-            tw.write_u8(kLosslessTransformFlagPalette);
-            // The predictor mode is ignored on the palette path; SELECT
-            // is a valid value that keeps the byte well-formed.
-            tw.write_u8(static_cast<uint8_t>(LosslessPred::SELECT));
-            tw.write_bytes(*palette_payload);
-            tile_chunk.payload = tw.finish();
-
-            file.tile_chunks.push_back(std::move(tile_chunk));
-        } else {
-            size_t tile_index = 0;
-            for (uint32_t ty = 0; ty < tiles_y; ++ty) {
-                for (uint32_t tx = 0; tx < tiles_x; ++tx) {
-                    Chunk tile_chunk;
-                    std::memcpy(tile_chunk.type, CHUNK_TILE, 4);
-
-                    TileHeader th;
-                    th.tile_x = static_cast<uint16_t>(tx);
-                    th.tile_y = static_cast<uint16_t>(ty);
-                    th.layer_flags = TILE_HAS_BASE;
-                    th.compressed_size = static_cast<uint32_t>(
-                        tile_payloads[tile_index].size());
-
-                    ByteWriter tw;
-                    auto th_data = serialize_tile_header(th);
-                    tw.write_bytes(th_data);
-                    tw.write_bytes(tile_payloads[tile_index]);
-                    tile_chunk.payload = tw.finish();
-
-                    file.tile_chunks.push_back(std::move(tile_chunk));
-                    ++tile_index;
-                }
-            }
-        }
-    } else {
-        size_t pixel_count = static_cast<size_t>(width) * height;
-
-        std::vector<int16_t> y_plane(pixel_count);
-        std::vector<int16_t> cb_plane_full(pixel_count);
-        std::vector<int16_t> cr_plane_full(pixel_count);
-
-        rgb_to_ycbcr(y_plane.data(), cb_plane_full.data(), cr_plane_full.data(),
-                      image.pixels().data(), width, height,
-                      fhdr.cicp_matrix, fhdr.bit_depth, fhdr.full_range(),
-                      source_has_alpha);
-
-        // Full-resolution chroma for the control-field classification:
-        // the tile planes handed to encode_lossy_tile below are at the
-        // tile's subsampling resolution (half-res for a 420 tile), but
-        // the classifier was measured on full-res chroma. Saved here,
-        // before the moves below: the buffers move into cb_plane /
-        // cr_plane (444 case) or stay put (420 case), but the
-        // allocation outlives the tile futures either way.
-        const int16_t* classify_cb_plane = cb_plane_full.data();
-        const int16_t* classify_cr_plane = cr_plane_full.data();
-
-        std::vector<int16_t> cb_plane;
-        std::vector<int16_t> cr_plane;
-        std::vector<int16_t> alpha_plane;
-        if (source_has_alpha) {
-            alpha_plane.resize(pixel_count);
-            if (fhdr.bit_depth == 8) {
-                const auto pixels = image.pixels();
-                for (size_t i = 0; i < pixel_count; ++i) {
-                    alpha_plane[i] = pixels[i * 4 + 3];
-                }
-            } else {
-                const uint16_t* pixels = reinterpret_cast<const uint16_t*>(image.pixels().data());
-                for (size_t i = 0; i < pixel_count; ++i) {
-                    alpha_plane[i] = static_cast<int16_t>(pixels[i * 4 + 3]);
-                }
-            }
-        }
-
-        // YUV420 is undecodable when the first tile is 8x8 or smaller:
-        // the decoder infers subsampling from the first tile's chroma
-        // block counts, and at <=8px the 4:4:4 and 4:2:0 counts coincide,
-        // so it defaults to 4:4:4 and decodes the chroma wrong. FHDR
-        // carries no subsampling field, so for tiny images fall back to
-        // 4:4:4 instead of writing a file no decoder can read correctly.
-        // Normal-size images are unaffected.
-        const bool use_yuv420 =
-            config.subsampling == Subsampling::YUV420 && (width > 8 || height > 8);
-
-        // Adaptive subsampling applies only when the image is not
-        // already image-wide 420 (then every tile is 420 by definition).
-        const bool use_adaptive_chroma =
-            config.adaptive_chroma_subsampling && config.subsampling == Subsampling::YUV444;
-
-        // The 420 planes are built image-wide (identical to the
-        // image-wide 420 path) so a 420 tile's chroma matches what
-        // --yuv420 would have written for that region.
-        std::vector<int16_t> cb_plane_420, cr_plane_420;
-        if (use_yuv420 || use_adaptive_chroma) {
-            const uint32_t chroma_w = (width + 1) / 2;
-            const uint32_t chroma_h = (height + 1) / 2;
-            cb_plane_420.resize(chroma_w * chroma_h);
-            cr_plane_420.resize(chroma_w * chroma_h);
-            subsample_420(cb_plane_full.data(), cb_plane_420.data(), width, height);
-            subsample_420(cr_plane_full.data(), cr_plane_420.data(), width, height);
-        }
-
-        if (use_yuv420) {
-            cb_plane = std::move(cb_plane_420);
-            cr_plane = std::move(cr_plane_420);
-        } else {
-            cb_plane = std::move(cb_plane_full);
-            cr_plane = std::move(cr_plane_full);
-        }
-
-        uint32_t tile_size = fhdr.tile_size();
-        uint32_t num_tx = fhdr.tiles_x();
-        uint32_t num_ty = fhdr.tiles_y();
-
-        // Skin false-positive pre-pass (#skin-fp): the W+C3 rule needs
-        // the Skin components of the whole frame, so the frame is
-        // classified once here and a per-block drop mask is handed to
-        // the tiles. The mask only refines which Skin blocks get the
-        // 0.5 scale; the per-tile field stays the authority for what
-        // counts as Skin. Runs only when the flag is on.
-        std::vector<uint8_t> skin_drop_mask;
-        if (config.use_control_field) {
-            const std::vector<BlockControl> frame_field = analyze_control_field(
-                y_plane.data(), width, height,
-                classify_cb_plane, classify_cr_plane, fhdr.bit_depth);
-            skin_drop_mask = skin_false_positive_mask(
-                frame_field, (width + 7) / 8, (height + 7) / 8);
-        }
-
-        ThreadPool pool(config.threads);
-        std::vector<std::future<Result<TileEncodeResult>>> futures;
-
-        for (uint32_t ty = 0; ty < num_ty; ty++) {
-            for (uint32_t tx = 0; tx < num_tx; tx++) {
-                auto future = pool.submit([&, tx, ty]() {
-                    // Stats are collected only when the caller asked for
-                    // them; otherwise encode_lossy_tile skips the work.
-                    TileStats tile_stats{};
-                    TileStats* tile_stats_ptr = (stats != nullptr) ? &tile_stats : nullptr;
-                    ChromaSubsampling tile_subsampling =
-                        use_yuv420 ? ChromaSubsampling::YUV420 : ChromaSubsampling::YUV444;
-                    const int16_t* tile_cb = cb_plane.data();
-                    const int16_t* tile_cr = cr_plane.data();
-                    if (use_adaptive_chroma) {
-                        // Per-tile decision from the source chroma
-                        // (cb_plane is full-resolution here, since the
-                        // image is not image-wide 420). The thresholds
-                        // are calibrated in 8-bit code values, but the
-                        // Laplacian stats grow with the code-value
-                        // range, so the thresholds scale with it (x4
-                        // at 10-bit, x16 at 12-bit) — measured slice
-                        // 0: unscaled thresholds waste 171,943 B
-                        // (10.9%) on the corpus by keeping 444 where
-                        // the oracle says 420.
-                        const double thr_scale = static_cast<double>(
-                            1 << std::max(0, static_cast<int>(fhdr.bit_depth) - 8));
-                        const uint32_t x0 = tx * tile_size;
-                        const uint32_t y0 = ty * tile_size;
-                        const uint32_t tw = std::min(tile_size, width - x0);
-                        const uint32_t th = std::min(tile_size, height - y0);
-                        tile_subsampling = should_subsample_chroma_420(
-                            cb_plane.data(), cr_plane.data(), width, height,
-                            x0, y0, tw, th,
-                            static_cast<double>(config.adaptive_chroma_laplacian_threshold) * thr_scale,
-                            static_cast<double>(config.adaptive_chroma_lap_p999_threshold) * thr_scale,
-                            static_cast<double>(config.adaptive_chroma_lap_sat_p999_threshold) * thr_scale,
-                            fhdr.bit_depth,
-                            // Fractions: no thr_scale (dimensionless).
-                            static_cast<double>(config.adaptive_chroma_lap_frac_gt2_threshold),
-                            static_cast<double>(config.adaptive_chroma_dct_band_threshold))
-                            ? ChromaSubsampling::YUV420 : ChromaSubsampling::YUV444;
-                        if (tile_subsampling == ChromaSubsampling::YUV420) {
-                            tile_cb = cb_plane_420.data();
-                            tile_cr = cr_plane_420.data();
-                        }
-                    }
-                    return encode_lossy_tile(
-                        y_plane.data(), tile_cb, tile_cr,
-                        classify_cb_plane, classify_cr_plane,
-                        alpha_plane.empty() ? nullptr : alpha_plane.data(),
-                        width, height, tx, ty, tile_size,
-                        config.quality, fhdr.bit_depth,
-                        source_has_alpha,
-                        tile_subsampling,
-                        config.use_control_field,
-                        config.use_cclm,
-                        use_adaptive_chroma,
-                        tile_stats_ptr,
-                        skin_drop_mask.empty() ? nullptr : skin_drop_mask.data());
-                });
-                futures.push_back(std::move(future));
-            }
-        }
-
-        float total_score = 0;
-        int tile_count = 0;
-
-        for (auto& future : futures) {
-            auto result = future.get();
-            if (!result) return std::unexpected(result.error());
-
-            if (stats != nullptr) {
-                stats->tiles.push_back(result->stats);
-            }
-
-            Chunk tile_chunk;
-            std::memcpy(tile_chunk.type, CHUNK_TILE, 4);
-
-            TileHeader th;
-            th.tile_x = result->tile_x;
-            th.tile_y = result->tile_y;
-            th.layer_flags = static_cast<uint8_t>(
-                TILE_HAS_BASE | (source_has_alpha ? TILE_HAS_ALPHA : 0) |
-                ((result->is_v11 && result->subsampling == ChromaSubsampling::YUV420)
-                     ? TILE_CHROMA_420
-                     : 0));
-            th.compressed_size = static_cast<uint32_t>(result->compressed.size());
-
-            ByteWriter tw;
-            auto th_data = serialize_tile_header(th);
-            tw.write_bytes(th_data);
-            tw.write_bytes(result->compressed);
-            tile_chunk.payload = tw.finish();
-
-            file.tile_chunks.push_back(std::move(tile_chunk));
-            total_score += result->quality_score;
-            tile_count++;
-        }
-
-        if (tile_count > 0 && config.write_quality_score) {
-            float avg_score = total_score / tile_count;
-            meta::MetaBlock meta;
-            meta.set(meta::Namespace::Rating, meta::rating::QUALITY_SCORE, avg_score);
-            file.metadata = std::move(meta);
-            file.header.flags |= wk::FHDR_FLAG_HAS_WKMETA;
-        }
+    if (!config.lossless && config.write_quality_score) {
+        meta::MetaBlock meta;
+        meta.set(meta::Namespace::Rating, meta::rating::QUALITY_SCORE,
+                 frame_tiles->avg_quality_score);
+        file.metadata = std::move(meta);
+        file.header.flags |= wk::FHDR_FLAG_HAS_WKMETA;
     }
 
     return write_container(file);
@@ -538,6 +609,197 @@ Result<std::vector<uint8_t>> encode_with_stats(const Image& image, const Encoder
         return std::unexpected(Error{ErrorCode::EncodeFailed, std::string("exception while encoding: ") + e.what()});
     } catch (...) {
         return std::unexpected(Error{ErrorCode::EncodeFailed, "unknown exception while encoding"});
+    }
+}
+
+// Animation encoder (Fase 9 Slice 3, SPEC Section 4): frame 0 defines
+// the canvas; later frames may be sub-rectangles. v1 has no
+// inter-frame reference: every frame's tiles are encoded
+// independently by encode_image_tiles, exactly as if the frame's
+// rectangle were a still. The container is one FHDR (ANIMATED flag)
+// + one ANIM chunk + the frames' TILE chunks in order, so tile_offset
+// is the running TILE-chunk index. No META chunk: the still's
+// quality-score META is a per-still mean, which has no defined
+// meaning across frames. #anim #fase9
+Result<std::vector<uint8_t>> encode_animation_impl(const EncoderConfig& config) {
+    const auto& frames = config.animation.frames;
+    if (frames.empty()) {
+        return std::unexpected(Error{ErrorCode::InvalidParameter,
+            "animation has no frames"});
+    }
+
+    // The decoder rejects CICP values the converter does not implement
+    // (see parse_fhdr), so the encoder must not produce them either.
+    if (config.cicp.matrix != 1 && config.cicp.matrix != 5 && config.cicp.matrix != 6 && config.cicp.matrix != 9) {
+        return std::unexpected(Error{ErrorCode::InvalidParameter, "unknown CICP matrix coefficient"});
+    }
+    if (config.cicp.transfer != 1 && config.cicp.transfer != 13 && config.cicp.transfer != 16 && config.cicp.transfer != 18) {
+        return std::unexpected(Error{ErrorCode::InvalidParameter, "unknown CICP transfer characteristic"});
+    }
+    if (!cicp_primaries_is_defined(config.cicp.primaries)) {
+        return std::unexpected(Error{ErrorCode::InvalidParameter, "unknown CICP primaries (no H.273 Table 2 entry)"});
+    }
+
+    const Image& canvas_image = frames[0].image;
+    const uint32_t canvas_w = canvas_image.width();
+    const uint32_t canvas_h = canvas_image.height();
+    if (canvas_w == 0 || canvas_h == 0) {
+        return std::unexpected(Error{ErrorCode::InvalidParameter, "zero dimensions"});
+    }
+    if (canvas_w > 65535 || canvas_h > 65535) {
+        return std::unexpected(Error{ErrorCode::InvalidParameter,
+            "animation canvas exceeds 65535 px per side"});
+    }
+    // Frame 0 defines the canvas and must sit at the origin (v1 rule:
+    // the canvas has no other origin to come from).
+    if (frames[0].rect_x != 0 || frames[0].rect_y != 0) {
+        return std::unexpected(Error{ErrorCode::InvalidParameter,
+            "frame 0 must sit at the origin"});
+    }
+
+    // All frames share the canvas bit depth and alpha: the container
+    // carries one bit depth and one alpha flag, and the decoder
+    // composites every frame onto the same canvas. A mismatch would
+    // silently drop a frame's alpha or misread its samples.
+    for (size_t k = 0; k < frames.size(); ++k) {
+        const Image& image = frames[k].image;
+        if (image.bit_depth() != config.bit_depth) {
+            return std::unexpected(Error{ErrorCode::InvalidParameter,
+                "config bit depth does not match frame bit depth"});
+        }
+        if (image.has_alpha() != canvas_image.has_alpha()) {
+            return std::unexpected(Error{ErrorCode::InvalidParameter,
+                "all animation frames must share the canvas alpha"});
+        }
+        if (image.width() > 65535 || image.height() > 65535) {
+            return std::unexpected(Error{ErrorCode::InvalidParameter,
+                "animation frame rect exceeds 65535 px per side"});
+        }
+    }
+
+    // Auto-compute MaxCLL/MaxFALL (#hdr) from the canvas (frame 0):
+    // PQ only, and only for fields left unset (0). Manual values
+    // always win, per field.
+    uint16_t max_cll = config.max_cll;
+    uint16_t max_fall = config.max_fall;
+    if (config.cicp.transfer == 16 && (max_cll == 0 || max_fall == 0)) {
+        const PqMaxLuminance computed = compute_pq_max_luminance(canvas_image);
+        if (max_cll == 0) max_cll = computed.max_cll;
+        if (max_fall == 0) max_fall = computed.max_fall;
+    }
+
+    auto tile_size_log2 = resolve_tile_size_log2(config);
+    if (!tile_size_log2) {
+        return std::unexpected(tile_size_log2.error());
+    }
+    const uint32_t tile_size = 1u << *tile_size_log2;
+
+    FrameHeader fhdr;
+    fhdr.width = canvas_w;
+    fhdr.height = canvas_h;
+    fhdr.bit_depth = static_cast<uint8_t>(config.bit_depth);
+    fhdr.cicp_primaries = config.cicp.primaries;
+    fhdr.cicp_transfer = config.cicp.transfer;
+    fhdr.cicp_matrix = config.cicp.matrix;
+    fhdr.max_cll = max_cll;
+    fhdr.max_fall = max_fall;
+    fhdr.tile_size_log2 = *tile_size_log2;
+
+    fhdr.flags = 0;
+    if (config.lossless) fhdr.flags |= wk::FHDR_FLAG_LOSSLESS;
+    if (canvas_image.has_alpha()) fhdr.flags |= wk::FHDR_FLAG_ALPHA;
+    if (fhdr.hdr_flag_expected()) fhdr.flags |= wk::FHDR_FLAG_HDR;
+    if (config.cicp.full_range) fhdr.flags |= wk::FHDR_FLAG_FULL_RANGE;
+    if (!config.c2pa_manifest.empty()) fhdr.flags |= wk::FHDR_FLAG_HAS_C2PA;
+    fhdr.flags |= FHDR_FLAG_TILED;
+    fhdr.flags |= wk::FHDR_FLAG_ANIMATED;
+
+    WkFile file;
+    file.header = fhdr;
+    file.icc_profile = config.icc_profile;
+    file.c2pa_manifest = config.c2pa_manifest;
+
+    AnimHeader anim;
+    anim.frame_count = static_cast<uint32_t>(frames.size());
+    anim.loop_count = config.animation.loop_count;
+    anim.background_rgba = config.animation.background_rgba;
+
+    for (size_t k = 0; k < frames.size(); ++k) {
+        const AnimFrameInput& input = frames[k];
+        const Image& image = input.image;
+        const uint32_t rect_x = input.rect_x;
+        const uint32_t rect_y = input.rect_y;
+        const uint32_t rect_w = image.width();
+        const uint32_t rect_h = image.height();
+
+        if (input.blend_mode > 1) {
+            return std::unexpected(Error{ErrorCode::InvalidParameter,
+                "blend_mode must be 0 (OVER) or 1 (SOURCE)"});
+        }
+        if (input.disposal > 1) {
+            return std::unexpected(Error{ErrorCode::InvalidParameter,
+                "disposal must be 0 (keep) or 1 (restore-bg)"});
+        }
+        // Mirror the decoder's rectangle rules (SPEC 4.2) so the
+        // encoder never writes a file its own decoder rejects.
+        if (rect_w == 0 || rect_h == 0) {
+            return std::unexpected(Error{ErrorCode::InvalidParameter,
+                "animation frame rect must be non-empty"});
+        }
+        if (rect_x + rect_w > canvas_w || rect_y + rect_h > canvas_h) {
+            return std::unexpected(Error{ErrorCode::InvalidParameter,
+                "animation frame rect outside canvas"});
+        }
+        if (rect_x % tile_size != 0 || rect_y % tile_size != 0) {
+            return std::unexpected(Error{ErrorCode::InvalidParameter,
+                "animation frame rect must be tile-aligned"});
+        }
+        if (rect_x + rect_w < canvas_w && rect_w % tile_size != 0) {
+            return std::unexpected(Error{ErrorCode::InvalidParameter,
+                "animation frame rect width must be tile-aligned"});
+        }
+        if (rect_y + rect_h < canvas_h && rect_h % tile_size != 0) {
+            return std::unexpected(Error{ErrorCode::InvalidParameter,
+                "animation frame rect height must be tile-aligned"});
+        }
+
+        const bool is_full_canvas =
+            rect_x == 0 && rect_y == 0 && rect_w == canvas_w && rect_h == canvas_h;
+        auto frame_tiles = encode_image_tiles(
+            image, config, *tile_size_log2, rect_x / tile_size, rect_y / tile_size,
+            /*allow_single_tile_at_origin=*/is_full_canvas,
+            /*allow_palette=*/false);
+        if (!frame_tiles) return std::unexpected(frame_tiles.error());
+
+        AnimFrame frame;
+        frame.delay_ms = input.delay_ms;
+        frame.blend_mode = input.blend_mode;
+        frame.disposal = input.disposal;
+        frame.rect_x = static_cast<uint16_t>(rect_x);
+        frame.rect_y = static_cast<uint16_t>(rect_y);
+        frame.rect_w = static_cast<uint16_t>(rect_w);
+        frame.rect_h = static_cast<uint16_t>(rect_h);
+        frame.tile_offset = static_cast<uint32_t>(file.tile_chunks.size());
+        anim.frames.push_back(frame);
+
+        for (auto& chunk : frame_tiles->chunks) {
+            file.tile_chunks.push_back(std::move(chunk));
+        }
+    }
+
+    file.animation = std::move(anim);
+    return write_container(file);
+}
+
+Result<std::vector<uint8_t>> encode_animation(const EncoderConfig& config) {
+    try {
+        return encode_animation_impl(config);
+    } catch (const std::bad_alloc&) {
+        return std::unexpected(Error{ErrorCode::OutOfMemory, "out of memory while encoding animation"});
+    } catch (const std::exception& e) {
+        return std::unexpected(Error{ErrorCode::EncodeFailed, std::string("exception while encoding animation: ") + e.what()});
+    } catch (...) {
+        return std::unexpected(Error{ErrorCode::EncodeFailed, "unknown exception while encoding animation"});
     }
 }
 

@@ -63,6 +63,7 @@ if(WK_BUILD_TESTS)
     wk_add_test(tile_util_test tests/tile_util_test.cpp)
     wk_add_test(dither_display_test tests/dither_display_test.cpp)
     wk_add_test(decoder_raster_alloc_test tests/decoder_raster_alloc_test.cpp)
+    wk_add_test(animation_encoder_test tests/animation_encoder_test.cpp)
 
     # ASan Debug builds make the encode-heavy tests extremely slow: one
     # 16x16 full-entropy encode costs ~65 s under ASan vs 3 s in Release
