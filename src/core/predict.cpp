@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #include "predict.h"
+#include "true_cost_model.h"
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -357,7 +358,8 @@ namespace wk
                               const int16_t *left, int16_t above_left,
                               float lambda, int16_t max_val,
                               const QuantTable &quant, uint8_t bit_depth,
-                              float quant_scale)
+                              float quant_scale,
+                              const TrueCostModel *cost_model)
     {
         RdResult best{PredMode::DC, std::numeric_limits<float>::max()};
 
@@ -400,7 +402,12 @@ namespace wk
             }
 
             float ssd = compute_ssd_8x8(original, reconstructed);
-            float bits = estimate_bits_8x8(quantized.data());
+            // #rdo: with a fitted cost model, price the block as the
+            // stream will (mode + span + coefficients); otherwise the
+            // stock estimate.
+            float bits = cost_model != nullptr
+                ? cost_model->block_bits(quantized, mode)
+                : estimate_bits_8x8(quantized.data());
             float cost = ssd + lambda * bits;
 
             if (cost < best.cost)

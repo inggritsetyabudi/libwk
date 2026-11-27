@@ -19,6 +19,7 @@
 #include "superblock_quant.h"
 #include "mode_span_rans.h"
 #include "mode_stream.h"
+#include "true_cost_model.h"
 
 namespace wk {
 
@@ -537,6 +538,10 @@ Result<TileEncodeResult> encode_lossy_tile(
     // tile_x * (tile_size / 8)).
     const uint32_t frame_blocks_x = (image_width + 7) / 8;
 
+    // #rdo: the luma RDO loop runs twice — pass 1 with the estimate
+    // costing (stock), pass 2 with the true-cost model fitted on the
+    // pass-1 blocks. One lambda so both passes share the code.
+    auto encode_luma_pass = [&](const TrueCostModel* y_model) {
     for (uint32_t by = 0; by < blocks_y; ++by) {
         for (uint32_t bx = 0; bx < blocks_x; ++bx) {
             int16_t original_block[64] = {};
@@ -617,7 +622,7 @@ Result<TileEncodeResult> encode_lossy_tile(
                                         has_above ? above : nullptr,
                                         has_left ? left : nullptr,
                                         above_left, lambda, max_val,
-                                        quant_y, bit_depth, block_scale);
+                                        quant_y, bit_depth, block_scale, y_model);
 
             int16_t pred[64];
             predict_8x8(rd.mode, has_above ? above : nullptr,
@@ -659,6 +664,8 @@ Result<TileEncodeResult> encode_lossy_tile(
             }
         }
     }
+    };
+    encode_luma_pass(nullptr);
 
     const int16_t chroma_mid = static_cast<int16_t>((static_cast<int>(max_val) + 1) / 2);
     std::vector<int16_t> tile_cb_data(chroma_tw * chroma_th, chroma_mid);
@@ -692,7 +699,9 @@ Result<TileEncodeResult> encode_lossy_tile(
                                         int16_t cr_above_left,
                                         float quant_scale = 1.0f,
                                         const int16_t* cb_cclm_pred = nullptr,
-                                        const int16_t* cr_cclm_pred = nullptr) {
+                                        const int16_t* cr_cclm_pred = nullptr,
+                                        const TrueCostModel* cb_model = nullptr,
+                                        const TrueCostModel* cr_model = nullptr) {
         RdResult best{PredMode::DC, 1.0e30f};
         int16_t cb_prediction[64];
         int16_t cr_prediction[64];
@@ -703,7 +712,8 @@ Result<TileEncodeResult> encode_lossy_tile(
         // quantized coefficients -- what the decoder and the stream
         // will actually see.
         auto plane_rd = [&](const int16_t* original, const int16_t* prediction,
-                            float& ssd_out, float& bits_out) {
+                            float& ssd_out, DctBlockI16& quantized_out,
+                            uint8_t& span_out) {
             int16_t residual[64];
             int16_t reconstructed[64];
             for (int i = 0; i < 64; ++i) {
@@ -725,7 +735,8 @@ Result<TileEncodeResult> encode_lossy_tile(
                 reconstructed[i] = static_cast<int16_t>(std::clamp(value, 0, static_cast<int>(max_val)));
             }
             ssd_out = compute_ssd_8x8(original, reconstructed);
-            bits_out = estimate_bits_8x8(quantized.data());
+            quantized_out = quantized;
+            span_out = compute_coefficient_span(quantized);
         };
 
         for (int mode_index = 0; mode_index < static_cast<int>(PredMode::NUM_MODES); ++mode_index) {
@@ -742,23 +753,40 @@ Result<TileEncodeResult> encode_lossy_tile(
                 predict_8x8(mode, cr_above, cr_left, cr_above_left, cr_prediction, max_val);
             }
 
-            float cb_ssd = 0, cb_bits = 0, cr_ssd = 0, cr_bits = 0;
-            plane_rd(cb_original, cb_prediction, cb_ssd, cb_bits);
-            plane_rd(cr_original, cr_prediction, cr_ssd, cr_bits);
+            float cb_ssd = 0, cr_ssd = 0;
+            DctBlockI16 q_cb, q_cr;
+            uint8_t sp_cb = 0, sp_cr = 0;
+            plane_rd(cb_original, cb_prediction, cb_ssd, q_cb, sp_cb);
+            plane_rd(cr_original, cr_prediction, cr_ssd, q_cr, sp_cr);
 
             const float distortion = cb_ssd + cr_ssd;
-            float bits = cb_bits + cr_bits;
-            if (mode == PredMode::CCLM) {
-                // The RDO above counts only coefficient bits, not the
-                // mode-stream cost. CCLM is a rarer symbol than the
-                // common intra modes, so signalling it costs more in
-                // the rANS mode stream. Charge ~6 bits so CCLM only
-                // wins when its coefficient saving exceeds the mode
-                // overhead; without this, marginal CCLM picks grew
-                // people photos (+0.6-0.8% at q85) even though the
-                // coefficient saving was real. (2 bits fixed q75 only;
-                // 4 bits fixed q85 but left mira +0.45% at q75.)
-                bits += 6.0f;
+            float bits = 0.0f;
+            if (cb_model != nullptr && cr_model != nullptr) {
+                // #rdo: true joint cost — the mode and the joint span
+                // are signalled once; each plane pays its own
+                // coefficients up to the joint span. This replaces the
+                // +6 CCLM patch with the true mode cost (the patch was
+                // wrong both ways: horizon over by 4.03 bit/block,
+                // ember/solis under by 0.81).
+                const uint8_t joint_span = std::max(sp_cb, sp_cr);
+                bits = cb_model->mode_cost[static_cast<int>(mode)] +
+                       cb_model->span_cost[joint_span] +
+                       cb_model->coeff_bits(q_cb, joint_span) +
+                       cr_model->coeff_bits(q_cr, joint_span);
+            } else {
+                bits = estimate_bits_8x8(q_cb.data()) + estimate_bits_8x8(q_cr.data());
+                if (mode == PredMode::CCLM) {
+                    // The RDO above counts only coefficient bits, not the
+                    // mode-stream cost. CCLM is a rarer symbol than the
+                    // common intra modes, so signalling it costs more in
+                    // the rANS mode stream. Charge ~6 bits so CCLM only
+                    // wins when its coefficient saving exceeds the mode
+                    // overhead; without this, marginal CCLM picks grew
+                    // people photos (+0.6-0.8% at q85) even though the
+                    // coefficient saving was real. (2 bits fixed q75 only;
+                    // 4 bits fixed q85 but left mira +0.45% at q75.)
+                    bits += 6.0f;
+                }
             }
             const float cost = distortion + chroma_lambda * bits;
             if (cost < best.cost) {
@@ -810,6 +838,9 @@ Result<TileEncodeResult> encode_lossy_tile(
         }
     };
 
+    // #rdo: same two-pass structure as the luma loop above.
+    auto encode_chroma_pass = [&](const TrueCostModel* cb_model,
+                                  const TrueCostModel* cr_model) {
     for (uint32_t by = 0; by < chroma_blocks_y; ++by) {
         for (uint32_t bx = 0; bx < chroma_blocks_x; ++bx) {
             int16_t original_cb_block[64] = {};
@@ -910,7 +941,9 @@ Result<TileEncodeResult> encode_lossy_tile(
                 cr_above_left,
                 c_block_scale,
                 cb_cclm_ptr,
-                cr_cclm_ptr);
+                cr_cclm_ptr,
+                cb_model,
+                cr_model);
 
             int16_t cb_prediction[64];
             int16_t cr_prediction[64];
@@ -936,6 +969,79 @@ Result<TileEncodeResult> encode_lossy_tile(
             encode_chroma_component(original_cr_block, cr_prediction, cr_block, reconstructed_cr, bx0, by0, c_block_scale);
         }
     }
+    };
+    encode_chroma_pass(nullptr, nullptr);
+
+    // #rdo: pass 2 — fit the true-cost models on the pass-1 blocks,
+    // then re-run both RDO loops with true costing. Reconstructions
+    // are reset first so pass 2 sees the same starting state as
+    // pass 1 (intra prediction reads the reconstructions).
+    auto modes_of = [](const std::vector<BlockData>& blocks) {
+        std::vector<PredMode> modes;
+        modes.reserve(blocks.size());
+        for (const auto& b : blocks) modes.push_back(b.mode);
+        return modes;
+    };
+    auto spans_of = [](const std::vector<BlockData>& blocks) {
+        std::vector<uint8_t> spans;
+        spans.reserve(blocks.size());
+        for (const auto& b : blocks) spans.push_back(compute_coefficient_span(b.quantized));
+        return spans;
+    };
+    const std::vector<uint8_t> y_spans_p1 = spans_of(y_blocks);
+    std::vector<uint8_t> c_spans_p1;
+    c_spans_p1.reserve(cb_blocks.size());
+    for (size_t i = 0; i < cb_blocks.size(); ++i) {
+        c_spans_p1.push_back(std::max(compute_coefficient_span(cb_blocks[i].quantized),
+                                      compute_coefficient_span(cr_blocks[i].quantized)));
+    }
+    // #rdo (iterasi 1): shrinkage weight for the per-tile true-cost
+    // model (TrueCostModel::build): per-position magnitude tables are
+    // blended with the per-band pooled prior. 0 = v1 (peaked tables,
+    // flattens smooth gradients one level). Value chosen by measurement
+    // on the 3 failing gate tests + corpus saving (see the iteration
+    // report); the lambda-0.54 variant was measured and rejected, do not
+    // re-try it.
+    constexpr float kTrueCostShrinkBeta = 0.25f;
+    // #rdo (iterasi 1): shrinkage weight for mode/span tables toward
+    // the uniform prior. Magnitude shrinkage alone fixed WCG but left
+    // the ramp and edge scenes bit-identical, so the binding penalty
+    // there is in mode/span.
+    constexpr float kTrueCostModeSpanBeta = 0.50f;
+    // #rdo (iterasi 1): shrinkage weight for the DC magnitude toward
+    // a flat prior over the observed DC range (see TrueCostModel::build).
+    constexpr float kTrueCostDcBeta = 0.50f;
+    // #rdo (iterasi 1): homogeneous-tile guard — skip pass 2 when the
+    // pass-1 luma blocks are almost all near-DC-only (mean span <= 2.0).
+    // On such tiles the per-tile model is extremely peaked (mean
+    // ~2-5 bits/block vs >=16 on photos) and pass 2 flattens real
+    // gradients one level; pass 1 (the stock estimator) passes the
+    // gates on them. Measured separation (logs/corpus_debug_iter1.log
+    // + gate probe): synthetic ramp/edge/wcg tiles mean span 0.01-1.07;
+    // photo/OOC tiles >= 3.86 (textui 10.10-11.29, so a span-0
+    // fraction alone would NOT separate it). The threshold sits ~2x
+    // from both sides. Guarding only ever restores stock behaviour on
+    // that tile — never wrong, at most less gain.
+    double y_mean_span_p1 = 0.0;
+    for (uint8_t s : y_spans_p1) y_mean_span_p1 += s;
+    if (!y_spans_p1.empty()) y_mean_span_p1 /= static_cast<double>(y_spans_p1.size());
+    const bool homogeneous_tile = y_mean_span_p1 <= 2.0;
+    if (!homogeneous_tile) {
+        TrueCostModel y_model, cb_model, cr_model;
+        y_model.build(modes_of(y_blocks), y_spans_p1, collect_quantized_blocks(y_blocks),
+                      kTrueCostShrinkBeta, kTrueCostModeSpanBeta, kTrueCostDcBeta);
+        cb_model.build(modes_of(cb_blocks), c_spans_p1, collect_quantized_blocks(cb_blocks),
+                       kTrueCostShrinkBeta, kTrueCostModeSpanBeta, kTrueCostDcBeta);
+        cr_model.build(modes_of(cr_blocks), c_spans_p1, collect_quantized_blocks(cr_blocks),
+                       kTrueCostShrinkBeta, kTrueCostModeSpanBeta, kTrueCostDcBeta);
+
+        std::fill(reconstructed_y.begin(), reconstructed_y.end(), 0);
+        std::fill(reconstructed_cb.begin(), reconstructed_cb.end(), chroma_mid);
+        std::fill(reconstructed_cr.begin(), reconstructed_cr.end(), chroma_mid);
+        uses_cclm = false;
+        encode_luma_pass(&y_model);
+        encode_chroma_pass(&cb_model, &cr_model);
+    }  // !homogeneous_tile: pass-1 blocks stand (stock behaviour)
 
     std::vector<int16_t> tile_alpha_data;
     std::vector<int16_t> reconstructed_alpha;

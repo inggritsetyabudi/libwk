@@ -42,6 +42,7 @@ src/core/predict.cpp
 src/core/rans.cpp
 src/core/superblock_quant.cpp
 src/core/tile_util.cpp
+src/core/true_cost_model.cpp
 src/core/webp_decode.cpp
 src/core/wkmeta.cpp
 src/core/wkmeta_interop.cpp

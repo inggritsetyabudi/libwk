@@ -80,11 +80,17 @@ struct RdResult {
 
 
 
+// True-cost RDO model (see true_cost_model.h); forward-declared so
+// this header stays free of the model. Pass nullptr for the stock
+// estimate-based costing.
+struct TrueCostModel;
+
 RdResult select_best_mode(const int16_t* original, const int16_t* above,
                            const int16_t* left, int16_t above_left,
                            float lambda, int16_t max_val,
                            const QuantTable& quant, uint8_t bit_depth,
-                           float quant_scale = 1.0f);
+                           float quant_scale = 1.0f,
+                           const TrueCostModel* cost_model = nullptr);
 
 float compute_ssd_8x8(const int16_t* a, const int16_t* b);
 
